@@ -47,7 +47,16 @@ typedef enum xgc_status {
   XGC_ERR_AGAIN = 3     /* nothing available now (in-port empty) */
 } xgc_status;
 
-typedef enum xgc_port_dir { XGC_PORT_IN = 0, XGC_PORT_OUT = 1 } xgc_port_dir;
+/* An OPTIONAL port (minor 2) may be left unbound in the manifest: an unbound
+ * optional in-port never has samples (`next` returns XGC_ERR_AGAIN) and a
+ * `publish` on an unbound optional out-port is dropped and returns XGC_OK.
+ * Every other port must be bound. */
+typedef enum xgc_port_dir {
+  XGC_PORT_IN = 0,
+  XGC_PORT_OUT = 1,
+  XGC_PORT_IN_OPTIONAL = 2,
+  XGC_PORT_OUT_OPTIONAL = 3
+} xgc_port_dir;
 
 /* QoS class; the host maps it onto the transport (docs/qos.md). */
 typedef enum xgc_qos {
@@ -94,7 +103,7 @@ typedef struct xgc_step_ctx {
 
 /* Minor revisions only append functions to xgc_host_api. A plugin checks
  * `abi_minor` before calling a function added in that minor. */
-#define XGC_RT_ABI_MINOR 1u
+#define XGC_RT_ABI_MINOR 2u
 
 typedef struct xgc_host_api {
   uint32_t abi_version;

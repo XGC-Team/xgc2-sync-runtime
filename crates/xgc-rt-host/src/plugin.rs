@@ -15,6 +15,8 @@ pub struct PortInfo {
     pub is_out: bool,
     pub schema_id: String,
     pub qos: Qos,
+    /// May be left unbound in the manifest.
+    pub optional: bool,
 }
 
 /// A validated plugin library. The vtable is copied out, so its function
@@ -102,13 +104,15 @@ pub fn load(path: &Path, expected_sha256: Option<&str>) -> Result<LoadedPlugin, 
         if !names.insert(port_name.clone()) {
             return Err(LoadError(format!("{name}: port {port_name} is declared twice")));
         }
-        let is_out = match p.dir {
-            XGC_PORT_IN => false,
-            XGC_PORT_OUT => true,
+        let (is_out, optional) = match p.dir {
+            XGC_PORT_IN => (false, false),
+            XGC_PORT_OUT => (true, false),
+            XGC_PORT_IN_OPTIONAL => (false, true),
+            XGC_PORT_OUT_OPTIONAL => (true, true),
             other => return Err(LoadError(format!("{name}: port {port_name} has direction {other}"))),
         };
         let qos = Qos::from_abi(p.qos).ok_or_else(|| LoadError(format!("{name}: port {port_name} has QoS {}", p.qos)))?;
-        ports.push(PortInfo { name: port_name, is_out, schema_id: text(p.schema_id, "schema id")?, qos });
+        ports.push(PortInfo { name: port_name, is_out, schema_id: text(p.schema_id, "schema id")?, qos, optional });
     }
     let v = unsafe { &*desc.vtbl };
     let missing = |f: &str| LoadError(format!("{name}: vtable entry {f} is NULL"));

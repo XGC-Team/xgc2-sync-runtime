@@ -38,7 +38,8 @@
 //!
 //! **Watchdog.** A step longer than the module's budget (`step_budget_ms`,
 //! default one period) marks it Degraded; the next step within budget
-//! recovers it. A step longer than 10× the budget is a hang: a thread can't
+//! recovers it. A step longer than 10× the budget is a hang (a lifecycle
+//! call such as activate or destroy gets at least 5 s): a thread can't
 //! be killed safely, so the instance is abandoned (never called again, its
 //! memory left alone) and, if the restart policy allows, a new thread and
 //! instance take over after the backoff. After `session.max_abandoned`
@@ -77,6 +78,10 @@ use crate::plugin::{self, LoadedPlugin};
 pub const INBOX_CAPACITY: usize = 1024;
 /// A step this many budgets long is a hang.
 pub const HANG_FACTOR: u32 = 10;
+/// How long a non-step call (create, configure, activate, deactivate,
+/// domain_state, destroy) may take before it counts as hung. These may do
+/// real I/O, e.g. ROS registration.
+pub const LIFECYCLE_GRACE: Duration = Duration::from_secs(5);
 /// Upper bound on any sleep, so a stop is noticed.
 const MAX_WAIT: Duration = Duration::from_millis(100);
 
@@ -218,6 +223,8 @@ struct Instance {
     /// Monotonic ns (since host start) + 1 when the current vtable call
     /// began; 0 when the thread is not inside plugin code.
     call_started: AtomicU64,
+    /// The current call is `step` (budgeted), not a lifecycle call.
+    in_step: AtomicBool,
     abandoned: AtomicBool,
     done: AtomicBool,
 }
@@ -229,6 +236,7 @@ impl Instance {
             inner: Mutex::new(Inner { inputs, dirty: 0, dropped: 0, schedule, stop: false }),
             wake: Condvar::new(),
             call_started: AtomicU64::new(0),
+            in_step: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             done: AtomicBool::new(false),
         })
@@ -314,6 +322,8 @@ struct Module {
     budget: Duration,
     inputs: Vec<Option<InputSpec>>,
     outputs: Vec<Option<OutRoute>>,
+    /// Optional ports the manifest left unbound, by port index.
+    unbound: Vec<bool>,
     current: RwLock<Arc<Instance>>,
     status: Mutex<Status>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -329,6 +339,15 @@ impl Module {
 
     fn hang(&self) -> Duration {
         self.budget * HANG_FACTOR
+    }
+
+    /// The hang limit for the call the instance is in now.
+    fn limit(&self, inst: &Instance) -> Duration {
+        if inst.in_step.load(Ordering::Acquire) {
+            self.hang()
+        } else {
+            self.hang().max(LIFECYCLE_GRACE)
+        }
     }
 }
 
@@ -405,6 +424,9 @@ unsafe extern "C" fn api_publish(host: *mut c_void, port: u32, round: u64, data:
     let s = slot(host);
     let rt = s.rt.clone();
     let module = &rt.modules[s.module];
+    if module.unbound.get(port as usize) == Some(&true) && module.lib.ports[port as usize].is_out {
+        return XGC_OK; // an unbound optional output: dropped
+    }
     let Some(Some(route)) = module.outputs.get(port as usize) else {
         return XGC_ERR_INVALID;
     };
@@ -449,8 +471,10 @@ unsafe extern "C" fn api_next(host: *mut c_void, port: u32, out: *mut XgcSampleV
     if out.is_null() {
         return XGC_ERR_INVALID;
     }
-    if !matches!(s.rt.modules[s.module].inputs.get(port as usize), Some(Some(_))) {
-        return XGC_ERR_INVALID;
+    let module = &s.rt.modules[s.module];
+    if !matches!(module.inputs.get(port as usize), Some(Some(_))) {
+        let unbound_input = module.unbound.get(port as usize) == Some(&true) && !module.lib.ports[port as usize].is_out;
+        return if unbound_input { XGC_ERR_AGAIN } else { XGC_ERR_INVALID };
     }
     let Some(sample) = s.staged[port as usize].pop_front() else {
         return XGC_ERR_AGAIN;
@@ -792,7 +816,10 @@ impl ModuleThread {
         let (f, instance) = (module.lib.vtbl.step, self.instance);
         let t0 = rt.clock.now();
         let began = Instant::now();
-        let Some(status) = self.call(|| unsafe { f(instance, &ctx) }) else { return false };
+        self.inst().in_step.store(true, Ordering::Release);
+        let status = self.call(|| unsafe { f(instance, &ctx) });
+        self.inst().in_step.store(false, Ordering::Release);
+        let Some(status) = status else { return false };
         let took = began.elapsed();
         let t1 = rt.clock.now();
         {
@@ -989,6 +1016,10 @@ impl Host {
             let lib = plugin::load(&path, decl.sha256.as_deref()).map_err(|e| HostError(e.0))?;
             for port in &lib.ports {
                 let Some((channel, origins)) = bindings.get(&port.name) else {
+                    if port.optional {
+                        health.event(serde_json::json!({ "event": "unbound_optional_port", "plugin": decl.name, "port": port.name }));
+                        continue;
+                    }
                     return herr(format!("plugin {}: port {} is not bound in the manifest", decl.name, port.name));
                 };
                 let chan = &resolved.channels[*channel as usize];
@@ -1014,7 +1045,7 @@ impl Host {
         let mut writers: BTreeMap<ChannelId, &str> = BTreeMap::new();
         let mut schemas: BTreeMap<ChannelId, (&str, &str)> = BTreeMap::new();
         for (decl, bindings, lib) in &loaded {
-            for port in &lib.ports {
+            for port in lib.ports.iter().filter(|p| bindings.contains_key(&p.name)) {
                 let channel = bindings[&port.name].0;
                 if port.is_out {
                     if let Some(other) = writers.insert(channel, &decl.name) {
@@ -1042,7 +1073,7 @@ impl Host {
                 lib.ports
                     .iter()
                     .map(|p| {
-                        (!p.is_out).then(|| {
+                        (!p.is_out && bindings.contains_key(&p.name)).then(|| {
                             let (channel, origins) = bindings[&p.name].clone();
                             InputSpec { channel, origins, latest: decl.bind[&p.name].latest }
                         })
@@ -1080,11 +1111,12 @@ impl Host {
         let mut out_channels = BTreeMap::new();
         let mut in_streams: BTreeMap<ChannelId, Vec<OriginId>> = BTreeMap::new();
         for ((decl, bindings, lib), inputs) in loaded.into_iter().zip(inputs.iter().cloned()) {
+            let unbound = lib.ports.iter().map(|p| !bindings.contains_key(&p.name)).collect();
             let outputs = lib
                 .ports
                 .iter()
                 .map(|p| {
-                    p.is_out.then(|| {
+                    (p.is_out && bindings.contains_key(&p.name)).then(|| {
                         let channel = bindings[&p.name].0;
                         out_channels.insert(channel, ());
                         OutRoute { channel, readers: local_readers(channel) }
@@ -1111,6 +1143,7 @@ impl Host {
                 current: RwLock::new(Instance::new(&inputs, None)),
                 inputs,
                 outputs,
+                unbound,
                 status: Mutex::new(Status::default()),
                 thread: Mutex::new(None),
                 steps: AtomicU64::new(0),
@@ -1182,7 +1215,7 @@ impl Host {
             let inst = module.instance();
             let started = inst.call_started.load(Ordering::Acquire);
             if started != 0 && !inst.abandoned.load(Ordering::Acquire) {
-                let hang = module.hang().as_nanos() as u64;
+                let hang = module.limit(&inst).as_nanos() as u64;
                 let busy = now_mono.saturating_sub(started);
                 if busy <= hang {
                     let at = Instant::now() + Duration::from_nanos(hang - busy + 1);
@@ -1196,7 +1229,7 @@ impl Host {
                     st.abandons += 1;
                 }
                 rt.health.event(serde_json::json!({ "event": "abandoned", "plugin": module.name, "busy_ms": busy as f64 / 1e6, "hang_ms": hang as f64 / 1e6 }));
-                rt.fault(m, &format!("hung for more than {} ms; instance abandoned", module.hang().as_millis()));
+                rt.fault(m, &format!("hung for more than {} ms; instance abandoned", hang / 1_000_000));
                 if *abandoned >= self.manifest.session.max_abandoned && aborted.is_none() {
                     *aborted = Some(format!("{abandoned} hung module instance(s) abandoned"));
                 }
@@ -1358,7 +1391,7 @@ impl Host {
                     continue;
                 }
                 let started = inst.call_started.load(Ordering::Acquire);
-                if started != 0 && now_mono.saturating_sub(started) > module.hang().as_nanos() as u64 {
+                if started != 0 && now_mono.saturating_sub(started) > module.limit(&inst).as_nanos() as u64 {
                     inst.abandoned.store(true, Ordering::Release);
                     module.status.lock().unwrap().abandons += 1;
                     rt.fault(m, "hung at stop; instance abandoned");
