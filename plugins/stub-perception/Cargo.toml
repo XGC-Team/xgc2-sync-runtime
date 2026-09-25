@@ -1,0 +1,15 @@
+[package]
+name = "stub-perception"
+description = "Z1 perception stub plugin: exercises ports, triggers and its domain FSM on the shared ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+xgc-rt-abi.workspace = true
+toml.workspace = true

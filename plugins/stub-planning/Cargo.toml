@@ -1,0 +1,14 @@
+[package]
+name = "stub-planning"
+description = "Z1 planning stub plugin: exercises ports, triggers and its domain FSM on the shared ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+xgc-rt-abi.workspace = true
