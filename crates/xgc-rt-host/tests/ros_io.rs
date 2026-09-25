@@ -106,20 +106,23 @@ qos = "state"
 [[channel]]
 name = "vision_pose"
 qos = "state"
+[[channel]]
+name = "estimate"
+qos = "state"
 
 [[plugin]]
 name = "ros_io"
 path = "{ros_io}"
 trigger = "on_round"
-config = {{ node_name = "xgc_ros_io_uav1", imu_topic = "/mavros/imu/data_raw", pose_topic = "/vrpn_client_node/uav1/pose", vision_pose_topic = "/mavros/vision_pose/pose" }}
-bind = {{ imu = {{ channel = "imu" }}, pose = {{ channel = "pose" }}, vision_pose = {{ channel = "vision_pose", from = ["uav1"] }} }}
+config = {{ node_name = "xgc_ros_io_uav1", imu_topic = "/mavros/imu/data_raw", pose_topic = "/vrpn_client_node/uav1/pose", vision_pose_topic = "/mavros/vision_pose/pose", rigid_state_estimate_topic = "/rigid_state_estimator/state" }}
+bind = {{ imu = {{ channel = "imu" }}, pose = {{ channel = "pose" }}, vision_pose = {{ channel = "vision_pose", from = ["uav1"] }}, rigid_state_estimate = {{ channel = "estimate", from = ["uav1"] }} }}
 
 [[plugin]]
 name = "rigid-state"
 path = "{eskf}"
 trigger = "both"
 config = {{ extrinsic_verified = true }}
-bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pose", from = ["uav1"] }}, rigid_state = {{ channel = "rigid_state" }}, vision_pose = {{ channel = "vision_pose" }} }}
+bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pose", from = ["uav1"] }}, rigid_state = {{ channel = "rigid_state" }}, vision_pose = {{ channel = "vision_pose" }}, estimate = {{ channel = "estimate" }} }}
 "#,
         ros_io = ros_io.display(),
         eskf = eskf.display(),
@@ -156,4 +159,28 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
     let err = ((x - 0.5 * (0.8 * t).sin()).powi(2) + (y - (0.5 * (0.8 * t).cos() - 0.5)).powi(2) + (z - 1.0).powi(2)).sqrt();
     println!("last vision pose error {err:.4} m");
     assert!(err < 0.05, "vision pose error {err}");
+    // The full estimate reached ROS as the node's own message type, most of
+    // it from the Running state.
+    assert_eq!(result["estimate_type"], "rigid_state_estimator_msgs/RigidStateEstimate");
+    assert_eq!(result["estimate_md5"], "7424c514b9ac1ad1576e5e21d46362a3");
+    let (estimates, running) = (result["estimates"].as_u64().unwrap(), result["running"].as_u64().unwrap());
+    assert!(estimates > 300 && running * 2 > estimates, "{estimates} estimates, {running} Running");
+}
+
+#[test]
+fn vendored_ros_messages_equal_their_originals() {
+    let root = common::workspace_root();
+    let products = root.join("../..");
+    let repos = products.join("../../..");
+    for (copy, original) in [
+        ("rigid_state_estimator_msgs/RigidStateEstimate.msg", products.join("ros1/common/ros1-msgs/rigid_state_estimator_msgs/msg/RigidStateEstimate.msg")),
+        ("formation_generator/AssumedTrajectory.msg", repos.join("academic/ros1_ws/src/planner/formation_generator/msg/AssumedTrajectory.msg")),
+        ("periodic_sync/SyncTrigger.msg", repos.join("academic/ros1_ws/src/communication/periodic_sync/msg/SyncTrigger.msg")),
+    ] {
+        let Ok(want) = std::fs::read(&original) else {
+            eprintln!("skipped {copy}: {} is not checked out", original.display());
+            continue;
+        };
+        assert_eq!(std::fs::read(root.join("plugins/ros-io/msg").join(copy)).unwrap(), want, "{copy} drifted from {}", original.display());
+    }
 }

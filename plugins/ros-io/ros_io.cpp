@@ -16,6 +16,7 @@
 //     vision_pose      xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
 //     neighbor_plans   xgc.dmpc.assumed_trajectory/1 -> formation_generator/AssumedTrajectory
 //     sync_trigger     xgc.dmpc.sync_trigger/1       -> periodic_sync/SyncTrigger
+//     rigid_state_estimate xgc.rigid_state_estimate/1 -> rigid_state_estimator_msgs/RigidStateEstimate
 //
 // Threading: ROS callbacks run on this plugin's own thread. Each step first
 // publishes what the modules wrote since the last step, then services this
@@ -39,6 +40,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <mavros_msgs/AttitudeTarget.h>
 #include <periodic_sync/SyncTrigger.h>
+#include <rigid_state_estimator_msgs/RigidStateEstimate.h>
 #include <ros/callback_queue.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
@@ -59,11 +61,12 @@ enum Port : uint32_t {
   kVisionPose,
   kNeighborPlans,
   kSyncTrigger,
+  kRigidStateEstimate,
   kPortCount
 };
 
 const char* const kPortNames[kPortCount] = {"imu", "pose", "attitude_target", "own_plan",
-                                            "vision_pose", "neighbor_plans", "sync_trigger"};
+                                            "vision_pose", "neighbor_plans", "sync_trigger", "rigid_state_estimate"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -209,6 +212,52 @@ struct RosIo {
       pubs[kSyncTrigger].publish(m);
       ++to_ros;
     }
+    while (host->next(host->host, kRigidStateEstimate, &v) == XGC_OK) {
+      if (v.len != sizeof(xgc_rigid_state_estimate_v1)) continue;
+      xgc_rigid_state_estimate_v1 e;
+      std::memcpy(&e, v.data, sizeof e);
+      rigid_state_estimator_msgs::RigidStateEstimate m;
+      m.header.stamp.fromSec(e.stamp);
+      m.estimator_state = e.estimator_state;
+      m.flags = e.flags;
+      m.position.x = e.position[0];
+      m.position.y = e.position[1];
+      m.position.z = e.position[2];
+      auto vec = [](geometry_msgs::Vector3& out, const double* in) {
+        out.x = in[0];
+        out.y = in[1];
+        out.z = in[2];
+      };
+      vec(m.velocity, e.velocity);
+      m.orientation.w = e.q_wxyz[0];
+      m.orientation.x = e.q_wxyz[1];
+      m.orientation.y = e.q_wxyz[2];
+      m.orientation.z = e.q_wxyz[3];
+      vec(m.angular_velocity, e.angular_velocity);
+      vec(m.linear_acceleration, e.linear_acceleration);
+      vec(m.gravity, e.gravity);
+      vec(m.accel_bias, e.accel_bias);
+      m.vrpn_observation_state = e.vrpn_observation_state;
+      m.filter_health = e.filter_health;
+      m.last_pose_reject_reason = e.last_pose_reject_reason;
+      m.last_pose_accepted = e.last_pose_accepted != 0;
+      m.last_fused_pose_stamp_sec = e.last_fused_pose_stamp_sec;
+      m.vrpn_innovation_window_chi_square = e.vrpn_innovation_window_chi_square;
+      m.last_pose_position_innovation_norm_m = e.last_pose_position_innovation_norm_m;
+      m.last_pose_orientation_innovation_norm_rad = e.last_pose_orientation_innovation_norm_rad;
+      m.last_pose_mahalanobis_distance = e.last_pose_mahalanobis_distance;
+      m.innovation_position_gate_m = e.innovation_position_gate_m;
+      m.innovation_orientation_gate_rad = e.innovation_orientation_gate_rad;
+      m.pose_nis_gate = e.pose_nis_gate;
+      m.last_imu_sample_stamp_sec = e.last_imu_sample_stamp_sec;
+      m.last_vrpn_pose_stamp_sec = e.last_vrpn_pose_stamp_sec;
+      m.filter_inertial_stamp_sec = e.filter_inertial_stamp_sec;
+      m.filter_pose_stamp_sec = e.filter_pose_stamp_sec;
+      m.vrpn_consecutive_rejects = e.vrpn_consecutive_rejects;
+      m.vrpn_consecutive_accepts = e.vrpn_consecutive_accepts;
+      pubs[kRigidStateEstimate].publish(m);
+      ++to_ros;
+    }
   }
 
   xgc_status activate() {
@@ -228,6 +277,9 @@ struct RosIo {
       pubs[kNeighborPlans] = nh->advertise<formation_generator::AssumedTrajectory>(topics[kNeighborPlans], queue_size);
     if (enabled(kSyncTrigger))
       pubs[kSyncTrigger] = nh->advertise<periodic_sync::SyncTrigger>(topics[kSyncTrigger], queue_size);
+    if (enabled(kRigidStateEstimate))
+      pubs[kRigidStateEstimate] =
+          nh->advertise<rigid_state_estimator_msgs::RigidStateEstimate>(topics[kRigidStateEstimate], queue_size);
     return XGC_OK;
   }
 
@@ -328,6 +380,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"vision_pose", XGC_PORT_IN_OPTIONAL, "xgc.pose/1", XGC_QOS_STATE},
     {"neighbor_plans", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.assumed_trajectory/1", XGC_QOS_CONTROL},
     {"sync_trigger", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.sync_trigger/1", XGC_QOS_CONTROL},
+    {"rigid_state_estimate", XGC_PORT_IN_OPTIONAL, "xgc.rigid_state_estimate/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

@@ -11,6 +11,8 @@
 //   out rigid_state  xgc.rigid_state/1  (the node's state topic, at the state rate)
 //   out vision_pose  xgc.pose/1         (corrected vision pose for PX4, on each
 //                                        PUBLISH_VISION_POSE that may be published)
+//   out estimate     xgc.rigid_state_estimate/1 (optional: the node's full
+//                                        RigidStateEstimate, with rigid_state)
 //
 // Scheduling: trigger `both`, period = 1 / state_publish_rate_hz. A step
 // applies the new samples in source-stamp order (ties: imu before pose), each
@@ -46,7 +48,7 @@ namespace rs = estimator_vrpn_px4_rotor_state;
 namespace sm = state_machine;
 namespace cfg = xgc_rt_config;
 
-enum Port : uint32_t { kImu = 0, kPose = 1, kRigidState = 2, kVisionPose = 3 };
+enum Port : uint32_t { kImu = 0, kPose = 1, kRigidState = 2, kVisionPose = 3, kEstimate = 4 };
 
 struct Pending {
   double stamp;
@@ -157,7 +159,39 @@ struct EstRigidState {
     put_vec(msg.velocity, out.state.velocity);
     put_quat(msg.q_wxyz, out.state.orientation);
     put_vec(msg.body_rate, out.state.angular_velocity);
-    return host->publish(host->host, kRigidState, round, reinterpret_cast<const uint8_t*>(&msg), sizeof msg);
+    if (host->publish(host->host, kRigidState, round, reinterpret_cast<const uint8_t*>(&msg), sizeof msg) != XGC_OK)
+      return XGC_ERR;
+    // RigidStateOutputConsumer's makeStateMessage, field for field.
+    xgc_rigid_state_estimate_v1 e{};
+    e.stamp = stamp;
+    put_vec(e.position, out.state.position);
+    put_vec(e.velocity, out.state.velocity);
+    put_quat(e.q_wxyz, out.state.orientation);
+    put_vec(e.angular_velocity, out.state.angular_velocity);
+    put_vec(e.linear_acceleration, out.state.linear_acceleration);
+    put_vec(e.gravity, out.state.gravity);
+    put_vec(e.accel_bias, out.state.accel_bias);
+    e.last_fused_pose_stamp_sec = out.last_fused_pose_stamp_sec;
+    e.vrpn_innovation_window_chi_square = out.vrpn_innovation_window_chi_square;
+    e.last_pose_position_innovation_norm_m = out.last_pose_position_innovation_norm_m;
+    e.last_pose_orientation_innovation_norm_rad = out.last_pose_orientation_innovation_norm_rad;
+    e.last_pose_mahalanobis_distance = out.last_pose_mahalanobis_distance;
+    e.innovation_position_gate_m = out.innovation_position_gate_m;
+    e.innovation_orientation_gate_rad = out.innovation_orientation_gate_rad;
+    e.pose_nis_gate = out.pose_nis_gate;
+    e.last_imu_sample_stamp_sec = out.last_imu_sample_stamp_sec;
+    e.last_vrpn_pose_stamp_sec = out.last_vrpn_pose_stamp_sec;
+    e.filter_inertial_stamp_sec = out.filter_inertial_stamp_sec;
+    e.filter_pose_stamp_sec = out.filter_pose_stamp_sec;
+    e.flags = out.flags;
+    e.vrpn_consecutive_rejects = out.vrpn_consecutive_rejects;
+    e.vrpn_consecutive_accepts = out.vrpn_consecutive_accepts;
+    e.estimator_state = out.estimator_state;
+    e.vrpn_observation_state = static_cast<uint8_t>(out.vrpn_observation_state);
+    e.filter_health = static_cast<uint8_t>(out.filter_health);
+    e.last_pose_reject_reason = static_cast<uint8_t>(out.last_pose_reject_reason);
+    e.last_pose_accepted = out.last_pose_accepted ? 1u : 0u;
+    return host->publish(host->host, kEstimate, round, reinterpret_cast<const uint8_t*>(&e), sizeof e);
   }
 
   xgc_status step(const xgc_step_ctx* ctx) {
@@ -320,12 +354,13 @@ const xgc_port_decl kPorts[] = {
     {"pose", XGC_PORT_IN, "xgc.pose/1", XGC_QOS_STATE},
     {"rigid_state", XGC_PORT_OUT, "xgc.rigid_state/1", XGC_QOS_STATE},
     {"vision_pose", XGC_PORT_OUT, "xgc.pose/1", XGC_QOS_STATE},
+    {"estimate", XGC_PORT_OUT_OPTIONAL, "xgc.rigid_state_estimate/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
 
 const xgc_plugin_descriptor kDescriptor = {
-    XGC_RT_ABI_VERSION, 4u, "est-rigid-state", "0.1.0", kPorts, &kVtbl,
+    XGC_RT_ABI_VERSION, 5u, "est-rigid-state", "0.2.0", kPorts, &kVtbl,
 };
 
 }  // namespace

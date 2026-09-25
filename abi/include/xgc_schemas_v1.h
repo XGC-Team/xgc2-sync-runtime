@@ -92,6 +92,40 @@ typedef struct xgc_attitude_rate_cmd_v1 {
   uint32_t flags;
 } xgc_attitude_rate_cmd_v1;
 
+/* "xgc.rigid_state_estimate/1": the full rigid_state_estimator_msgs/
+ * RigidStateEstimate (field for field; constants as in that message). */
+typedef struct xgc_rigid_state_estimate_v1 {
+  double stamp;
+  double position[3];
+  double velocity[3];
+  double q_wxyz[4];
+  double angular_velocity[3];
+  double linear_acceleration[3];
+  double gravity[3];
+  double accel_bias[3];
+  double last_fused_pose_stamp_sec;
+  double vrpn_innovation_window_chi_square;
+  double last_pose_position_innovation_norm_m;
+  double last_pose_orientation_innovation_norm_rad;
+  double last_pose_mahalanobis_distance;
+  double innovation_position_gate_m;
+  double innovation_orientation_gate_rad;
+  double pose_nis_gate;
+  double last_imu_sample_stamp_sec;
+  double last_vrpn_pose_stamp_sec;
+  double filter_inertial_stamp_sec;
+  double filter_pose_stamp_sec;
+  uint32_t flags;
+  uint32_t vrpn_consecutive_rejects;
+  uint32_t vrpn_consecutive_accepts;
+  uint8_t estimator_state;
+  uint8_t vrpn_observation_state;
+  uint8_t filter_health;
+  uint8_t last_pose_reject_reason;
+  uint8_t last_pose_accepted;
+  uint8_t reserved[7];
+} xgc_rigid_state_estimate_v1;
+
 /* "xgc.dmpc.assumed_trajectory/1": formation_generator/AssumedTrajectory
  * (TRO DMPC). This header is followed by num_states * num_timesteps doubles
  * (`states`, in the message's column-major order: states[i*num_states + j]
@@ -128,6 +162,7 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_hover_thrust_v1) == 64, "xgc_hover_thrust_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_rigid_state_v1) == 112, "xgc_rigid_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_flat_ref_v1) == 160, "xgc_flat_ref_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_rate_cmd_v1) == 104, "xgc_attitude_rate_cmd_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_rigid_state_estimate_v1) == 304, "xgc_rigid_state_estimate_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_assumed_trajectory_v1) == 32, "xgc_dmpc_assumed_trajectory_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_sync_trigger_v1) == 32, "xgc_dmpc_sync_trigger_v1");
 

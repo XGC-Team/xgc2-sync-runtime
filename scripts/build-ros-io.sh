@@ -8,9 +8,10 @@
 #               boost and libstdc++ match roscpp.
 #   CXX         overrides the compiler.
 #
-# formation_generator/AssumedTrajectory and periodic_sync/SyncTrigger headers
-# are generated with gencpp from the verbatim .msg copies in plugins/ros-io/msg,
-# so the type names and md5 sums equal the academic packages'.
+# formation_generator/AssumedTrajectory, periodic_sync/SyncTrigger and
+# rigid_state_estimator_msgs/RigidStateEstimate headers are generated with
+# gencpp from the verbatim .msg copies in plugins/ros-io/msg, so the type names
+# and md5 sums equal the original packages'.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 prefix="${ROS_PREFIX:-/opt/ros/noetic}"
@@ -22,10 +23,10 @@ if [[ -z "$cxx" ]]; then
 fi
 gen="$(dirname "$1")/ros-io-gen"
 rm -rf "$gen"
-for msg in formation_generator/AssumedTrajectory periodic_sync/SyncTrigger; do
+for msg in formation_generator/AssumedTrajectory periodic_sync/SyncTrigger rigid_state_estimator_msgs/RigidStateEstimate; do
   pkg="${msg%/*}"
   "$python" "$prefix/lib/gencpp/gen_cpp.py" "$root/plugins/ros-io/msg/$msg.msg" -p "$pkg" \
-    -Istd_msgs:"$prefix/share/std_msgs/msg" -I"$pkg:$root/plugins/ros-io/msg/$pkg" \
+    -Istd_msgs:"$prefix/share/std_msgs/msg" -Igeometry_msgs:"$prefix/share/geometry_msgs/msg" -I"$pkg:$root/plugins/ros-io/msg/$pkg" \
     -o "$gen/$pkg" -e "$prefix/share/gencpp" >/dev/null
 done
 "$cxx" -std=c++17 -O2 -fPIC -Wall -Wextra -shared -fvisibility=hidden \
