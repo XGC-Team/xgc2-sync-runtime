@@ -72,3 +72,22 @@ pub fn est_hover_thrust() -> &'static (PathBuf, PathBuf) {
         (lib, reference)
     })
 }
+
+/// Build `libctl_dfbc.so` and its replay reference (needs `$CXX` and
+/// `$EIGEN_INCLUDE`, default /usr/include/eigen3).
+pub fn ctl_dfbc() -> &'static (PathBuf, PathBuf) {
+    static OUT: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    OUT.get_or_init(|| {
+        let root = workspace_root();
+        let out = root.join("target/plugin-tests/cpp");
+        std::fs::create_dir_all(&out).unwrap();
+        let (lib, reference) = (out.join("libctl_dfbc.so"), out.join("dfbc_reference"));
+        let status = Command::new(root.join("scripts/build-ctl-dfbc.sh"))
+            .arg(&lib)
+            .arg(&reference)
+            .status()
+            .expect("run build-ctl-dfbc.sh (needs $CXX and Eigen headers in $EIGEN_INCLUDE)");
+        assert!(status.success(), "building ctl-dfbc failed");
+        (lib, reference)
+    })
+}

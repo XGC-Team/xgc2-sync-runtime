@@ -56,6 +56,42 @@ typedef struct xgc_hover_thrust_v1 {
   uint32_t reserved;
 } xgc_hover_thrust_v1;
 
+/* "xgc.rigid_state/1": estimated rigid-body state, Session world frame. */
+typedef struct xgc_rigid_state_v1 {
+  double stamp;
+  double position[3];
+  double velocity[3];
+  double q_wxyz[4];
+  double body_rate[3];
+} xgc_rigid_state_v1;
+
+/* "xgc.flat_ref/1": differentially flat reference (position derivatives + yaw). */
+typedef struct xgc_flat_ref_v1 {
+  double stamp;
+  double position[3];
+  double velocity[3];
+  double acceleration[3];
+  double jerk[3];
+  double snap[3];
+  double yaw;
+  double yaw_rate;
+  double yaw_accel;
+  uint32_t flags;
+  uint32_t reserved;
+} xgc_flat_ref_v1;
+
+/* "xgc.attitude_rate_cmd/1": geometric controller output (before any
+ * vehicle-specific thrust mapping). */
+typedef struct xgc_attitude_rate_cmd_v1 {
+  double stamp;                 /* stamp of the state it was computed from */
+  double specific_thrust;       /* m/s^2 along body z */
+  double q_wxyz[4];             /* desired attitude */
+  double body_rate[3];          /* rad/s */
+  double position_error[3];
+  uint32_t success;
+  uint32_t flags;
+} xgc_attitude_rate_cmd_v1;
+
 #ifdef __cplusplus
 #define XGC_SCHEMA_ASSERT static_assert
 #else
@@ -65,6 +101,9 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_imu_v1) == 56, "xgc_imu_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_target_v1) == 56, "xgc_attitude_target_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_pose_v1) == 64, "xgc_pose_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_hover_thrust_v1) == 64, "xgc_hover_thrust_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_rigid_state_v1) == 112, "xgc_rigid_state_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_flat_ref_v1) == 160, "xgc_flat_ref_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_rate_cmd_v1) == 104, "xgc_attitude_rate_cmd_v1");
 
 #ifdef __cplusplus
 }
