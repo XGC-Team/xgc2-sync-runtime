@@ -2,7 +2,23 @@
 
 One module skeleton for every onboard and station module: perception, estimation, planning, control, DMPC neighbor exchange and simulation adapters. Communications are one plugin family on the same skeleton, with Zenoh as the cross-host transport. Latency, loss, reordering and throughput are audited per link against exact definitions.
 
-**It is not:** a planner, PX4 HIL, a ROS replacement mandate, or anything to do with AI chat. "Agent" in XGC2 means the robot `xgc-agent` ops process, which launches these hosts.
+**It is not:** a planner, PX4 HIL, a ROS replacement mandate, or anything to do with AI chat. "Agent" in XGC2 means the robot `xgc-agent` ops process, which launches the host.
+
+## Topology
+
+One `xgc-rt-host` process per robot (and one on the station) loads every module as a `.so` plugin from one manifest. Development and simulation always run this way.
+
+```text
+            robot (container or onboard)                         other robots / station
+ ┌──────────────────── xgc-rt-host ─────────────────────┐
+ │  ros1-bridge ─▶ estimator ─▶ planner ─▶ controller ──┼─▶ (bridge ▶ MAVROS)
+ │                               ▲  │                    │
+ │  in-host hops: loopback       │  └── dmpc/plan ───────┼──▶ Zenoh over radio ◀──▶ peers
+ │  every hop stamped + audited  └───── neighbor plans ◀─┼───
+ └──────────────────────────────────────────────────────┘
+```
+
+Splitting modules across processes is optional later, only for a concrete need (e.g. ROS thread isolation on a real robot).
 
 ## Shape
 
