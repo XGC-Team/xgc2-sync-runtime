@@ -4,6 +4,7 @@ members = [
   "crates/xgc-rt-abi",
   "crates/xgc-rt-core",
   "crates/xgc-rt-audit",
+  "crates/xgc-rt-clock",
   "crates/xgc-rt-transport-loopback",
   "crates/xgc-rt-transport-zenoh",
   "crates/xgc-rt-impair",
@@ -26,6 +27,7 @@ repository = "https://github.com/XGC-Team/xgc2-sync-runtime"
 xgc-rt-abi = { path = "crates/xgc-rt-abi" }
 xgc-rt-core = { path = "crates/xgc-rt-core" }
 xgc-rt-audit = { path = "crates/xgc-rt-audit" }
+xgc-rt-clock = { path = "crates/xgc-rt-clock" }
 xgc-rt-transport-loopback = { path = "crates/xgc-rt-transport-loopback" }
 xgc-rt-transport-zenoh = { path = "crates/xgc-rt-transport-zenoh" }
 xgc-rt-impair = { path = "crates/xgc-rt-impair" }

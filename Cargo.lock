@@ -3054,6 +3054,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xgc-rt-clock"
+version = "0.1.0"
+
+[[package]]
 name = "xgc-rt-core"
 version = "0.1.0"
 dependencies = [
@@ -3072,6 +3076,7 @@ dependencies = [
  "toml 0.8.23",
  "xgc-rt-abi",
  "xgc-rt-audit",
+ "xgc-rt-clock",
  "xgc-rt-core",
  "xgc-rt-impair",
  "xgc-rt-transport-loopback",

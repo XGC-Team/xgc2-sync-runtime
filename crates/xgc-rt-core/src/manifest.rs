@@ -42,6 +42,9 @@ pub struct Manifest {
     pub session: SessionSpec,
     pub transport: TransportSpec,
     pub audit: AuditSpec,
+    /// Clock-bound probe (docs/time-model.md). Absent: the bound stays
+    /// whatever the clock reports (0 on a single-host loopback run).
+    pub clock: Option<ClockSpec>,
     #[serde(rename = "channel", default)]
     pub channels: Vec<ChannelDecl>,
     #[serde(rename = "plugin", default)]
@@ -88,6 +91,61 @@ pub struct TransportSpec {
 #[serde(deny_unknown_fields)]
 pub struct AuditSpec {
     pub dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockRole {
+    /// The reference (the station): answers probes, bound 0.
+    Server,
+    /// Probes the server, gates activation on the bound.
+    Client,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClockSpec {
+    pub role: ClockRole,
+    /// Roster name of the server.
+    pub server: String,
+    #[serde(default = "default_probe_interval_ms")]
+    pub interval_ms: u64,
+    /// Activation gate: the bound must be at or under this.
+    #[serde(default = "default_gate_ms")]
+    pub gate_ms: f64,
+    #[serde(default = "default_gate_timeout_ms")]
+    pub gate_timeout_ms: u64,
+    #[serde(default = "default_probe_window")]
+    pub window: usize,
+}
+
+fn default_probe_interval_ms() -> u64 {
+    1_000
+}
+fn default_gate_ms() -> f64 {
+    2.0
+}
+fn default_gate_timeout_ms() -> u64 {
+    5_000
+}
+fn default_probe_window() -> usize {
+    8
+}
+
+/// Reserved channels the host appends when `[clock]` is set.
+pub const CLOCK_REQ_CHANNEL: &str = "xgc/clock/req";
+pub const CLOCK_REP_CHANNEL: &str = "xgc/clock/rep";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedClock {
+    pub role: ClockRole,
+    pub server: OriginId,
+    pub req: ChannelId,
+    pub rep: ChannelId,
+    pub interval_ns: i64,
+    pub gate_ns: i64,
+    pub gate_timeout_ns: i64,
+    pub window: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,6 +234,7 @@ pub struct Resolved {
     pub publish_deadline_ns: i64,
     /// Per plugin: port name → (channel id, origins; empty for out-ports).
     pub bindings: Vec<BTreeMap<String, (ChannelId, Vec<OriginId>)>>,
+    pub clock: Option<ResolvedClock>,
 }
 
 impl Manifest {
@@ -217,6 +276,42 @@ impl Manifest {
             channels.push(ChannelSpec { id: i as ChannelId, name: c.name.clone(), qos: c.qos });
         }
 
+        let clock = match &self.clock {
+            None => None,
+            Some(c) => {
+                let Some(server) = s.roster.iter().position(|n| *n == c.server) else {
+                    return err(format!("clock server {:?} is not in the roster", c.server));
+                };
+                if (c.role == ClockRole::Server) != (server == node_id) {
+                    return err("clock role must be server exactly on the server node".into());
+                }
+                if c.interval_ms == 0 || !(c.gate_ms.is_finite() && c.gate_ms > 0.0) || c.window == 0 {
+                    return err("clock interval_ms, gate_ms and window must be positive".into());
+                }
+                let mut add = |name: &str| -> Result<ChannelId, ManifestError> {
+                    if channel_ids.contains_key(name) {
+                        return Err(ManifestError(format!("channel {name} is reserved for the clock probe")));
+                    }
+                    let id = channels.len() as ChannelId;
+                    channel_ids.insert(name.to_string(), id);
+                    channels.push(ChannelSpec { id, name: name.to_string(), qos: Qos::Control });
+                    Ok(id)
+                };
+                let req = add(CLOCK_REQ_CHANNEL)?;
+                let rep = add(CLOCK_REP_CHANNEL)?;
+                Some(ResolvedClock {
+                    role: c.role,
+                    server: server as OriginId,
+                    req,
+                    rep,
+                    interval_ns: c.interval_ms as i64 * 1_000_000,
+                    gate_ns: (c.gate_ms * 1e6) as i64,
+                    gate_timeout_ns: c.gate_timeout_ms as i64 * 1_000_000,
+                    window: c.window,
+                })
+            }
+        };
+
         let mut plugin_names = BTreeSet::new();
         let mut bindings = Vec::new();
         for p in &self.plugins {
@@ -245,7 +340,7 @@ impl Manifest {
             }
             bindings.push(ports);
         }
-        Ok(Resolved { node_id: node_id as OriginId, channels, period_ns, publish_deadline_ns, bindings })
+        Ok(Resolved { node_id: node_id as OriginId, channels, period_ns, publish_deadline_ns, bindings, clock })
     }
 }
 

@@ -289,6 +289,7 @@ pub struct Host {
     timings: StartupTimings,
     started: Instant,
     run_dir: PathBuf,
+    clock_service: Option<crate::clock_service::ClockService>,
 }
 
 // SAFETY: slots are only touched by the thread that runs the host.
@@ -479,6 +480,19 @@ impl Host {
         for (channel, origins) in &in_streams {
             endpoint.declare_in(*channel, origins).map_err(|e| HostError(e.0))?;
         }
+        let clock_service = match resolved.clock.clone() {
+            None => None,
+            Some(spec) => Some(
+                crate::clock_service::ClockService::new(
+                    spec,
+                    resolved.node_id,
+                    manifest.session.roster.len(),
+                    endpoint.clone(),
+                    &audit.dir().join("clock.jsonl"),
+                )
+                .map_err(|e| HostError(format!("clock probe: {e}")))?,
+            ),
+        };
         timings.ports_ready_ms = ms_since(started);
 
         let host = Self {
@@ -493,6 +507,7 @@ impl Host {
             timings,
             started,
             run_dir,
+            clock_service,
         };
         // Plugins are created and configured in `run`, on the executor
         // thread: the ABI promises every vtable call happens there, and
@@ -585,8 +600,13 @@ impl Host {
         self.activate(i);
     }
 
-    fn route(&self, frames: Vec<RxFrame>) {
+    fn route(&mut self, frames: Vec<RxFrame>) {
         for frame in frames {
+            if let Some(cs) = self.clock_service.as_mut() {
+                if cs.on_frame(&frame) {
+                    continue;
+                }
+            }
             for i in 0..self.slots.len() {
                 let s = self.slot(i);
                 for (p, port) in s.ports.iter_mut().enumerate() {
@@ -652,8 +672,30 @@ impl Host {
             self.bring_up(i)?;
         }
         self.timings.configured_ms = ms_since(self.started);
-        // Clock gate: in Z1 the clock is local and always admitted. Z2 adds
-        // the chrony/probe gate and the Sim authority.
+        // Clock gate: a probe client waits until the bound is within the gate
+        // (at least 3 samples), probing every 100 ms. On timeout it runs on
+        // with frames flagged CLOCK_DEGRADED, and the health log says so.
+        if let Some(timeout) = self.clock_service.as_ref().filter(|c| c.is_client()).map(|c| c.gate_timeout()) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let frames = self.endpoint.drain();
+                self.route(frames);
+                let cs = self.clock_service.as_mut().unwrap();
+                if cs.within_gate() || Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                cs.tick(true);
+                self.endpoint.wait(Duration::from_millis(20));
+            }
+            let cs = self.clock_service.as_ref().unwrap();
+            let estimate = cs.estimate();
+            if cs.within_gate() {
+                self.health.event(serde_json::json!({ "event": "clock_gate_passed", "estimate": format!("{estimate:?}") }));
+            } else {
+                self.endpoint.set_clock_degraded(true);
+                self.health.event(serde_json::json!({ "event": "clock_gate_timeout", "estimate": format!("{estimate:?}") }));
+            }
+        }
         self.timings.clock_ok_ms = ms_since(self.started);
         // Peers: every out-channel has a matching subscriber, or the timeout
         // passes. The host then runs Degraded-by-evidence: the audit shows
@@ -680,7 +722,11 @@ impl Host {
             if stop.load(Ordering::Relaxed) || stop_at.is_some_and(|t| now >= t) {
                 break;
             }
-            self.route(self.endpoint.drain());
+            let frames = self.endpoint.drain();
+            self.route(frames);
+            if let Some(cs) = self.clock_service.as_mut() {
+                cs.tick(false);
+            }
             if let Some(k) = schedule.round_at(now) {
                 if !activated {
                     for i in 0..self.slots.len() {
@@ -717,6 +763,9 @@ impl Host {
                 if let Some(at) = self.slot(i).restart_at {
                     timeout = timeout.min(at.saturating_duration_since(Instant::now()));
                 }
+            }
+            if let Some(at) = self.clock_service.as_ref().and_then(|c| c.next_due()) {
+                timeout = timeout.min(at.saturating_duration_since(Instant::now()));
             }
             // Wake at least every 100 ms so a stop signal is noticed.
             self.endpoint.wait(timeout.min(Duration::from_millis(100)));
