@@ -39,3 +39,8 @@ sha2 = "0.10"
 
 [profile.release]
 debug = 1
+
+# Plugin loading hashes each library; unoptimized sha2 takes about a second
+# per debug-built plugin and made multi-host tests miss their epoch.
+[profile.dev.package.sha2]
+opt-level = 3
