@@ -53,3 +53,22 @@ pub fn scratch(name: &str) -> PathBuf {
 pub fn lib(name: &str) -> String {
     plugin_dir().join(format!("lib{name}.so")).display().to_string()
 }
+
+/// Build `libest_hover_thrust.so` and its replay reference with `$CXX`
+/// (default `c++`) from the upstream hover_thrust_estimator sources.
+pub fn est_hover_thrust() -> &'static (PathBuf, PathBuf) {
+    static OUT: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    OUT.get_or_init(|| {
+        let root = workspace_root();
+        let out = root.join("target/plugin-tests/cpp");
+        std::fs::create_dir_all(&out).unwrap();
+        let (lib, reference) = (out.join("libest_hover_thrust.so"), out.join("hte_reference"));
+        let status = Command::new(root.join("scripts/build-est-hover-thrust.sh"))
+            .arg(&lib)
+            .arg(&reference)
+            .status()
+            .expect("run build-est-hover-thrust.sh (needs a C++17 compiler in $CXX or c++)");
+        assert!(status.success(), "building est-hover-thrust failed");
+        (lib, reference)
+    })
+}
