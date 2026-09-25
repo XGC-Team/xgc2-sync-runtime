@@ -8,8 +8,11 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+pub mod neighbor;
+
 pub const XGC_RT_ABI_VERSION: u32 = 1;
 pub const XGC_RT_MAX_PORTS: u32 = 64;
+pub const XGC_RT_ABI_MINOR: u32 = 1;
 
 /// `xgc_status`. It is kept as a plain integer so that an out-of-range value
 /// from a foreign plugin is a checked error, never undefined behaviour.
@@ -73,7 +76,7 @@ pub struct XgcStepCtx {
 #[repr(C)]
 pub struct XgcHostApi {
     pub abi_version: u32,
-    pub reserved: u32,
+    pub abi_minor: u32,
     pub host: *mut c_void,
     pub publish: unsafe extern "C" fn(*mut c_void, u32, u64, *const u8, u32) -> XgcStatus,
     pub next: unsafe extern "C" fn(*mut c_void, u32, *mut XgcSampleView) -> XgcStatus,
@@ -81,6 +84,10 @@ pub struct XgcHostApi {
     pub log: unsafe extern "C" fn(*mut c_void, XgcLogLevel, *const c_char),
     pub request_degrade: unsafe extern "C" fn(*mut c_void, *const c_char),
     pub request_recover: unsafe extern "C" fn(*mut c_void),
+    /// abi_minor >= 1
+    pub port_origins: unsafe extern "C" fn(*mut c_void, u32, *mut u16, u32) -> u32,
+    /// abi_minor >= 1
+    pub node_id: unsafe extern "C" fn(*mut c_void) -> u16,
 }
 
 /// Entries are `Option` because a C plugin may leave one NULL. The host
@@ -199,6 +206,30 @@ impl Host {
         let api = self.api();
         let text = CString::new(reason.replace('\0', " ")).unwrap_or_default();
         unsafe { (api.request_degrade)(api.host, text.as_ptr()) }
+    }
+
+    /// Roster ids an in-port receives from; empty on a host older than
+    /// ABI minor 1.
+    pub fn port_origins(&self, port: u32) -> Vec<u16> {
+        let api = self.api();
+        if api.abi_minor < 1 {
+            return Vec::new();
+        }
+        let mut ids = vec![0u16; 16];
+        loop {
+            let n = unsafe { (api.port_origins)(api.host, port, ids.as_mut_ptr(), ids.len() as u32) } as usize;
+            if n <= ids.len() {
+                ids.truncate(n);
+                return ids;
+            }
+            ids.resize(n, 0);
+        }
+    }
+
+    /// This node's roster id, or None on a host older than ABI minor 1.
+    pub fn node_id(&self) -> Option<u16> {
+        let api = self.api();
+        (api.abi_minor >= 1).then(|| unsafe { (api.node_id)(api.host) })
     }
 
     pub fn request_recover(&self) {

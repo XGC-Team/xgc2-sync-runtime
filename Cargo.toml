@@ -12,6 +12,7 @@ members = [
   "plugins/stub-estimation",
   "plugins/stub-planning",
   "plugins/stub-control",
+  "plugins/dmpc-exchange-demo",
 ]
 
 [workspace.package]

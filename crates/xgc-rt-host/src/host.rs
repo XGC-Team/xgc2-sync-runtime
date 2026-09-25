@@ -70,6 +70,7 @@ enum PortRuntime {
 /// plugin's lifetime.
 struct Slot {
     name: String,
+    node_id: OriginId,
     lib: LoadedPlugin,
     trigger: Trigger,
     restart: xgc_rt_core::manifest::RestartPolicy,
@@ -205,6 +206,23 @@ unsafe extern "C" fn api_request_degrade(host: *mut c_void, reason: *const c_cha
     let s = slot(host);
     s.degrade_request = Some(c_text(reason));
     s.recover_request = false;
+}
+
+unsafe extern "C" fn api_port_origins(host: *mut c_void, port: u32, out: *mut u16, cap: u32) -> u32 {
+    let s = slot(host);
+    let Some(PortRuntime::In { origins, .. }) = s.ports.get(port as usize) else {
+        return 0;
+    };
+    if !out.is_null() {
+        for (i, o) in origins.iter().take(cap as usize).enumerate() {
+            *out.add(i) = *o;
+        }
+    }
+    origins.len() as u32
+}
+
+unsafe extern "C" fn api_node_id(host: *mut c_void) -> u16 {
+    slot(host).node_id
 }
 
 unsafe extern "C" fn api_request_recover(host: *mut c_void) {
@@ -423,7 +441,7 @@ impl Host {
                 fsm: Lifecycle::default(),
                 api: XgcHostApi {
                     abi_version: XGC_RT_ABI_VERSION,
-                    reserved: 0,
+                    abi_minor: XGC_RT_ABI_MINOR,
                     host: std::ptr::null_mut(),
                     publish: api_publish,
                     next: api_next,
@@ -431,7 +449,10 @@ impl Host {
                     log: api_log,
                     request_degrade: api_request_degrade,
                     request_recover: api_request_recover,
+                    port_origins: api_port_origins,
+                    node_id: api_node_id,
                 },
+                node_id: resolved.node_id,
                 instance: std::ptr::null_mut(),
                 ports,
                 dirty: 0,

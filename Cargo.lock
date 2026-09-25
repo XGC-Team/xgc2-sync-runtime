@@ -459,6 +459,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmpc-exchange-demo"
+version = "0.1.0"
+dependencies = [
+ "xgc-rt-abi",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
