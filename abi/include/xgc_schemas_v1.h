@@ -92,6 +92,30 @@ typedef struct xgc_attitude_rate_cmd_v1 {
   uint32_t flags;
 } xgc_attitude_rate_cmd_v1;
 
+/* "xgc.dmpc.assumed_trajectory/1": formation_generator/AssumedTrajectory
+ * (TRO DMPC). This header is followed by num_states * num_timesteps doubles
+ * (`states`, in the message's column-major order: states[i*num_states + j]
+ * is state j at timestep i) and then rest_len doubles (`rest_position`). */
+typedef struct xgc_dmpc_assumed_trajectory_v1 {
+  double stamp;           /* header.stamp */
+  uint32_t uav_id;
+  uint32_t num_states;
+  uint32_t num_timesteps;
+  uint32_t rest_len;
+  uint32_t valid;
+  uint32_t reserved;
+} xgc_dmpc_assumed_trajectory_v1;
+
+/* "xgc.dmpc.sync_trigger/1": periodic_sync/SyncTrigger, from local rounds.
+ * This header is followed by `count` uint32 active_participant_ids. */
+typedef struct xgc_dmpc_sync_trigger_v1 {
+  uint64_t sequence_id;   /* the round k */
+  double trigger_time;    /* scheduled round start, Session seconds */
+  double published_time;  /* when it was written, Session seconds */
+  uint32_t count;
+  uint32_t reserved;
+} xgc_dmpc_sync_trigger_v1;
+
 #ifdef __cplusplus
 #define XGC_SCHEMA_ASSERT static_assert
 #else
@@ -104,6 +128,8 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_hover_thrust_v1) == 64, "xgc_hover_thrust_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_rigid_state_v1) == 112, "xgc_rigid_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_flat_ref_v1) == 160, "xgc_flat_ref_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_rate_cmd_v1) == 104, "xgc_attitude_rate_cmd_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_assumed_trajectory_v1) == 32, "xgc_dmpc_assumed_trajectory_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_sync_trigger_v1) == 32, "xgc_dmpc_sync_trigger_v1");
 
 #ifdef __cplusplus
 }

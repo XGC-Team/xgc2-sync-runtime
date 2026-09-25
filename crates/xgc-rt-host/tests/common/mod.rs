@@ -23,7 +23,7 @@ pub fn plugin_dir() -> &'static Path {
         let target = root.join("target/plugin-tests");
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
-            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "--target-dir"])
+            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "-p", "dmpc-rounds", "--target-dir"])
             .arg(&target)
             .status()
             .expect("run cargo");
