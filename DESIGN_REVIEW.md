@@ -8,10 +8,8 @@
 - **L3:** no module can block the process; one Session clock; explicit synchronization; many FSMs alive at once.
 
 **A. Architecture:**
-- **ROS:** exists only in the bridge plugin.
-- **Zenoh:** is the transport under the host endpoint, bound to the radio network only. In-host hops use loopback.
-- **Audit:** the host stamps and audits every hop (send, receive, first read).
-- **Clock:** a probe bounds each node's clock error, and the bound rides every frame.
+- **ROS / Zenoh:** ROS exists only in the bridge plugin. Zenoh is the transport under the host endpoint, bound to the radio network only; in-host hops use loopback.
+- **Audit / clock:** the host stamps and audits every hop (send, receive, first read); a probe bounds each node's clock error, and the bound rides every frame.
 - **DMPC round:** bridge → estimator → planner (snapshot neighbors k−1, solve, publish k over Zenoh) → controller → bridge.
 
 **B. Base components.** Proposed new abstractions, required by L3:
@@ -23,10 +21,8 @@
 **The one L3 gap in the built code:** the host runs all plugins on *one* executor thread, so a blocking module stalls the host. B3 is the fix, and it is the first slice after GO.
 
 **C. Communications plugin family:**
-- **Transport:** loadable through a proposed `xgc_rt_transport_v1` (loopback and Zenoh built; shm later).
-- **Audit:** host-side, `audit-def/1`.
-- **Impairment:** netem on the station; the seeded relay in the sandbox.
-- **Clock probe:** built.
+- **Transport / audit:** loadable through a proposed `xgc_rt_transport_v1` (loopback and Zenoh built; shm later); audit host-side, `audit-def/1`.
+- **Impairment / clock:** netem on the station, the seeded relay in the sandbox; the clock probe is built.
 - **NeighborExchange:** Fresh/Stale/Missing snapshot. Rust built; C header proposed.
 
 **D. Migration:**
@@ -35,13 +31,10 @@
 - **Next:** TRO DMPC Phase 1 keeps the node behind the bridge, with `/formation/assumed_trajectories` ↔ `dmpc/plan` and local rounds. Phase 2 wraps `IDmpcOptimizer` once it is ROS-free.
 
 **Evidence so far (31 tests pass):**
-- **Audit exactness:** equal to injected ground truth.
 - **Zenoh finding:** best-effort drops late frames (reordering shows as loss) and suppresses duplicates. See `docs/transport-findings.md`.
-- **Clock probe:** measured a 5 ms skew exactly.
+- **Audit / clock:** audit counts equal injected ground truth; the clock probe measured a 5 ms skew exactly.
 
 **Decisions needed (defaults proposed):**
-- **D2:** create `XGC-Team/xgc2-sync-runtime`.
+- **D2:** create `XGC-Team/xgc2-sync-runtime`. D1, D3, D5, D6: as in the plan.
 - **D7:** control channels are latest-wins best-effort.
-- **D8:** watchdog policy as above.
-- **D9:** a thread per plugin rather than a pool.
-- D1, D3, D5, D6: as in the plan.
+- **D8 / D9:** watchdog policy as above; a thread per plugin rather than a pool.
