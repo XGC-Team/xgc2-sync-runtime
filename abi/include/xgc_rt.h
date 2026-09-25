@@ -13,6 +13,11 @@
  *  - Every vtable call happens on the host's executor thread for that plugin,
  *    never concurrently. `step` is called only on a round boundary or when an
  *    in-port is dirty, as the manifest trigger says.
+ *  - ROS edge rule: a domain plugin (estimation, control, planning, DMPC)
+ *    never calls ROS: no ros::init/rospy, no publish/subscribe, no ROS
+ *    libraries. Only one host-loaded bridge plugin (ros1-bridge) talks ROS,
+ *    converting inbound topics into input samples and output samples into
+ *    outbound topics. VRPN, simulators and legacy ROS stacks stay behind it.
  *  - Times are Session nanoseconds (see docs/time-model.md).
  *  - Strings are UTF-8, NUL-terminated, and owned by whoever returned them;
  *    descriptor strings must stay valid for the lifetime of the library.

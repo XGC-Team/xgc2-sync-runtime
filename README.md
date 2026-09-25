@@ -43,6 +43,7 @@ Splitting modules across processes is optional later, only for a concrete need (
 4. Plugins step on their round (`on_round`), on new input (`on_dirty`), or both. There is no busy-polling: an idle host measured 0.44 % CPU.
 5. Every module has the lifecycle state machine (`Unconfigured → Inactive → Active ⇄ Degraded`, plus `Error` and `Finalized`), tested exhaustively, and its own domain state is visible in health.
 6. IPC goes only through ports and transports.
+6a. **Modules never touch ROS.** No ros::init/rospy, no publish/subscribe, no ROS libraries in a domain plugin. One host-loaded `ros1-bridge` plugin owns all ROS I/O: inbound topics become input samples, output samples become outbound topics. VRPN, simulators and legacy ROS stacks stay behind it.
 7. Every channel is audited, and the audit is calibrated (`docs/audit-definitions.md`).
 
 ## Build, test and demo
