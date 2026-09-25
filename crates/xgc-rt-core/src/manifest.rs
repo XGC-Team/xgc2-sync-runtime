@@ -64,6 +64,13 @@ pub struct SessionSpec {
     pub start_delay_ms: u64,
     /// Stop after this long past E0. None means run until signalled.
     pub run_for_ms: Option<u64>,
+    /// How long startup waits for remote subscribers on every out-channel.
+    #[serde(default = "default_peer_timeout_ms")]
+    pub peer_timeout_ms: u64,
+}
+
+fn default_peer_timeout_ms() -> u64 {
+    5_000
 }
 
 fn default_start_delay_ms() -> u64 {

@@ -77,5 +77,12 @@ pub trait Transport: Send {
     /// Deliver `channel` from exactly these origins.
     fn declare_in(&mut self, channel: ChannelId, origins: &[OriginId]) -> Result<(), TransportError>;
     fn send(&mut self, channel: ChannelId, frame: &[u8]) -> Result<(), TransportError>;
+    /// Block up to `timeout` until every declared out-channel has at least
+    /// one matching remote subscriber. The host records the elapsed time as
+    /// `peers_ready`. It returns false on timeout, and the host then
+    /// continues, with the gap visible as loss in the audit.
+    fn wait_ready(&mut self, _timeout: std::time::Duration) -> bool {
+        true
+    }
     fn close(&mut self) {}
 }

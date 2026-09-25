@@ -11,6 +11,7 @@ xgc-rt-abi.workspace = true
 xgc-rt-core.workspace = true
 xgc-rt-audit.workspace = true
 xgc-rt-transport-loopback.workspace = true
+xgc-rt-transport-zenoh.workspace = true
 libloading.workspace = true
 serde.workspace = true
 serde_json.workspace = true

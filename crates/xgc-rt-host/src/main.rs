@@ -14,6 +14,7 @@ use xgc_rt_core::manifest::Manifest;
 use xgc_rt_core::transport::Transport;
 use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
+use xgc_rt_transport_zenoh::{ZenohOptions, ZenohTransport};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -57,8 +58,9 @@ fn run() -> Result<bool, String> {
     let base = path.parent().map(PathBuf::from).unwrap_or_default();
     let transport: Box<dyn Transport> = match manifest.transport.kind.as_str() {
         // A single-process bus: every roster node on it must run in this
-        // process. Z2 adds `zenoh`.
+        // process.
         "loopback" => Box::new(LoopbackTransport::new(LoopbackBus::new())),
+        "zenoh" => Box::new(ZenohTransport::new(ZenohOptions::from_table(&manifest.transport.options).map_err(|e| e.0)?)),
         other => return Err(format!("transport kind {other:?} is not available in this build")),
     };
     // One host clock, so the bound is 0 on loopback. Z2 sets it from chrony

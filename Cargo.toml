@@ -5,6 +5,7 @@ members = [
   "crates/xgc-rt-core",
   "crates/xgc-rt-audit",
   "crates/xgc-rt-transport-loopback",
+  "crates/xgc-rt-transport-zenoh",
   "crates/xgc-rt-host",
   "plugins/stub-perception",
   "plugins/stub-estimation",
@@ -24,6 +25,7 @@ xgc-rt-abi = { path = "crates/xgc-rt-abi" }
 xgc-rt-core = { path = "crates/xgc-rt-core" }
 xgc-rt-audit = { path = "crates/xgc-rt-audit" }
 xgc-rt-transport-loopback = { path = "crates/xgc-rt-transport-loopback" }
+xgc-rt-transport-zenoh = { path = "crates/xgc-rt-transport-zenoh" }
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

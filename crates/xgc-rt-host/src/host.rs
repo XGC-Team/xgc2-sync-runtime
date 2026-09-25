@@ -628,8 +628,14 @@ impl Host {
         // Clock gate: in Z1 the clock is local and always admitted. Z2 adds
         // the chrony/probe gate and the Sim authority.
         self.timings.clock_ok_ms = ms_since(self.started);
-        // Peers: loopback peers exist at open. Z2 adds roster discovery.
+        // Peers: every out-channel has a matching subscriber, or the timeout
+        // passes. The host then runs Degraded-by-evidence: the audit shows
+        // the loss.
+        let ready = self.endpoint.wait_ready(Duration::from_millis(self.manifest.session.peer_timeout_ms));
         self.timings.peers_ready_ms = ms_since(self.started);
+        if !ready {
+            self.health.event(serde_json::json!({ "event": "peers_timeout", "after_ms": self.timings.peers_ready_ms }));
+        }
         self.health.event(serde_json::json!({ "event": "startup", "timings": self.timings }));
 
         let s = &self.manifest.session;

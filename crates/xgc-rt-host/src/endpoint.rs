@@ -160,6 +160,10 @@ impl Endpoint {
         !q.is_empty()
     }
 
+    pub fn wait_ready(&self, timeout: Duration) -> bool {
+        self.transport.lock().unwrap().wait_ready(timeout)
+    }
+
     pub fn close(&self) {
         self.transport.lock().unwrap().close();
     }

@@ -1,0 +1,13 @@
+[package]
+name = "xgc-rt-transport-zenoh"
+description = "Zenoh transport: explicit per-origin keys, QoS classes, radio-only endpoints"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+xgc-rt-core.workspace = true
+# Same version as the xgc2-zenoh source pin (zenoh b845e3a = 1.9.0).
+zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_udp", "unstable"] }
+toml.workspace = true
