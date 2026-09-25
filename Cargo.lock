@@ -3066,8 +3066,19 @@ dependencies = [
  "xgc-rt-abi",
  "xgc-rt-audit",
  "xgc-rt-core",
+ "xgc-rt-impair",
  "xgc-rt-transport-loopback",
  "xgc-rt-transport-zenoh",
+]
+
+[[package]]
+name = "xgc-rt-impair"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+ "xgc-rt-core",
 ]
 
 [[package]]

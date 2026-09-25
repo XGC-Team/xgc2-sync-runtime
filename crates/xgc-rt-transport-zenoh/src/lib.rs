@@ -7,7 +7,7 @@
 //! - One publisher per declared out-channel, and one subscriber per
 //!   `(channel, origin)` the host asked for. Control loops never use
 //!   wildcard subscriptions.
-//! - The session runs in peer mode with multicast scouting off. It listens
+//! - The session runs in peer mode with multicast scouting and gossip off. It listens
 //!   and connects only on the endpoints the manifest gives, which in
 //!   deployment are the radio-network addresses. So this transport can
 //!   never ride the physics network by discovery.
@@ -93,6 +93,9 @@ impl ZenohTransport {
         let json = |v: &Vec<String>| serde_json_like(v);
         config.insert_json5("mode", "\"peer\"").map_err(|e| terr("config mode", e))?;
         config.insert_json5("scouting/multicast/enabled", "false").map_err(|e| terr("config scouting", e))?;
+        // No gossip either: peers are exactly the manifest's endpoints, so a
+        // session can never be rerouted around the radio path (or a relay).
+        config.insert_json5("scouting/gossip/enabled", "false").map_err(|e| terr("config gossip", e))?;
         config.insert_json5("listen/endpoints", &json(&self.options.listen)).map_err(|e| terr("config listen", e))?;
         config.insert_json5("connect/endpoints", &json(&self.options.connect)).map_err(|e| terr("config connect", e))?;
         // Peers come and go at different times: keep retrying connects rather

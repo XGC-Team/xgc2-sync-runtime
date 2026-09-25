@@ -21,3 +21,6 @@ toml.workspace = true
 [[bin]]
 name = "xgc-rt-host"
 path = "src/main.rs"
+
+[dev-dependencies]
+xgc-rt-impair.workspace = true
