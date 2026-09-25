@@ -2,23 +2,21 @@
 
 One module skeleton for every onboard and station module: perception, estimation, planning, control, DMPC neighbor exchange and simulation adapters. Communications are one plugin family on the same skeleton, with Zenoh as the cross-host transport. Latency, loss, reordering and throughput are audited per link against exact definitions.
 
-**It is not:** a planner, PX4 HIL, a ROS replacement mandate, or anything to do with AI chat. "Agent" in XGC2 means the robot `xgc-agent` ops process, which launches the host.
+**It is not:** a planner, PX4 HIL, a ROS replacement mandate, or anything to do with AI chat. "Agent" in XGC2 means the robot `xgc-agent` ops process, which launches the aggregator.
 
 ## Topology
 
-One `xgc-rt-host` process per robot (and one on the station) loads every module as a `.so` plugin from one manifest. Development and simulation always run this way.
+An aggregator is a plain process (`xgc-rt-host`) that loads the `.so` modules one manifest lists. Usually there is one per robot; a computer may run several for independent jobs.
 
 ```text
             robot (container or onboard)                         other robots / station
- ┌──────────────────── xgc-rt-host ─────────────────────┐
- │  ros1-bridge ─▶ estimator ─▶ planner ─▶ controller ──┼─▶ (bridge ▶ MAVROS)
- │                               ▲  │                    │
- │  in-host hops: loopback       │  └── dmpc/plan ───────┼──▶ Zenoh over radio ◀──▶ peers
- │  every hop stamped + audited  └───── neighbor plans ◀─┼───
+ ┌─────────────────── aggregator (xgc-rt-host) ─────────┐
+ │  ros_io ─▶ estimator ─▶ planner ─▶ controller ─▶ ros_io ─▶ MAVROS (ROS pub)
+ │   (ROS sub)                    ▲  │                  │
+ │  same process: memory only    │  └── dmpc/plan ─────┼──▶ Zenoh over radio ◀──▶ peers
+ │  (one thread per module)      └───── neighbor plans ◀┼───  stamped + audited
  └──────────────────────────────────────────────────────┘
 ```
-
-Splitting modules across processes is optional later, only for a concrete need (e.g. ROS thread isolation on a real robot).
 
 ## Shape
 
@@ -28,20 +26,22 @@ Splitting modules across processes is optional later, only for a concrete need (
 | `crates/xgc-rt-abi` | Rust mirror of the ABI, plus the safe plugin SDK (`Plugin` trait, `export_plugin!`) |
 | `crates/xgc-rt-core` | Envelope v2, the lifecycle state machine, `Clock`/`RoundSchedule`, the `Transport` and `AuditSink` interfaces, and the manifest |
 | `crates/xgc-rt-audit` | Lossless records, the multi-node merge, and the `audit-def/1` report (`xgc-rt-audit merge`) |
-| `crates/xgc-rt-transport-loopback` | In-process transport with a seeded ground-truth impairment injector |
-| `crates/xgc-rt-host` | The host process (`xgc-rt-host --manifest`): loader, round and dirty executor, restart policy, health log |
+| `crates/xgc-rt-transport-loopback` | In-memory stand-in for a link between nodes, with a seeded ground-truth impairment injector (tests only; never used between modules of one aggregator) |
+| `crates/xgc-rt-host` | The aggregator (`xgc-rt-host --manifest`): loader, one thread per module, memory handoff, watchdog, restart policy, health and step logs |
 | `plugins/stub-*`, `plugins/c-stub` | Z1 domain stubs (Rust) and the pure-C plugin |
 
 ## Host rules (acceptance for first-party modules)
 
 1. A new domain is a plugin plus a manifest entry. It never needs changes to host, clock, transport or audit code.
 2. Each plugin has one responsibility, and its declared ports are its entire I/O.
-3. Threads: the design (DESIGN_REVIEW.md, plan B3) gives each plugin its own runner thread, so no module can block the host. The Z1 build still runs all plugins on one executor thread; that change is the first slice after review. Transport IO threads only stamp, verify, audit and enqueue, and one audit writer thread writes records.
-4. Plugins step on their round (`on_round`), on new input (`on_dirty`), or both. There is no busy-polling: an idle host measured 0.44 % CPU.
+3. Threads: one thread per module (D9), so a slow or blocking module stalls only itself. The main thread routes link frames and runs the clock probe and the watchdog. Transport IO threads only stamp, verify, audit and enqueue; writer threads append audit and step records.
+4. Modules step on their round (`on_round`), on new input (`on_dirty`), or both. There is no busy-polling. Each step reads one snapshot of its inputs taken at step start.
+4a. **Same process = memory only.** An output write hands one shared sample to each same-process reader's input (a bounded queue, or with `latest = true` only the newest sample) and wakes it. No envelope, transport or pub/sub between modules of one aggregator. The link (Zenoh) is used only when the roster has other nodes. `steps.jsonl` records each step's start, end and the samples it read.
+4b. **Watchdog.** A step over `step_budget_ms` (default one period) marks the module Degraded; the next step within budget recovers it. A step over 10× the budget is a hang: the instance is abandoned and, if the restart policy allows, replaced. After `session.max_abandoned` (default 2) abandons the aggregator stops and exits nonzero, so the Agent restarts it.
 5. Every module has the lifecycle state machine (`Unconfigured → Inactive → Active ⇄ Degraded`, plus `Error` and `Finalized`), tested exhaustively, and its own domain state is visible in health.
-6. IPC goes only through ports and transports.
-6a. **Modules never touch ROS.** No ros::init/rospy, no publish/subscribe, no ROS libraries in a domain plugin. One host-loaded `ros1-bridge` plugin owns all ROS I/O: inbound topics become input samples, output samples become outbound topics. VRPN, simulators and legacy ROS stacks stay behind it.
-7. Every channel is audited, and the audit is calibrated (`docs/audit-definitions.md`).
+6. A module's declared inputs and outputs are its entire I/O. Between processes, only the link (Zenoh) is used.
+6a. **Modules never touch ROS.** No ros::init/rospy, no publish/subscribe, no ROS libraries in a domain plugin. The aggregator's `ros_io` module does ordinary ROS subscribe and publish: topics are copied into module inputs, module outputs are published as topics. It is not the `ros1_bridge` package. VRPN, simulators and third-party ROS stacks stay ROS nodes, reached through `ros_io`.
+7. Every link (cross-process) channel is audited, and the audit is calibrated (`docs/audit-definitions.md`).
 
 ## Build, test and demo
 

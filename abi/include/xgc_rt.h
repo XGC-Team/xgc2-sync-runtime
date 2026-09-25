@@ -1,7 +1,7 @@
 /*
  * xgc_rt.h — XGC2 Sync Runtime plugin ABI, version 1.
  *
- * The one contract between a host process (xgc-rt-host) and every module
+ * The one contract between an aggregator process (xgc-rt-host) and every module
  * plugin, whatever its domain (perception, estimation, planning, control,
  * DMPC neighbor exchange, simulation adapters) or language. A plugin is a
  * shared library that exports `xgc_rt_plugin_v1`.
@@ -10,14 +10,19 @@
  *  - The host owns threads, the clock, transports and audit. A plugin never
  *    opens sockets or spawns threads for IPC; it publishes and reads through
  *    `xgc_host_api`.
- *  - Every vtable call happens on the host's executor thread for that plugin,
- *    never concurrently. `step` is called only on a round boundary or when an
- *    in-port is dirty, as the manifest trigger says.
+ *  - Every vtable call happens on the aggregator's thread for that plugin
+ *    (one thread per plugin), never concurrently. `step` is called only on a
+ *    round boundary or when an in-port is dirty, as the manifest trigger
+ *    says. `next` reads a snapshot of the inputs taken when the step began.
+ *  - "Ports" are module inputs and outputs in memory, not network ports.
+ *    Between plugins of one aggregator, `publish` hands the sample over in
+ *    memory; it is sent over the link (Zenoh) only to other processes.
  *  - ROS edge rule: a domain plugin (estimation, control, planning, DMPC)
  *    never calls ROS: no ros::init/rospy, no publish/subscribe, no ROS
- *    libraries. Only one host-loaded bridge plugin (ros1-bridge) talks ROS,
- *    converting inbound topics into input samples and output samples into
- *    outbound topics. VRPN, simulators and legacy ROS stacks stay behind it.
+ *    libraries. Only the aggregator's `ros_io` plugin talks ROS, with ordinary
+ *    subscribe and publish: inbound topics become input samples, output
+ *    samples become outbound topics. It is not the ros1_bridge package.
+ *    VRPN, simulators and third-party ROS stacks stay ROS nodes.
  *  - Times are Session nanoseconds (see docs/time-model.md).
  *  - Strings are UTF-8, NUL-terminated, and owned by whoever returned them;
  *    descriptor strings must stay valid for the lifetime of the library.
