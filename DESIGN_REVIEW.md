@@ -1,40 +1,30 @@
-# XGC2 Sync Runtime: design pack for author review
+# XGC2 Sync Runtime: design for review
 
-**STATUS: DESIGN FREEZE, awaiting author review.** Coding stopped at `e14de41` (local, not pushed). The full pack is plan sections A–D (`/tmp/claude-zenoh-sync/plan.md`; harness copy `CLAUDE_TERMINAL2_ZENOH_SYNC_COMMS.md`).
+**Status: design freeze.** No code changes since `e14de41`. The full design is `/tmp/claude-zenoh-sync/plan.md`, sections A–E.
 
-**Locks, written as requirements:**
-- **L1:** one `xgc-rt-host` per robot, many `.so` plugins, one manifest. Multi-process is optional later only.
-- **L2:** modules never touch ROS. One host-loaded `ros1-bridge` plugin converts topics to and from port events.
-- **L3:** no module can block the process; one Session clock; explicit synchronization; many FSMs alive at once.
+## Base parts
+- **Aggregator:** one process that loads the `.so` modules one manifest lists; usually one per robot.
+- **Modules:** one thread each. They hand data to each other in memory: latest-value outputs as double buffers with a version, every-sample inputs as a queue + notify, and dirty flags. No pub/sub or sockets inside the process.
+- **Clock:** one Session clock for every module; rounds are E0 + k·P, computed locally.
+- **FSMs:** the aggregator's own FSM, a lifecycle FSM per module, and each module's domain FSMs, all running at once.
+- **Watchdog:** a slow step marks the module Degraded; a hung module is abandoned and restarted.
+- **ROS:** only the `ros_io` module talks ROS (ordinary subscribe/publish), copying topics into and out of module inputs and outputs. Modules never touch ROS.
+- **Zenoh:** only between processes (robot↔robot, robot↔station), on the radio network, stamped and audited.
 
-**A. Architecture:**
-- **ROS / Zenoh:** ROS exists only in the bridge plugin. Zenoh is the transport under the host endpoint, bound to the radio network only; in-host hops use loopback.
-- **Audit / clock:** the host stamps and audits every hop (send, receive, first read); a probe bounds each node's clock error, and the bound rides every frame.
-- **DMPC round:** bridge → estimator → planner (snapshot neighbors k−1, solve, publish k over Zenoh) → controller → bridge.
+The built code still runs all modules on one thread and passes same-process data through a loopback transport. Fixing that is the first slice after GO.
 
-**B. Base components.** Proposed new abstractions, required by L3:
-- **ModuleRunner:** one thread per plugin; all of its calls run there.
-- **Router:** in the transport sink; fills per-port **Mailboxes** and wakes runners.
-- **Supervisor:** host FSM, lifecycles, clock probe, **Watchdog** (overrun → Degraded; hang → abandon the runner and restart; repeated → exit so the Agent restarts the host).
-- **FSM stack:** host FSM + one lifecycle FSM per plugin + plugin domain FSMs. They couple only through degrade/recover requests, activate/deactivate, and port events.
+## Migration (the main work)
+- **Pattern:** keep each module's ROS-free core, replace its ROS input and output code with module I/O, and let `ros_io` carry the topics. Each wrap must match the original on recorded inputs before it is used anywhere else.
+- **Done:** the hover-thrust estimator and the DFBC controller, both bit-identical to the originals.
+- **Next, the TRO flight chain:** rigid-state ESKF, PX4 controller, reference trajectory, and the DMPC planner. The planner first stays a ROS node behind `ros_io`, with its plans exchanged over Zenoh and local rounds replacing the central sync trigger; later it is wrapped once `IDmpcOptimizer` is ROS-free.
+- **Then:** UGV controllers, reset safety and measured state.
+- **Stays ROS:** third-party code (SLAM, detection, TARE/CMU, drivers, simulators). The full register is in plan section D.
 
-**The one L3 gap in the built code:** the host runs all plugins on *one* executor thread, so a blocking module stalls the host. B3 is the fix, and it is the first slice after GO.
+## Deployment
+The same modules run at every step; only the manifest and Session change, one thing per step: replay → sim loop → containers over Zenoh → real companion computer → partial onboard → full onboard. Each step leaves behind logs, module step records, the link audit and `ros_io` recordings.
 
-**C. Communications plugin family:**
-- **Transport / audit:** loadable through a proposed `xgc_rt_transport_v1` (loopback and Zenoh built; shm later); audit host-side, `audit-def/1`.
-- **Impairment / clock:** netem on the station, the seeded relay in the sandbox; the clock probe is built.
-- **NeighborExchange:** Fresh/Stale/Missing snapshot. Rust built; C header proposed.
-
-**D. Migration:**
-- **Wrap first:** keep the ROS-free core, replace ROS I/O with ports, route topics through the bridge.
-- **Done:** the hover-thrust estimator and DFBC controller, both bit-identical to the originals.
-- **Next:** TRO DMPC Phase 1 keeps the node behind the bridge, with `/formation/assumed_trajectories` ↔ `dmpc/plan` and local rounds. Phase 2 wraps `IDmpcOptimizer` once it is ROS-free.
-
-**Evidence so far (31 tests pass):**
-- **Zenoh finding:** best-effort drops late frames (reordering shows as loss) and suppresses duplicates. See `docs/transport-findings.md`.
-- **Audit / clock:** audit counts equal injected ground truth; the clock probe measured a 5 ms skew exactly.
-
-**Decisions needed (defaults proposed):**
-- **D2:** create `XGC-Team/xgc2-sync-runtime`. D1, D3, D5, D6: as in the plan.
-- **D7:** control channels are latest-wins best-effort.
-- **D8 / D9:** watchdog policy as above; a thread per plugin rather than a pool.
+## Decisions (defaults proposed)
+- **D2:** create `XGC-Team/xgc2-sync-runtime`.
+- **D7:** control links are latest-wins best-effort.
+- **D8:** watchdog as above.
+- **Others:** D1, D3, D5 and D6 as in the plan. D9 (a thread per module) is locked.
