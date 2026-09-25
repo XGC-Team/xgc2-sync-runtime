@@ -102,7 +102,12 @@ fn calibrate(name: &str, profile: Profile) -> Outcome {
         }
     }
     let by_seq: HashMap<u64, &xgc_rt_impair::TruthRecord> = truth.iter().filter(|t| t.origin == 0).map(|t| (t.seq, t)).collect();
-    assert_eq!(by_seq.len() as u64, SAMPLES, "the relay saw every sample exactly once (one per datagram)");
+    // Samples the relay never saw were shed by the sender's own best-effort
+    // queue under congestion (control class = drop). None may be received.
+    let sender_shed = (1..=SAMPLES).filter(|seq| !by_seq.contains_key(seq)).count() as u64;
+    for seq in (1..=SAMPLES).filter(|seq| !by_seq.contains_key(seq)) {
+        assert!(!first_owd.contains_key(&seq), "seq {seq} never passed the relay but was received");
+    }
     let count = |a: Action| truth.iter().filter(|t| t.action == a).count() as u64;
     let (relay_drop, relay_dup, relay_reorder) = (count(Action::Drop), count(Action::Duplicate), count(Action::Reorder));
     let mut residual = Vec::new();
@@ -122,10 +127,10 @@ fn calibrate(name: &str, profile: Profile) -> Outcome {
         }
     }
     let c = &s.counts;
-    assert_eq!(c.lost, relay_drop + zenoh_discarded, "every loss is a relay drop or a measured transport discard");
+    assert_eq!(c.lost, relay_drop + zenoh_discarded + sender_shed, "every loss is a relay drop, a receive-side discard, or a sender shed");
     let (p50, p99) = (pct(&mut residual.clone(), 50.0), pct(&mut residual, 99.0));
     println!(
-        "[{name}] expected {} received {} lost {} (relay dropped {relay_drop}, zenoh discarded {zenoh_discarded}) dup {} (relay {relay_dup}) reordered {} (relay held {relay_reorder})\n  OWD p50/p99 {:.3}/{:.3} ms; OWD - injected delay p50/p99 {:.3}/{:.3} ms; bound {} ns",
+        "[{name}] expected {} received {} lost {} (relay dropped {relay_drop}, zenoh discarded {zenoh_discarded}, sender shed {sender_shed}) dup {} (relay {relay_dup}) reordered {} (relay held {relay_reorder})\n  OWD p50/p99 {:.3}/{:.3} ms; OWD - injected delay p50/p99 {:.3}/{:.3} ms; bound {} ns",
         c.expected, c.received, c.lost, c.duplicates, c.reordered,
         s.owd_ns.p50 as f64 / 1e6, s.owd_ns.p99 as f64 / 1e6, p50 as f64 / 1e6, p99 as f64 / 1e6, s.owd_bound_ns.max
     );
