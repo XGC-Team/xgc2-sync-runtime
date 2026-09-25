@@ -8,10 +8,9 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use xgc_rt_core::clock::WallClock;
@@ -19,59 +18,22 @@ use xgc_rt_core::manifest::Manifest;
 use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
-fn ros_prefix() -> Option<PathBuf> {
-    std::env::var_os("ROS_PREFIX").map(PathBuf::from).filter(|p| p.join("include/ros/ros.h").is_file())
-}
-
-fn ros_io_lib(prefix: &std::path::Path) -> &'static PathBuf {
-    static LIB: OnceLock<PathBuf> = OnceLock::new();
-    LIB.get_or_init(|| {
-        let out = common::workspace_root().join("target/plugin-tests/ros");
-        std::fs::create_dir_all(&out).unwrap();
-        let lib = out.join("libros_io.so");
-        let status = Command::new(common::workspace_root().join("scripts/build-ros-io.sh")).arg(&lib).env("ROS_PREFIX", prefix).status().unwrap();
-        assert!(status.success(), "building ros_io failed");
-        lib
-    })
-}
-
-/// A command run with the ROS environment (`source $ROS_PREFIX/setup.sh`).
-fn ros_command(prefix: &std::path::Path, program: &str) -> Command {
-    let mut c = Command::new("bash");
-    let path = format!("{}:{}", prefix.join("bin").display(), std::env::var("PATH").unwrap_or_default());
-    c.env("PATH", path).arg("-c").arg(format!("source '{}/setup.sh' && exec \"$0\" \"$@\"", prefix.display())).arg(program);
-    c
-}
-
-struct Roscore(Child);
-
-impl Drop for Roscore {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[test]
 fn imu_and_vrpn_topics_run_the_eskf_module_and_its_vision_pose_goes_back_to_ros() {
-    let Some(prefix) = ros_prefix() else {
+    let Some(prefix) = common::ros_prefix() else {
         eprintln!("skipped: set ROS_PREFIX to a ROS Noetic install to run the ros_io test");
         return;
     };
-    let ros_io = ros_io_lib(&prefix).clone();
+    let ros_io = common::ros_io_lib(&prefix).clone();
     let (eskf, _) = common::est_rigid_state();
     let port = 11411;
     let master = format!("http://127.0.0.1:{port}");
     let ros_home = common::scratch("ros-home");
-    let _core = Roscore(
-        ros_command(&prefix, "roscore")
-            .args(["-p", &port.to_string()])
-            .env("ROS_HOME", &ros_home)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let _core = common::Roscore::spawn({
+        let mut c = common::ros_command(&prefix, "roscore");
+        c.args(["-p", &port.to_string()]).env("ROS_HOME", &ros_home).stdout(Stdio::null()).stderr(Stdio::null());
+        c
+    });
     std::thread::sleep(Duration::from_secs(3));
     // ros::init in this process reads the master from the environment.
     std::env::set_var("ROS_MASTER_URI", &master);
@@ -133,7 +95,7 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
         let stop = stop.clone();
         std::thread::spawn(move || host.run(&stop).unwrap())
     };
-    let player = ros_command(&prefix, "python3")
+    let player = common::ros_command(&prefix, "python3")
         .arg(common::workspace_root().join("crates/xgc-rt-host/tests/ros/eskf_chain.py"))
         .arg("4.0")
         .env("ROS_HOME", &ros_home)
