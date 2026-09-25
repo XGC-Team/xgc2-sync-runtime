@@ -221,6 +221,8 @@ pub struct StartupTimings {
     pub manifest_ms: f64,
     pub plugins_loaded_ms: f64,
     pub ports_ready_ms: f64,
+    /// Every plugin created and configured (on the executor thread).
+    pub configured_ms: f64,
     pub clock_ok_ms: f64,
     pub peers_ready_ms: f64,
     pub first_round_ms: f64,
@@ -287,8 +289,8 @@ impl Default for HostOptions {
 }
 
 impl Host {
-    /// Load, validate and wire everything up to "ports ready". Nothing is
-    /// activated yet. Relative plugin and audit paths resolve against
+    /// Load, validate and wire everything up to "ports ready". No plugin
+    /// instance exists yet: `run` creates them on the executor thread. Relative plugin and audit paths resolve against
     /// `base_dir`, the manifest's directory.
     pub fn new(
         manifest: Manifest,
@@ -471,9 +473,9 @@ impl Host {
             started,
             run_dir,
         };
-        for i in 0..host.slots.len() {
-            host.bring_up(i)?;
-        }
+        // Plugins are created and configured in `run`, on the executor
+        // thread: the ABI promises every vtable call happens there, and
+        // wrapped code (e.g. libxgc2-state-machine) enforces thread ownership.
         Ok(host)
     }
 
@@ -625,6 +627,10 @@ impl Host {
 
     /// Run until `stop` is set or `session.run_for_ms` after E0 elapses.
     pub fn run(mut self, stop: &AtomicBool) -> Result<RunSummary, HostError> {
+        for i in 0..self.slots.len() {
+            self.bring_up(i)?;
+        }
+        self.timings.configured_ms = ms_since(self.started);
         // Clock gate: in Z1 the clock is local and always admitted. Z2 adds
         // the chrony/probe gate and the Sim authority.
         self.timings.clock_ok_ms = ms_since(self.started);
