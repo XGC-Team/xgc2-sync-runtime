@@ -3077,6 +3077,7 @@ dependencies = [
 name = "xgc-rt-host"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libloading",
  "serde",
  "serde_json",

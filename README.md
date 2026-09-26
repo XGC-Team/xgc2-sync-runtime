@@ -58,6 +58,8 @@ With the real dependencies configured, `scripts/check-native-gates.sh` checks
 the executed test counts and rejects those skips. The [recorded validation](docs/validation/native-20260926/README.md)
 lists source identities, replay hashes, software-plant results and limitations.
 
+The runtime-owned [deployment renderer](docs/native-deployment.md) binds an actual Session, robot namespace, topics, calibration provenance and artifact hashes into a private manifest generation. Use its target-local `run` entry with the ordinary managed-process definition; `prepare` alone does not establish module readiness.
+
 ## Design and plan
 
 Decisions, rationale and the development plan for this runtime are kept in the academic knowledge base: lxk36/academic, `docs/architecture/xgc2-sync-runtime/`. This repository keeps only present-tense how-to.

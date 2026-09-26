@@ -1,0 +1,122 @@
+# uav-control-dfbc-native-hover/v1
+# Hash these exact bytes. Only the owner renderer binds the identity, roles,
+# artifact paths/hashes, explicit takeoff/calibration, and audit generation.
+# Other algorithm settings use the exact bundled upstream core defaults.
+[session]
+id = "UNBOUND"
+node = "SELF"
+roster = ["SELF"]
+period_ms = 1
+start_delay_ms = 100
+
+[transport]
+kind = "loopback"
+
+[audit]
+dir = "UNBOUND"
+
+[[channel]]
+name = "imu"
+qos = "state"
+[[channel]]
+name = "pose"
+qos = "state"
+[[channel]]
+name = "vision_pose"
+qos = "state"
+[[channel]]
+name = "rigid_state"
+qos = "state"
+[[channel]]
+name = "estimate"
+qos = "state"
+[[channel]]
+name = "fcu_state"
+qos = "state"
+[[channel]]
+name = "local_pose"
+qos = "state"
+[[channel]]
+name = "local_velocity"
+qos = "state"
+[[channel]]
+name = "fcu_imu"
+qos = "state"
+[[channel]]
+name = "battery"
+qos = "state"
+[[channel]]
+name = "command"
+qos = "event"
+[[channel]]
+name = "alg_setpoint"
+qos = "control"
+[[channel]]
+name = "hover_thrust"
+qos = "state"
+[[channel]]
+name = "attitude_target"
+qos = "state"
+[[channel]]
+name = "setpoint"
+qos = "control"
+[[channel]]
+name = "attitude_rate"
+qos = "control"
+[[channel]]
+name = "fcu_request"
+qos = "event"
+[[channel]]
+name = "status"
+qos = "state"
+[[channel]]
+name = "ref_request"
+qos = "event"
+[[channel]]
+name = "ref_status"
+qos = "state"
+[[channel]]
+name = "ref_active_analytic"
+qos = "state"
+[[channel]]
+name = "ref_active_polynomial"
+qos = "state"
+[[channel]]
+name = "ref_active_sampled"
+qos = "state"
+
+[[plugin]]
+name = "ros_io"
+path = "ros_io"
+trigger = "on_round"
+config = {}
+bind = { imu = {channel="imu"}, pose = {channel="pose"}, vision_pose = {channel="vision_pose",from=["SELF"]}, rigid_state_estimate = {channel="estimate",from=["SELF"]}, fcu_state = {channel="fcu_state"}, local_pose = {channel="local_pose"}, local_velocity = {channel="local_velocity"}, fcu_imu = {channel="fcu_imu"}, battery = {channel="battery"}, command = {channel="command"}, alg_setpoint = {channel="alg_setpoint"}, attitude_target = {channel="attitude_target"}, setpoint = {channel="setpoint",from=["SELF"]}, attitude_rate = {channel="attitude_rate",from=["SELF"]}, status = {channel="status",from=["SELF"]}, fcu_request = {channel="fcu_request",from=["SELF"]} }
+
+[[plugin]]
+name = "rigid-state"
+path = "rigid_state"
+trigger = "both"
+config = {time_source="session"}
+bind = {imu={channel="imu",from=["SELF"]},pose={channel="pose",from=["SELF"]},rigid_state={channel="rigid_state"},vision_pose={channel="vision_pose"},estimate={channel="estimate"}}
+
+[[plugin]]
+name = "ctl-px4"
+path = "controller"
+trigger = "on_round"
+step_budget_ms = 10
+config = {time_source="session",tracking_backend="dfbc",reference_analytic_type=3}
+bind = {estimate={channel="estimate",from=["SELF"]},local_pose={channel="local_pose",from=["SELF"]},local_velocity={channel="local_velocity",from=["SELF"]},imu={channel="fcu_imu",from=["SELF"]},fcu_state={channel="fcu_state",from=["SELF"]},battery={channel="battery",from=["SELF"]},vrpn_pose={channel="pose",from=["SELF"]},command={channel="command",from=["SELF"]},alg_setpoint={channel="alg_setpoint",from=["SELF"]},hover_thrust={channel="hover_thrust",from=["SELF"]},setpoint={channel="setpoint"},attitude_rate={channel="attitude_rate"},fcu_request={channel="fcu_request"},status={channel="status"},ref_request={channel="ref_request"},ref_active_analytic={channel="ref_active_analytic",from=["SELF"]},ref_active_polynomial={channel="ref_active_polynomial",from=["SELF"]},ref_active_sampled={channel="ref_active_sampled",from=["SELF"]}}
+
+[[plugin]]
+name = "ref-trajectory"
+path = "reference"
+trigger = "on_round"
+config = {time_source="session"}
+bind = {analytic={channel="ref_request",from=["SELF"]},status={channel="ref_status"},active_analytic={channel="ref_active_analytic"},active_polynomial={channel="ref_active_polynomial"},active_sampled={channel="ref_active_sampled"}}
+
+[[plugin]]
+name = "hover-thrust"
+path = "hover_thrust"
+trigger = "both"
+config = {time_source="session"}
+bind = {imu={channel="imu",from=["SELF"]},attitude_target={channel="attitude_target",from=["SELF"]},pose={channel="pose",from=["SELF"]},hover_thrust={channel="hover_thrust"}}
