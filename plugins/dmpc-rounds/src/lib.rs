@@ -71,7 +71,8 @@ pub fn plan_uav_id(p: &[u8]) -> Option<u32> {
     let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
     let (states, steps, rest) = (u(12) as usize, u(16) as usize, u(20) as usize);
     let doubles = states.checked_mul(steps)?.checked_add(rest)?;
-    (p.len() == PLAN_HEADER + doubles * 8).then(|| u(8))
+    let bytes = doubles.checked_mul(8)?.checked_add(PLAN_HEADER)?;
+    (p.len() == bytes).then(|| u(8))
 }
 
 /// `xgc.dmpc.sync_trigger/1` for round `k`.
@@ -368,6 +369,25 @@ mod tests {
         p[20..24].copy_from_slice(&rest.to_le_bytes());
         p.resize(PLAN_HEADER + 8 * (states * steps + rest) as usize, 0);
         p
+    }
+
+    #[test]
+    fn rejects_overflowing_plan_counts_without_panicking() {
+        for (states, steps, rest) in [
+            (0x80000000u32, 0x40000000u32, 0u32),
+            (u32::MAX, u32::MAX, 0),
+            (u32::MAX, u32::MAX, u32::MAX),
+            (0x10000, 0x10000, 0),
+            (1, 1, u32::MAX),
+            (0, 0, u32::MAX),
+        ] {
+            let mut p = vec![0u8; PLAN_HEADER];
+            p[8..12].copy_from_slice(&1u32.to_le_bytes());
+            p[12..16].copy_from_slice(&states.to_le_bytes());
+            p[16..20].copy_from_slice(&steps.to_le_bytes());
+            p[20..24].copy_from_slice(&rest.to_le_bytes());
+            assert_eq!(plan_uav_id(&p), None);
+        }
     }
 
     #[test]

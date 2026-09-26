@@ -448,8 +448,13 @@ struct RosIo {
       xgc_dmpc_assumed_trajectory_v1 h;
       if (v.len < sizeof h) continue;
       std::memcpy(&h, v.data, sizeof h);
-      const size_t states = static_cast<size_t>(h.num_states) * h.num_timesteps;
-      if (v.len != sizeof h + 8 * (states + h.rest_len)) continue;
+      // Bound allocation by the actual received bytes. A uint32-by-uint32
+      // product fits uint64_t; its byte count need not fit size_t.
+      if ((v.len - sizeof h) % 8 != 0) continue;
+      const uint64_t state_count = static_cast<uint64_t>(h.num_states) * h.num_timesteps;
+      const size_t elements = (v.len - sizeof h) / 8;
+      if (state_count > elements || h.rest_len != elements - state_count) continue;
+      const size_t states = static_cast<size_t>(state_count);
       formation_generator::AssumedTrajectory m;
       m.header.stamp.fromSec(h.stamp);
       m.uav_id = static_cast<uint8_t>(h.uav_id);
