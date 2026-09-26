@@ -101,18 +101,17 @@ fn herr<T>(m: impl Into<String>) -> Result<T, HostError> {
 }
 
 /// Append-only `health.jsonl`: timings, lifecycle transitions, plugin logs
-/// and faults. Any thread may write.
+/// and faults. Module threads enqueue; the writer owns disk and stderr I/O.
 pub struct HealthLog {
-    file: Mutex<Option<File>>,
+    output: LineLog,
     clock: Arc<dyn Clock>,
-    echo: bool,
     started: Instant,
 }
 
 impl HealthLog {
     fn open(path: &Path, clock: Arc<dyn Clock>, echo: bool) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: Mutex::new(Some(file)), clock, echo, started: Instant::now() })
+        Ok(Self { output: LineLog::spawn(file, echo, "xgc-health")?, clock, started: Instant::now() })
     }
 
     pub fn event(&self, value: serde_json::Value) {
@@ -120,46 +119,48 @@ impl HealthLog {
         if let (Some(obj), serde_json::Value::Object(extra)) = (line.as_object_mut(), value) {
             obj.extend(extra);
         }
-        let text = line.to_string();
-        if self.echo {
-            eprintln!("{text}");
-        }
-        if let Some(f) = self.file.lock().unwrap().as_mut() {
-            let _ = writeln!(f, "{text}");
-        }
+        let _ = self.output.tx.send(Some(line.to_string()));
     }
 }
 
-/// `steps.jsonl`, written by its own thread so module threads never wait on
-/// the disk.
-struct StepLog {
-    tx: Mutex<mpsc::Sender<Option<String>>>,
+/// Shared writer for health and step logs. Neither disk nor stderr backpressure
+/// belongs on a module thread.
+struct LineLog {
+    tx: mpsc::Sender<Option<String>>,
     writer: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl StepLog {
-    fn open(path: &Path) -> std::io::Result<Self> {
-        let mut out = BufWriter::new(File::create(path)?);
+impl LineLog {
+    fn spawn<W: Write + Send + 'static>(mut out: W, echo: bool, name: &str) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel::<Option<String>>();
-        let writer = std::thread::Builder::new().name("xgc-steps".into()).spawn(move || {
+        let writer = std::thread::Builder::new().name(name.into()).spawn(move || {
             while let Ok(Some(line)) = rx.recv() {
                 let _ = writeln!(out, "{line}");
+                if echo {
+                    eprintln!("{line}");
+                }
             }
             let _ = out.flush();
         })?;
-        Ok(Self { tx: Mutex::new(tx), writer: Mutex::new(Some(writer)) })
+        Ok(Self { tx, writer: Mutex::new(Some(writer)) })
     }
 
     fn sender(&self) -> mpsc::Sender<Option<String>> {
-        self.tx.lock().unwrap().clone()
+        self.tx.clone()
     }
 
     /// Flush and stop, even if abandoned threads still hold senders.
     fn finish(&self) {
-        let _ = self.tx.lock().unwrap().send(None);
+        let _ = self.tx.send(None);
         if let Some(w) = self.writer.lock().unwrap().take() {
             let _ = w.join();
         }
+    }
+}
+
+impl Drop for LineLog {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -361,7 +362,7 @@ struct Runtime {
     clock: Arc<dyn Clock>,
     endpoint: Arc<Endpoint>,
     health: Arc<HealthLog>,
-    steps: StepLog,
+    steps: LineLog,
     modules: Vec<Module>,
     started: Instant,
 }
@@ -1063,7 +1064,9 @@ impl Host {
             HealthLog::open(&audit.dir().join("health.jsonl"), clock.clone(), opts.echo_health)
                 .map_err(|e| HostError(format!("health log: {e}")))?,
         );
-        let steps = StepLog::open(&audit.dir().join("steps.jsonl")).map_err(|e| HostError(format!("step log: {e}")))?;
+        let steps = File::create(audit.dir().join("steps.jsonl"))
+            .and_then(|file| LineLog::spawn(BufWriter::new(file), false, "xgc-steps"))
+            .map_err(|e| HostError(format!("step log: {e}")))?;
 
         // Load and validate every plugin before opening the transport.
         let mut loaded = Vec::new();
@@ -1577,6 +1580,7 @@ impl Host {
         };
         rt.health.event(serde_json::json!({ "event": "stopped", "rounds": rounds, "wakeups": wakeups }));
         rt.steps.finish();
+        rt.health.output.finish();
         self.audit.finish().map_err(|e| HostError(format!("audit: {e}")))?;
         Ok(summary)
     }
@@ -1584,4 +1588,64 @@ impl Host {
 
 fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    struct PausedWriter {
+        entered: Option<mpsc::Sender<()>>,
+        resume: mpsc::Receiver<()>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for PausedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.resume.recv().unwrap();
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn health_events_do_not_wait_for_the_writer_and_finish_drains_them() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(HealthLog {
+            output: LineLog::spawn(PausedWriter {
+                entered: Some(entered_tx), resume: resume_rx, bytes: bytes.clone(),
+            }, false, "test-health").unwrap(),
+            clock: Arc::new(xgc_rt_core::clock::WallClock::new(0)),
+            started: Instant::now(),
+        });
+        log.event(serde_json::json!({"event":"first"}));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let producer_log = log.clone();
+        let producer = std::thread::spawn(move || {
+            producer_log.event(serde_json::json!({"event":"second"}));
+            let _ = sent_tx.send(());
+        });
+        let sent_while_writer_paused = sent_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        resume_tx.send(()).unwrap();
+        producer.join().unwrap();
+        log.output.finish();
+        assert!(sent_while_writer_paused, "plugin logging waited for output I/O");
+        let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let events: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "first");
+        assert_eq!(events[1]["event"], "second");
+        assert!(events[0]["steady_elapsed_ns"].is_u64());
+        assert!(events[1]["t"].is_i64());
+    }
 }
