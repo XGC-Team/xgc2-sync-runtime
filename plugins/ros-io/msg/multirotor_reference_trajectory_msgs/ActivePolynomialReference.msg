@@ -1,0 +1,12 @@
+std_msgs/Header header
+uint32 trajectory_id
+uint32 revision
+uint32 flags
+time start_time
+float64 duration
+uint8 order
+float64[] segment_durations
+float64[] coeff_x
+float64[] coeff_y
+float64[] coeff_z
+float64[] coeff_yaw

@@ -179,6 +179,26 @@ pub fn ctl_px4_lib(prefix: &std::path::Path) -> &'static PathBuf {
     })
 }
 
+/// ref-trajectory built against the ROS-free reference trajectory core
+/// (REF_CORE_LIB_DIR and the other build-ref-trajectory.sh variables), with
+/// the toolchain that built the core (RoboStack's, when present).
+pub fn ref_trajectory_lib(prefix: &std::path::Path) -> &'static PathBuf {
+    static LIB: OnceLock<PathBuf> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let out = workspace_root().join("target/plugin-tests/cpp");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("libref_trajectory.so");
+        let mut c = Command::new(workspace_root().join("scripts/build-ref-trajectory.sh"));
+        c.arg(&lib);
+        let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
+        if std::env::var_os("CXX").is_none() && conda_cxx.is_file() {
+            c.env("CXX", conda_cxx);
+        }
+        assert!(c.status().unwrap().success(), "building ref-trajectory failed");
+        lib
+    })
+}
+
 /// A command run with the ROS environment (`source $ROS_PREFIX/setup.sh`).
 pub fn ros_command(prefix: &std::path::Path, program: &str) -> std::process::Command {
     let mut c = std::process::Command::new("bash");
