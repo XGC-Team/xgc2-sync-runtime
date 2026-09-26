@@ -1,14 +1,30 @@
 # Native deployment renderer v1
 
-The release-owned `xgc-rt-render` renders a frozen, single-robot five-module composition. Deployment validation and native control acceptance are separate gates. This profile uses a 1 ms period and a 10 ms controller watchdog budget; it does not establish a 1 ms execution deadline. Native functional evidence is listed in [the validation record](validation/native-20260926/README.md).
+The release-owned `xgc-rt-render` selects one of two frozen, single-robot five-module compositions. Deployment validation and native control acceptance are separate gates. Both profiles use a 1 ms period and a 10 ms controller watchdog budget; this does not establish a 1 ms execution deadline. Native functional evidence is listed in [the validation record](validation/native-20260926/README.md).
 
 Executable: `xgc-rt-render` (same bundle/bin directory as xgc-rt-host). The existing xgc-rt-host `--manifest` CLI is unchanged.
 
 ```
 xgc-rt-render describe
+xgc-rt-render describe --composition-id uav-control-px4-local-native-hover/v1
 xgc-rt-render prepare --bundle-root /opt/xgc2/sync-runtime --state-root /absolute/private/test-state --deployment-json JSON
 xgc-rt-render run --bundle-root /opt/xgc2/sync-runtime --deployment-json JSON
 ```
+
+`describe` without a selector retains `uav-control-dfbc-native-hover/v1`. The
+explicit selector accepts only that ID and `uav-control-px4-local-native-hover/v1`.
+The latter uses the controller's PX4_LOCAL backend to consume PositionTarget
+messages on the declared `alg_setpoint_topic`; it has no built-in DMPC planner.
+The reference module remains available in this five-module graph, but its
+analytic stream does not supply the PX4_LOCAL tracking input. The DFBC profile
+uses its existing reference-generator path and ignores algorithm PositionTargets.
+
+Each bundle pins exactly one composition SHA. Use the selected `describe` result
+when packaging and verifying it; a renderer supporting both profiles does not
+allow either graph to run against a bundle pinned to the other. `prepare` and
+`run` select exclusively from the deployment JSON ID/SHA, with the same strict
+configuration and five artifact roles for both profiles. Arbitrary backend,
+graph or plugin-role overrides are not accepted.
 
 `run` selects exactly one nonempty target-owned `XGC_AGENT_MANAGED_ROOT` or `XGC_CORE_MANAGED_ROOT` (both permitted only if equal), creates `<managed-root>/sync-runtime/<session_id>/<node_id>/generations/<nonce>/node.toml`, and execs the verified bundle host with that manifest. The launcher invokes no shell, removes inherited ROS_HOSTNAME, sets ROS_MASTER_URI/ROS_IP from the frozen configuration and sets ROS_NAMESPACE to the selected namespace. The host inherits an exclusive identity lock for its entire process lifetime. `prepare` is the isolated render/validation command and releases the lock on exit; it is not the managed launch entry.
 
@@ -103,7 +119,7 @@ Packaging writes a separate **DEPLOYMENT-BUNDLE.json** (exact bytes SHA binds it
 
 Host/plugins/libraries are indexed actual regular ELF files. Bundle links are separately indexed, constrained to the same directory, and resolve to an indexed real file; source/target cannot escape the bundle. Every indexed byte is verified before generation/exec. External ROS and system dependencies remain installed OS dependencies, not forged vendored files. The runtime launch sets LD_LIBRARY_PATH to bundle/lib plus /opt/ros/noetic/lib.
 
-`describe` supplies the canonical composition document and SHA. Composition is built into the renderer, sets a 1 ms period and a controller 10 ms step budget, self-only roster, five actual module roles and source-default algorithm settings except the explicit takeoff/calibration values. No observer, run_for_ms, fixed ROS namespace or automatic extrinsic verification. No Sim clock, distributed synchronization, DMPC or UGV claim.
+`describe` supplies the selected canonical composition document and SHA. Each composition is built into the renderer, sets a 1 ms period and a controller 10 ms step budget, self-only roster, five actual module roles and the fixed backend settings plus explicit takeoff/calibration values. No observer, run_for_ms, fixed ROS namespace or automatic extrinsic verification. No Sim clock, distributed synchronization, DMPC or UGV claim.
 
 State contract: same Session/node identity with different frozen deployment JSON is refused (including bundle/config/composition changes). Same identity/input creates a fresh audit generation; an active `run` blocks a second writer. Identity and generation writes are atomic under a no-symlink directory descriptor lock. Receipt includes deployment/manifest/bundle/config/composition hashes, generation and exact manifest/audit paths; prepare success is not live-module readiness.
 
@@ -125,7 +141,7 @@ The caller explicitly declares `input_time_domain: wall-unix`. The ESKF, hover-t
 
 `prepare` validates schema, files and the real Manifest resolver; its `live_readiness` is always false. A `run` receipt is also not module readiness: host module lifecycle/health (under `<audit_path>/<node_id>/health.jsonl`) and actual output/input evidence must be checked by the managing workflow. The process remains alive until the ordinary managed-process stop signal or an actual host failure; there is no fixture observer or 180-second deadline.
 
-The composition is self-only, with native ESKF, native hover-thrust, DFBC controller, reference generation and ROS I/O. Native hover-thrust owns its internal channel; the ROS adapter is not a second hover-thrust producer. This profile does not include DMPC rounds/planning, multi-robot synchronization, UGV control, physical-flight acceptance, or a simulation-clock profile. The surrounding catalog must claim the robot namespace exclusively across Sessions, not claim only the Session/node identity.
+Both compositions are self-only, with native ESKF, native hover-thrust, the selected controller backend, reference generation and ROS I/O. Native hover-thrust owns its internal channel; the ROS adapter is not a second hover-thrust producer. Neither profile includes DMPC rounds/planning, multi-robot synchronization, UGV control, physical-flight acceptance, or simulation time. The surrounding catalog must claim the robot namespace exclusively across Sessions, not claim only the Session/node identity.
 
 ## Build and boundary tests
 

@@ -13,8 +13,39 @@ pub use files::{prepare, Prepared};
 pub type Result<T> = std::result::Result<T, String>;
 pub const COMPOSITION_ID: &str = "uav-control-dfbc-native-hover/v1";
 pub const COMPOSITION: &str = include_str!("composition.toml");
+pub const PX4_LOCAL_COMPOSITION_ID: &str = "uav-control-px4-local-native-hover/v1";
+pub const PX4_LOCAL_COMPOSITION: &str = include_str!("composition-px4-local.toml");
 pub const BUNDLE_FILE: &str = "DEPLOYMENT-BUNDLE.json";
 pub const MAX_INPUT: usize = 64 * 1024;
+
+/// Release-owned graphs. Both use the same strict five-artifact bundle and
+/// typed input contract; the deployment cannot add roles or edit a graph.
+pub struct Composition {
+    pub id: &'static str,
+    pub bytes: &'static str,
+}
+impl Composition {
+    pub fn sha256(&self) -> String {
+        sha256(self.bytes.as_bytes())
+    }
+}
+static COMPOSITIONS: [Composition; 2] = [
+    Composition {
+        id: COMPOSITION_ID,
+        bytes: COMPOSITION,
+    },
+    Composition {
+        id: PX4_LOCAL_COMPOSITION_ID,
+        bytes: PX4_LOCAL_COMPOSITION,
+    },
+];
+
+pub fn composition(id: &str) -> Result<&'static Composition> {
+    COMPOSITIONS
+        .iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| "unsupported composition identity".into())
+}
 
 pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -203,8 +234,7 @@ impl Deployment {
             "only linux-amd64 is supported by this composition release",
         )?;
         require(
-            self.composition_id == COMPOSITION_ID
-                && self.composition_sha256 == composition_sha256(),
+            self.composition_sha256 == composition(&self.composition_id)?.sha256(),
             "composition identity/digest mismatch",
         )?;
         require(
@@ -369,17 +399,19 @@ pub fn render(
     audit: &Path,
 ) -> Result<String> {
     let config = deployment.validate()?;
+    let composition = composition(&deployment.composition_id)?;
     require(
         bundle.schema_version == 1
             && bundle.platform == deployment.platform
-            && bundle.composition_sha256 == composition_sha256(),
+            && bundle.composition_sha256 == composition.sha256(),
         "bundle release does not match deployment",
     )?;
     require(
         absolute(bundle_root) && absolute(audit),
         "render paths must be absolute",
     )?;
-    let mut value: toml::Value = COMPOSITION
+    let mut value: toml::Value = composition
+        .bytes
         .parse()
         .map_err(|e| format!("internal composition: {e}"))?;
     value["session"]["id"] = deployment.session_id.clone().into();

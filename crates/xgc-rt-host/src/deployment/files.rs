@@ -247,7 +247,7 @@ fn verify_bundle(root: &Path, deployment: &Deployment) -> Result<(Bundle, File)>
     require(
         bundle.schema_version == 1
             && bundle.platform == deployment.platform
-            && bundle.composition_sha256 == composition_sha256(),
+            && bundle.composition_sha256 == composition(&deployment.composition_id)?.sha256(),
         "bundle release mismatch",
     )?;
     require(

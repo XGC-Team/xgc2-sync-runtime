@@ -103,6 +103,12 @@ impl Case {
         self.input.bundle_sha256 = sha256(&bytes);
         fs::write(self.bundle.join(BUNDLE_FILE), bytes).unwrap();
     }
+    fn select_composition(&mut self, id: &str) {
+        self.input.composition_id = id.into();
+        self.input.composition_sha256 = composition(id).unwrap().sha256();
+        let digest = self.input.composition_sha256.clone();
+        self.descriptor(|b| b.composition_sha256 = digest);
+    }
     fn rejected(&self, needle: &str) {
         match self.prepare() {
             Err(error) => assert!(error.contains(needle), "expected {needle}: {error}"),
@@ -473,71 +479,74 @@ fn verified_host_descriptor_survives_directory_entry_replacement() {
 #[test]
 fn real_exec_preserves_pid_frozen_ros_environment_and_process_lifetime_lock() {
     // Real native process execution, deliberately a lifecycle probe, not ROS.
-    let mut c = Case::new();
-    let source = c.root.join("host.c");
-    fs::write(&source,r#"#include <stdio.h>
+    for id in [COMPOSITION_ID, PX4_LOCAL_COMPOSITION_ID] {
+        let mut c = Case::new();
+        c.select_composition(id);
+        let source = c.root.join("host.c");
+        fs::write(&source,r#"#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 int main(int argc,char**argv){
  printf("%d|%s|%s|%s|%s|%s|%s\n",getpid(),argv[1],argv[2],getenv("ROS_MASTER_URI"),getenv("ROS_IP"),getenv("ROS_NAMESPACE"),getenv("ROS_HOSTNAME")?"BAD":"unset"); fflush(stdout);
  return getchar()=='q'?0:3;
 }"#).unwrap();
-    let output = Command::new("cc")
-        .arg(&source)
-        .arg("-o")
-        .arg(c.bundle.join("bin/xgc-rt-host"))
-        .output()
-        .expect("deployment lifecycle test requires a native C compiler");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let host_sha = sha256(&fs::read(c.bundle.join("bin/xgc-rt-host")).unwrap());
-    c.descriptor(|b| b.host.sha256 = host_sha);
-    let managed = c.root.join("managed");
-    c.state = managed.join("sync-runtime");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_xgc-rt-render"))
-        .args([
-            "run",
-            "--bundle-root",
-            c.bundle.to_str().unwrap(),
-            "--deployment-json",
-            &c.raw(),
-        ])
-        .env_remove("XGC_CORE_MANAGED_ROOT")
-        .env("XGC_AGENT_MANAGED_ROOT", &managed)
-        .env("ROS_HOSTNAME", "inherited-wrong")
-        .env("ROS_IP", "1.2.3.4")
-        .env("ROS_MASTER_URI", "http://wrong:1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut receipt = String::new();
-    stdout.read_line(&mut receipt).unwrap();
-    let receipt: Value = serde_json::from_str(&receipt).expect("renderer receipt before exec");
-    let mut line = String::new();
-    stdout.read_line(&mut line).unwrap();
-    assert_eq!(
-        line.trim(),
-        format!(
-            "{}|--manifest|{}|http://172.30.251.251:11311|172.30.251.102|/uav2|unset",
-            child.id(),
-            receipt["manifest_path"].as_str().unwrap()
-        )
-    );
-    c.rejected("active/locked");
-    use std::io::Write;
-    child.stdin.take().unwrap().write_all(b"q").unwrap();
-    assert!(child.wait().unwrap().success());
-    let next = c.prepare().unwrap();
-    assert_ne!(
-        next.receipt.generation,
-        receipt["generation"].as_str().unwrap()
-    );
+        let output = Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(c.bundle.join("bin/xgc-rt-host"))
+            .output()
+            .expect("deployment lifecycle test requires a native C compiler");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let host_sha = sha256(&fs::read(c.bundle.join("bin/xgc-rt-host")).unwrap());
+        c.descriptor(|b| b.host.sha256 = host_sha);
+        let managed = c.root.join("managed");
+        c.state = managed.join("sync-runtime");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_xgc-rt-render"))
+            .args([
+                "run",
+                "--bundle-root",
+                c.bundle.to_str().unwrap(),
+                "--deployment-json",
+                &c.raw(),
+            ])
+            .env_remove("XGC_CORE_MANAGED_ROOT")
+            .env("XGC_AGENT_MANAGED_ROOT", &managed)
+            .env("ROS_HOSTNAME", "inherited-wrong")
+            .env("ROS_IP", "1.2.3.4")
+            .env("ROS_MASTER_URI", "http://wrong:1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut receipt = String::new();
+        stdout.read_line(&mut receipt).unwrap();
+        let receipt: Value = serde_json::from_str(&receipt).expect("renderer receipt before exec");
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line.trim(),
+            format!(
+                "{}|--manifest|{}|http://172.30.251.251:11311|172.30.251.102|/uav2|unset",
+                child.id(),
+                receipt["manifest_path"].as_str().unwrap()
+            )
+        );
+        c.rejected("active/locked");
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"q").unwrap();
+        assert!(child.wait().unwrap().success());
+        let next = c.prepare().unwrap();
+        assert_ne!(
+            next.receipt.generation,
+            receipt["generation"].as_str().unwrap()
+        );
+    }
 }
 #[test]
 fn cli_rejects_duplicate_flags_and_run_state_override() {
@@ -569,6 +578,136 @@ fn cli_rejects_duplicate_flags_and_run_state_override() {
             .status
             .success());
     }
+}
+
+#[test]
+fn describe_selects_only_compiled_compositions_and_preserves_legacy_default() {
+    let bin = env!("CARGO_BIN_EXE_xgc-rt-render");
+    let default = Command::new(bin).arg("describe").output().unwrap();
+    assert!(default.status.success());
+    assert_eq!(
+        composition_sha256(),
+        "e9589ea20818504ab2e698ac0ffd8db21e0410581c41c70147e4ebe06b37b985"
+    );
+    for id in [COMPOSITION_ID, PX4_LOCAL_COMPOSITION_ID] {
+        let output = Command::new(bin)
+            .args(["describe", "--composition-id", id])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        if id == COMPOSITION_ID {
+            assert_eq!(output.stdout, default.stdout);
+        }
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            value,
+            json!({"schema_version":1,"composition_id":id,
+            "composition_sha256":composition(id).unwrap().sha256(),
+            "composition_bytes":composition(id).unwrap().bytes,"platform":"linux-amd64",
+            "input_time_domain":"wall-unix","managed_launch":"run","live_readiness":false})
+        );
+    }
+    for args in [
+        vec!["describe", "--composition-id"],
+        vec!["describe", "--composition-id", "unknown"],
+        vec!["describe", "--composition-id", "plan-dmpc/v1"],
+        vec![
+            "describe",
+            "--composition-id",
+            PX4_LOCAL_COMPOSITION_ID,
+            "--composition-id",
+            COMPOSITION_ID,
+        ],
+        vec![
+            "describe",
+            "--composition-id",
+            PX4_LOCAL_COMPOSITION_ID,
+            "extra",
+        ],
+        vec!["prepare", "--composition-id", PX4_LOCAL_COMPOSITION_ID],
+        vec!["run", "--composition-id", PX4_LOCAL_COMPOSITION_ID],
+    ] {
+        let output = Command::new(bin).args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "rejected selector must produce no receipt"
+        );
+    }
+}
+
+#[test]
+fn composition_id_digest_and_single_bundle_must_all_match_before_publication() {
+    let ids = [COMPOSITION_ID, PX4_LOCAL_COMPOSITION_ID];
+    for id in ids {
+        for digest_id in ids {
+            for bundle_id in ids {
+                let mut c = Case::new();
+                c.input.composition_id = id.into();
+                c.input.composition_sha256 = composition(digest_id).unwrap().sha256();
+                c.descriptor(|b| b.composition_sha256 = composition(bundle_id).unwrap().sha256());
+                if id == digest_id && id == bundle_id {
+                    let p = c.prepare().unwrap();
+                    let m = manifest(&p);
+                    let cfg = &plugin(&m, "ctl-px4")["config"];
+                    let px4 = id == PX4_LOCAL_COMPOSITION_ID;
+                    assert_eq!(
+                        cfg["tracking_backend"].as_str(),
+                        Some(if px4 { "px4_local" } else { "dfbc" })
+                    );
+                    assert_eq!(cfg.get("reference_analytic_type").is_none(), px4);
+                    assert_eq!(m["session"]["period_ms"].as_integer(), Some(1));
+                    assert_eq!(m["plugin"].as_array().unwrap().len(), 5);
+                    assert_eq!(
+                        p.receipt.composition_sha256,
+                        composition(id).unwrap().sha256()
+                    );
+                } else {
+                    assert!(
+                        c.prepare().is_err(),
+                        "accepted id={id}, digest={digest_id}, bundle={bundle_id}"
+                    );
+                    assert!(!c.state.exists(), "mismatch created state");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn switching_composition_cannot_replace_an_existing_frozen_identity() {
+    for (old, new) in [
+        (COMPOSITION_ID, PX4_LOCAL_COMPOSITION_ID),
+        (PX4_LOCAL_COMPOSITION_ID, COMPOSITION_ID),
+    ] {
+        let mut c = Case::new();
+        c.select_composition(old);
+        let p = c.prepare().unwrap();
+        let path = p.receipt.manifest_path.clone();
+        let bytes = fs::read(&path).unwrap();
+        drop(p);
+        c.select_composition(new);
+        c.rejected("different frozen configuration");
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn second_composition_keeps_strict_configuration_and_fixed_descriptor_roles() {
+    let mut c = Case::new();
+    c.select_composition(PX4_LOCAL_COMPOSITION_ID);
+    c.config(|v| v["tracking_backend"] = json!("dfbc"));
+    c.rejected("configuration schema");
+    let mut c = Case::new();
+    c.select_composition(PX4_LOCAL_COMPOSITION_ID);
+    let mut descriptor: Value =
+        serde_json::from_slice(&fs::read(c.bundle.join(BUNDLE_FILE)).unwrap()).unwrap();
+    descriptor["plugins"]["planner"] = descriptor["plugins"]["controller"].clone();
+    let bytes = serde_json::to_vec(&descriptor).unwrap();
+    c.input.bundle_sha256 = sha256(&bytes);
+    fs::write(c.bundle.join(BUNDLE_FILE), bytes).unwrap();
+    c.rejected("bundle schema");
+    assert!(!c.state.exists());
 }
 
 #[test]

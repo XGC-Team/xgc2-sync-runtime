@@ -11,12 +11,18 @@ fn execute() -> Result<()> {
         .next()
         .ok_or("usage: xgc-rt-render describe|prepare|run [options]")?;
     if action == "describe" {
+        let id = match args.next().as_deref() {
+            None => deployment::COMPOSITION_ID.to_owned(),
+            Some("--composition-id") => args.next().ok_or("--composition-id requires a value")?,
+            Some(_) => return Err("describe accepts only --composition-id <id>".into()),
+        };
         if args.next().is_some() {
-            return Err("describe takes no arguments".into());
+            return Err("describe accepts exactly one composition selector".into());
         }
+        let composition = deployment::composition(&id)?;
         println!(
             "{}",
-            serde_json::json!({"schema_version":1,"composition_id":deployment::COMPOSITION_ID,"composition_sha256":deployment::composition_sha256(),"composition_bytes":deployment::COMPOSITION,"platform":"linux-amd64","input_time_domain":"wall-unix","managed_launch":"run","live_readiness":false})
+            serde_json::json!({"schema_version":1,"composition_id":composition.id,"composition_sha256":composition.sha256(),"composition_bytes":composition.bytes,"platform":"linux-amd64","input_time_domain":"wall-unix","managed_launch":"run","live_readiness":false})
         );
         return Ok(());
     }
