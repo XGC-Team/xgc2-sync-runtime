@@ -5,7 +5,9 @@
 // multirotor_reference_trajectory_msgs messages (in ros_io) and the ROS-free
 // runtime's plain types (reference_types.h, in ref-trajectory) have the same
 // field names. Times travel as their exact sec/nsec, so a round trip changes
-// no bit. frame_id is cut to 31 bytes.
+// no bit. frame_id is cut to 31 bytes. A header type without seq or frame_id
+// (the PX4 controller's plain reference types carry only the stamp) writes
+// them as zero / empty and ignores them on read.
 
 #pragma once
 
@@ -13,6 +15,8 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "xgc_schemas_v1.h"
@@ -50,22 +54,33 @@ struct In {
   }
 };
 
+template <class T, class = void>
+struct has_seq : std::false_type {};
+template <class T>
+struct has_seq<T, std::void_t<decltype(std::declval<T&>().seq)>> : std::true_type {};
+template <class T, class = void>
+struct has_frame_id : std::false_type {};
+template <class T>
+struct has_frame_id<T, std::void_t<decltype(std::declval<T&>().frame_id)>> : std::true_type {};
+
 template <class H>
 void put_header(xgc_ref_header_v1& o, const H& h) {
-  o.seq = h.seq;
+  if constexpr (has_seq<H>::value) o.seq = h.seq;
   o.stamp_sec = h.stamp.sec;
   o.stamp_nsec = h.stamp.nsec;
-  const size_t n = std::min(h.frame_id.size(), sizeof o.frame_id - 1);
-  std::memcpy(o.frame_id, h.frame_id.data(), n);
-  o.frame_id[n] = '\0';
+  if constexpr (has_frame_id<H>::value) {
+    const size_t n = std::min(h.frame_id.size(), sizeof o.frame_id - 1);
+    std::memcpy(o.frame_id, h.frame_id.data(), n);
+    o.frame_id[n] = '\0';
+  }
 }
 
 template <class H>
 void get_header(const xgc_ref_header_v1& i, H& h) {
-  h.seq = i.seq;
+  if constexpr (has_seq<H>::value) h.seq = i.seq;
   h.stamp.sec = i.stamp_sec;
   h.stamp.nsec = i.stamp_nsec;
-  h.frame_id.assign(i.frame_id, strnlen(i.frame_id, sizeof i.frame_id));
+  if constexpr (has_frame_id<H>::value) h.frame_id.assign(i.frame_id, strnlen(i.frame_id, sizeof i.frame_id));
 }
 
 template <class V>

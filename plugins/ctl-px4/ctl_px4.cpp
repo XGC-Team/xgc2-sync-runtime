@@ -16,6 +16,11 @@
 //   in  clock           xgc.clock/1                 (optional; replay: advance time)
 //   in  alg_setpoint    xgc.position_target/1       (optional; planner setpoint, alg/setpoint_raw/local)
 //   in  hover_thrust    xgc.hover_thrust/1          (optional; hover_thrust/estimate_state)
+//   in  ref_active_analytic   xgc.ref.analytic/1    (optional; the reference generator's active
+//   in  ref_active_polynomial xgc.ref.polynomial/1   reference, for the nmpc and dfbc
+//   in  ref_active_sampled    xgc.ref.sampled/1      Custom1 backends)
+//   out ref_request     xgc.ref.analytic/1          (optional; the reference Custom1 activates,
+//                                                    to the reference generator's analytic input)
 //   out setpoint        xgc.position_target/1       (mavros setpoint_raw/local)
 //   out attitude_rate   xgc.body_rate_thrust/1      (optional; setpoint_raw/attitude)
 //   out fcu_request     xgc.fcu_request/1           (optional; arming, set_mode)
@@ -40,9 +45,15 @@
 //                        xgc2-multirotor-controller) exactly; with trace = true
 //                        the trace port carries the harness's output lines.
 //
+// NMPC (tracking_backend "nmpc"): each REQUEST_NMPC_SOLVE is solved inline,
+// as the node's NmpcOutputConsumer worker solves it; the result arrives at
+// the next update, as if the worker had finished at once. The module's
+// thread is its only one, and runs are deterministic.
+//
 // Config: time_source, trace, takeoff_altitude, tracking_backend
 // ("px4_local" | "dfbc" | "nmpc"), local_type_mask, skip_takeoff_init_disarm,
-// planning_period, enable_yaw_control.
+// planning_period, enable_yaw_control, reference_analytic_type. Defaults are
+// config/uav_nmpc.yaml's (the TRO configuration).
 
 #include <algorithm>
 #include <cinttypes>
@@ -63,6 +74,10 @@
 #include "px4_multirotor_controller/common/types.h"
 #include "px4_multirotor_controller/drone_controller.h"
 #include "px4_multirotor_controller/nmpc/nmpc_math_utils.h"
+#include "px4_multirotor_controller/nmpc/uav_nmpc_solver.h"
+#include "px4_multirotor_controller/uav/nmpc_tracking_backend.h"
+#include "px4_multirotor_controller/uav/reference_activation.h"
+#include "reference_wire.hpp"
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
 
@@ -73,7 +88,8 @@ namespace sm = state_machine;
 
 enum Port : uint32_t {
   kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
-  kSetpoint, kAttitudeRate, kFcuRequest, kStatus, kTrace, kAlgSetpoint, kHoverThrust, kPortCount
+  kSetpoint, kAttitudeRate, kFcuRequest, kStatus, kTrace, kAlgSetpoint, kHoverThrust,
+  kRefActiveAnalytic, kRefActivePolynomial, kRefActiveSampled, kRefRequest, kPortCount
 };
 constexpr uint32_t kFirstStatsPort = kEstimate;
 constexpr uint32_t kStatsPorts = 7;  // estimate .. vrpn_pose, in port order
@@ -138,7 +154,24 @@ struct CtlPx4 {
   std::string domain{"idle"};
   std::string line;
 
+  pmc::ReferenceActivation activation;       // ReferenceActivationOutputConsumer
+  pmc::UavNmpcTrackingBackend nmpc_backend;  // NmpcOutputConsumer
+  bool nmpc_entered{false};
+
   CtlPx4() {
+    // config/uav_nmpc.yaml: the values that differ from ControllerConfig's
+    // defaults (world_boundary_json null).
+    pmc::ControllerConfig c = controller.getConfig();
+    c.takeoff_altitude = 2.3;
+    c.local_type_mask = 3072;
+    c.dfbc.acceleration_correction_enabled = true;
+    c.nmpc.hover_thrust_enabled = true;
+    c.safety.position_jump_threshold = 100.0;
+    c.safety.max_velocity_xy = 1000.0;
+    c.safety.max_velocity_z = 1000.0;
+    c.safety.acc_saturation_xy = 1000.0;
+    c.safety.acc_saturation_z = 1000.0;
+    controller.setConfig(c);
     pmc::SensorData::TopicStats* stats[kStatsPorts] = {
         &sensor.uav_state_estimate_stats, &sensor.local_pos_stats, &sensor.local_velocity_stats,
         &sensor.imu_stats, &sensor.state_stats, &sensor.battery_stats, &sensor.vrpn_pose_stats};
@@ -291,8 +324,101 @@ struct CtlPx4 {
         post(pmc::event_type::INPUT_HOVER_THRUST_UPDATED, now, "hover_thrust/estimate_state");
         break;
       }
+      case kRefActiveAnalytic:
+      case kRefActivePolynomial:
+      case kRefActiveSampled: {  // TrajectoryInputProducer::active{Analytic,Polynomial,Sampled}Callback
+        auto& cache = controller.activeTrajectoryCache();
+        const pmc::Time received = pmc::Time().fromNSec(in.t_ns);
+        bool accepted = false;
+        const char* source = "";
+        if (in.port == kRefActiveAnalytic) {
+          pmc::reference::AnalyticReference m;
+          accepted = xgc_ref_wire::decode_analytic(in.data.data(), in.data.size(), m) && cache.updateAnalytic(m, received);
+          source = "alg/multirotor_reference_trajectory/active/analytic";
+        } else if (in.port == kRefActivePolynomial) {
+          pmc::reference::ActivePolynomialReference m;
+          accepted =
+              xgc_ref_wire::decode_polynomial(in.data.data(), in.data.size(), m) && cache.updatePolynomial(m, received);
+          source = "alg/multirotor_reference_trajectory/active/polynomial";
+        } else {
+          pmc::reference::SampledReference m;
+          accepted = xgc_ref_wire::decode_sampled(in.data.data(), in.data.size(), m) && cache.updateSampled(m, received);
+          source = "alg/multirotor_reference_trajectory/active/sampled";
+        }
+        if (accepted) post(pmc::event_type::INPUT_REFERENCE_TRAJECTORY_UPDATED, now, source);
+        break;
+      }
       default:
         break;
+    }
+  }
+
+  // NmpcOutputConsumer::handle + workerLoop, inline; returns the trace text.
+  void solveNmpc(const sm::Event& e, double t) {
+    const uint64_t sequence = e.correlation_id;
+    const pmc::ControllerConfig cfg = controller.getConfig();
+    const double ros_now = pmc::Time(t).toSec();
+    const pmc::Time now(e.timestamp > 0.0 ? e.timestamp : ros_now);
+    const double stage_dt = cfg.nmpc.prediction_horizon / static_cast<double>(pmc::UavNmpcSolver::horizonSteps());
+    std::vector<pmc::Se3Reference> references;
+    pmc::NmpcSolveResult result;
+    result.sequence = sequence;
+    if (!controller.activeTrajectoryCache().sampleHorizon(now, stage_dt, pmc::UavNmpcSolver::horizonSteps(),
+                                                           cfg.nmpc.gravity, references)) {
+      result.success = false;
+      result.solver_status = pmc::nmpc_solver_status::kReferenceSamplingFailed;
+      result.stamp = pmc::Time(t);
+    } else {
+      const pmc::SensorData snapshot = controller.getSensorData();
+      result.stamp = now;
+      nmpc_backend.configure(cfg);
+      if (sequence == 1) {
+        nmpc_backend.exit();
+        nmpc_entered = false;
+      }
+      if (!nmpc_entered) nmpc_entered = nmpc_backend.enter(snapshot);
+      if (nmpc_entered) {
+        result.success = nmpc_backend.compute(snapshot, references, now, result.target);
+        result.solver_status = nmpc_backend.status();
+      } else {
+        result.success = false;
+        result.solver_status = pmc::nmpc_solver_status::kBackendUnavailable;
+      }
+    }
+    controller.nmpcResultBuffer().store(result);
+    sm::Event done(result.success ? pmc::event_type::INPUT_NMPC_SOLVE_SUCCEEDED : pmc::event_type::INPUT_NMPC_SOLVE_FAILED,
+                   sm::EventTimestamp{ros_now});
+    done.source = "nmpc_output_consumer";
+    done.correlation_id = sequence;
+    controller.getStateMachine().postEvent(std::move(done));
+    if (trace) {
+      char buf[48];
+      std::snprintf(buf, sizeof buf, " nmpc %d status %d", result.success ? 1 : 0, result.solver_status);
+      line += buf;
+      appendHex(line, "t", {result.target.body_rate_x, result.target.body_rate_y, result.target.body_rate_z,
+                            result.target.thrust});
+    }
+  }
+
+  // ReferenceActivationOutputConsumer::handle: the reference request.
+  void activateReference(const sm::Event& e, double t, uint64_t round) {
+    const double stamp = e.timestamp > 0.0 ? e.timestamp : pmc::Time(t).toSec();
+    const auto m = activation.make(stamp, controller.getSensorData(), controller.getConfig());
+    auto bytes = xgc_ref_wire::encode_analytic(m);
+    auto* head = reinterpret_cast<xgc_ref_analytic_v1*>(bytes.data());
+    std::strncpy(head->header.frame_id, "map", sizeof head->header.frame_id - 1);
+    publish(kRefRequest, round, bytes.data(), bytes.size());
+    if (trace) {
+      char buf[160];
+      std::snprintf(buf, sizeof buf, " activation %u.%09u req %u id %u rev %u type %u start %u.%09u", m.header.stamp.sec,
+                    m.header.stamp.nsec, m.request_id, m.trajectory_id, m.revision, m.analytic_type, m.start_time.sec,
+                    m.start_time.nsec);
+      line += buf;
+      appendHex(line, "o", {m.duration, m.origin.position.x, m.origin.position.y, m.origin.position.z,
+                            m.origin.orientation.x, m.origin.orientation.y, m.origin.orientation.z,
+                            m.origin.orientation.w});
+      line += " params";
+      for (double v : m.params) appendHex(line, "", {v});
     }
   }
 
@@ -381,6 +507,10 @@ struct CtlPx4 {
           std::strncpy(m.mode, std::get<std::string>(it->second).c_str(), sizeof m.mode - 1);
           publish(kFcuRequest, round, &m, sizeof m);
         }
+      } else if (e.id == pmc::output_event_type::PUBLISH_REFERENCE_TRAJECTORY_ACTIVATION) {
+        activateReference(e, t, round);
+      } else if (e.id == pmc::output_event_type::REQUEST_NMPC_SOLVE) {
+        solveNmpc(e, t);
       } else if (e.id == pmc::output_event_type::PUBLISH_CONTROLLER_STATUS) {
         xgc_controller_status_v1 m{};
         m.stamp = t;
@@ -410,7 +540,7 @@ struct CtlPx4 {
   void drain(std::vector<Input>& into) {
     xgc_sample_view v;
     for (uint32_t port : {kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
-                          kAlgSetpoint, kHoverThrust}) {
+                          kAlgSetpoint, kHoverThrust, kRefActiveAnalytic, kRefActivePolynomial, kRefActiveSampled}) {
       while (host->next(host->host, port, &v) == XGC_OK) {
         if (port == kClock) {
           xgc_clock_v1 c;
@@ -494,6 +624,7 @@ xgc_status configure(void* p, const char* config) {
               cfg::boolean(t, "skip_takeoff_init_disarm", &c.skip_takeoff_init_disarm) &&
               cfg::number(t, "planning_period", &c.planning_period) &&
               cfg::boolean(t, "enable_yaw_control", &c.enable_yaw_control) && cfg::boolean(t, "trace", &self->trace) &&
+              cfg::integer(t, "reference_analytic_type", &c.nmpc.reference_analytic_type) &&
               (source == "session" || source == "input") && mask >= 0 && mask <= 0xFFFF;
     if (backend == "px4_local") c.tracking_backend = pmc::TrackingBackend::PX4_LOCAL;
     else if (backend == "dfbc") c.tracking_backend = pmc::TrackingBackend::DFBC;
@@ -540,6 +671,10 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"trace", XGC_PORT_OUT_OPTIONAL, "xgc.text/1", XGC_QOS_BULK},
     {"alg_setpoint", XGC_PORT_IN_OPTIONAL, "xgc.position_target/1", XGC_QOS_CONTROL},
     {"hover_thrust", XGC_PORT_IN_OPTIONAL, "xgc.hover_thrust/1", XGC_QOS_STATE},
+    {"ref_active_analytic", XGC_PORT_IN_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_STATE},
+    {"ref_active_polynomial", XGC_PORT_IN_OPTIONAL, "xgc.ref.polynomial/1", XGC_QOS_STATE},
+    {"ref_active_sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
+    {"ref_request", XGC_PORT_OUT_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_EVENT},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

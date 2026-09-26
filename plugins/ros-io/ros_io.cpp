@@ -23,6 +23,7 @@
 //     ref_waypoint     multirotor_reference_trajectory_msgs/WaypointReferenceRequest -> xgc.ref.waypoint_request/1
 //     ref_sampled      multirotor_reference_trajectory_msgs/SampledReference        -> xgc.ref.sampled/1
 //     ref_reset        std_msgs/Empty                        -> xgc.ref.reset/1
+//     hover_thrust     hover_thrust_estimator_msgs/HoverThrustEstimate -> xgc.hover_thrust/1
 //   module inputs -> ROS
 //     vision_pose      xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
 //     neighbor_plans   xgc.dmpc.assumed_trajectory/1 -> formation_generator/AssumedTrajectory
@@ -68,6 +69,7 @@
 #include <formation_generator/AssumedTrajectory.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
+#include <hover_thrust_estimator_msgs/HoverThrustEstimate.h>
 #include <mavros_msgs/AttitudeTarget.h>
 #include <mavros_msgs/CommandLong.h>
 #include <mavros_msgs/PositionTarget.h>
@@ -124,6 +126,7 @@ enum Port : uint32_t {
   kRefActiveAnalytic,
   kRefActivePolynomial,
   kRefActiveSampled,
+  kHoverThrust,
   kPortCount
 };
 
@@ -131,7 +134,8 @@ const char* const kPortNames[kPortCount] = {
     "imu",       "pose",       "attitude_target", "own_plan", "vision_pose", "neighbor_plans", "sync_trigger",
     "rigid_state_estimate", "fcu_state", "local_pose", "local_velocity", "fcu_imu", "battery", "command",
     "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
-    "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled"};
+    "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled",
+    "hover_thrust"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -340,6 +344,15 @@ struct RosIo {
   }
 
   void on_ref_reset(const std_msgs::Empty::ConstPtr&) { write(kRefReset, xgc_ref_reset_v1{}); }
+
+  void on_hover_thrust(const hover_thrust_estimator_msgs::HoverThrustEstimate::ConstPtr& m) {
+    xgc_hover_thrust_v1 s{};
+    s.stamp = stamp_or_now(m->header.stamp);
+    s.hover_thrust = m->hover_thrust;
+    s.state = m->state;
+    s.flags = m->flags;
+    write(kHoverThrust, s);
+  }
 
   // --- fcu_request service calls -------------------------------------------
 
@@ -619,6 +632,8 @@ struct RosIo {
       subs.push_back(nh->subscribe(topics[kRefWaypoint], queue_size, &RosIo::on_ref_waypoint, this));
     if (enabled(kRefSampled))
       subs.push_back(nh->subscribe(topics[kRefSampled], queue_size, &RosIo::on_ref_sampled, this));
+    if (enabled(kHoverThrust))
+      subs.push_back(nh->subscribe(topics[kHoverThrust], queue_size, &RosIo::on_hover_thrust, this));
     if (enabled(kRefReset)) subs.push_back(nh->subscribe(topics[kRefReset], queue_size, &RosIo::on_ref_reset, this));
     namespace rmsg = multirotor_reference_trajectory_msgs;
     if (enabled(kRefStatus)) pubs[kRefStatus] = nh->advertise<rmsg::ReferenceStatus>(topics[kRefStatus], queue_size, true);
@@ -752,6 +767,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"ref_active_analytic", XGC_PORT_IN_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_STATE},
     {"ref_active_polynomial", XGC_PORT_IN_OPTIONAL, "xgc.ref.polynomial/1", XGC_QOS_STATE},
     {"ref_active_sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
+    {"hover_thrust", XGC_PORT_OUT_OPTIONAL, "xgc.hover_thrust/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

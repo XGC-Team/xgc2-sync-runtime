@@ -11,6 +11,9 @@
 //!   PX4_CORE_LIB_DIR    dir with libpx4_multirotor_controller_core.so
 //!   PX4_REPLAY_STREAM   the replay stream (bag_to_stream.py output)
 //!   PX4_REPLAY_REF      replay_harness output on that stream
+//!   PX4_REPLAY_BACKEND  optional: the tracking backend the harness ran with
+//!                       (px4_local | dfbc | nmpc; default px4_local)
+//!   PX4_REPLAY_REFERENCE_TYPE optional: its reference_analytic_type
 //!   XGC2_PREFIX, ACADOS_ROOT, PX4_CONTROLLER_ROOT, EIGEN_INCLUDE (as for build-ctl-px4.sh)
 //! Without them the test prints why and passes.
 
@@ -31,7 +34,7 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
 // Channel ids = ctl-px4 port indices (the stream converter emits those).
-const CHANNELS: [(&str, Qos); 16] = [
+const CHANNELS: [(&str, Qos); 20] = [
     ("estimate", Qos::State),
     ("local_pose", Qos::State),
     ("local_velocity", Qos::State),
@@ -48,8 +51,12 @@ const CHANNELS: [(&str, Qos); 16] = [
     ("trace", Qos::Bulk),
     ("alg_setpoint", Qos::Control),
     ("hover_thrust", Qos::State),
+    ("ref_active_analytic", Qos::State),
+    ("ref_active_polynomial", Qos::State),
+    ("ref_active_sampled", Qos::State),
+    ("ref_request", Qos::Event),
 ];
-const INPUTS: [u32; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15];
+const INPUTS: [u32; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 18];
 const CLOCK: u32 = 8;
 const TRACE: u32 = 13;
 
@@ -68,6 +75,7 @@ fn convert_stream(prefix: &std::path::Path, stream: &std::path::Path) -> Vec<(u6
     let status = Command::new(cxx)
         .args(["-std=c++17", "-O2"])
         .arg("-I").arg(common::workspace_root().join("abi/include"))
+        .arg("-I").arg(common::workspace_root().join("plugins/common"))
         .arg("-I").arg(&gen)
         .arg("-isystem").arg(prefix.join("include"))
         .arg(common::workspace_root().join("crates/xgc-rt-host/tests/ros/px4_stream_to_xgc.cpp"))
@@ -139,11 +147,15 @@ dir = "audit"
 name = "ctl-px4"
 path = "{lib}"
 trigger = "on_dirty"
-config = {{ time_source = "input", trace = true, takeoff_altitude = 2.3, local_type_mask = 3072, tracking_backend = "px4_local" }}
+# A replay step catches up many ticks at once (with nmpc, one solve each).
+step_budget_ms = 1000.0
+config = {{ time_source = "input", trace = true, tracking_backend = "{backend}"{reference_type} }}
 bind = {{ {binds} }}
 "#,
         lib = lib.display(),
         binds = binds.join(", "),
+        backend = std::env::var("PX4_REPLAY_BACKEND").unwrap_or_else(|_| "px4_local".into()),
+        reference_type = std::env::var("PX4_REPLAY_REFERENCE_TYPE").map(|t| format!(", reference_analytic_type = {t}")).unwrap_or_default(),
     );
     let bus = LoopbackBus::new();
     let clock = Arc::new(WallClock::new(0));
@@ -180,10 +192,19 @@ bind = {{ {binds} }}
     };
     std::thread::sleep(Duration::from_millis(300));
     let mut trace = Vec::new();
+    // Paced against flight time (PX4_REPLAY_SPEED times real time, default
+    // 4): the links are best-effort, so a feeder far ahead of a busy module
+    // (nmpc solves) would let samples be superseded before it reads them.
+    let speed: f64 = std::env::var("PX4_REPLAY_SPEED").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0);
+    let start = std::time::Instant::now();
+    let t_first = records[0].0;
     for (i, (t, port, payload)) in records.iter().enumerate() {
+        let due = Duration::from_secs_f64((*t - t_first) as f64 * 1e-9 / speed);
+        if let Some(wait) = due.checked_sub(start.elapsed()) {
+            std::thread::sleep(wait);
+        }
         feeder.publish(*port, 0, *t as i64, payload).unwrap();
         if i % 32 == 31 {
-            std::thread::sleep(Duration::from_millis(2));
             trace.extend(feeder.drain());
         }
     }
@@ -210,6 +231,7 @@ bind = {{ {binds} }}
     );
     assert!(module.last_error.is_none(), "{module:?}");
     if got != expected {
+        std::fs::write(dir.join("trace.got.txt"), &got).unwrap();
         let (g, e) = (String::from_utf8_lossy(&got), String::from_utf8_lossy(&expected));
         let first = g.lines().zip(e.lines()).position(|(a, b)| a != b);
         panic!(
