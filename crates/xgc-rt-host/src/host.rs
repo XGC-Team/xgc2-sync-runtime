@@ -1481,6 +1481,14 @@ impl Host {
             for at in watch.into_iter().chain(self.clock_service.as_ref().and_then(|c| c.next_due())) {
                 timeout = timeout.min(at.saturating_duration_since(Instant::now()));
             }
+            // Before the shared epoch there are no module/frame wakeups. Poll
+            // on the source's wall cadence so normal advances are committed
+            // without accumulating into a false max-advance fault.
+            if now < e0 {
+                if let Some(spec) = &self.manifest.clock_source {
+                    timeout = timeout.min(Duration::from_millis(spec.poll_wall_ms));
+                }
+            }
             rt.endpoint.wait(timeout.min(MAX_WAIT));
             wakeups += 1;
         }

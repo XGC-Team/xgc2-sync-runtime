@@ -803,3 +803,60 @@ fn frozen_identifier_and_utf8_byte_length_boundaries() {
     c.config(|v| v["topics"]["pose_topic"] = json!("/_private/pose"));
     c.rejected("invalid absolute ROS name");
 }
+
+fn simulation() -> Value {
+    json!({"epoch_ns":2000000000,"topic":"/clock","expected_publisher":"/experiment_world",
+        "world_instance_id":"world-generation-52","startup_timeout_wall_ms":3000,
+        "stale_after_wall_ms":100,"max_advance_ns":50000000,"poll_wall_ms":5,"queue_capacity":256})
+}
+
+#[test]
+fn simulation_uses_shared_epoch_and_existing_source_in_both_control_profiles() {
+    for id in [COMPOSITION_ID, PX4_LOCAL_COMPOSITION_ID] {
+        let mut c = Case::new();
+        c.select_composition(id);
+        c.config(|v| {
+            v["input_time_domain"] = json!("ros1-sim");
+            v["simulation"] = simulation();
+        });
+        let prepared = c.prepare().unwrap();
+        assert_eq!(prepared.receipt.input_time_domain, "ros1-sim");
+        let m = manifest(&prepared);
+        assert_eq!(m["session"]["epoch_ns"].as_integer(), Some(2000000000));
+        assert_eq!(m["session"]["period_ms"].as_integer(), Some(1));
+        assert_eq!(m["clock_source"]["kind"].as_str(), Some("ros1_sim"));
+        assert_eq!(m["clock_source"]["plugin"].as_str(), Some("ros_io"));
+        assert_eq!(m["clock_source"]["expected_publisher"].as_str(), Some("/experiment_world"));
+        assert_eq!(m["clock_source"]["world_instance_id"].as_str(), Some("world-generation-52"));
+        assert_eq!(m["clock_source"]["queue_capacity"].as_integer(), Some(256));
+        assert!(m.get("clock").is_none());
+        assert_eq!(m["plugin"].as_array().unwrap().len(), 5);
+        assert_eq!(plugin(&m, "ctl-px4")["config"]["time_source"].as_str(), Some("session"));
+    }
+}
+
+#[test]
+fn mixed_clock_deployments_and_invalid_host_source_are_rejected() {
+    let mut c = Case::new();
+    c.config(|v| v["input_time_domain"] = json!("ros1-sim"));
+    c.rejected("ros1-sim requires simulation");
+    let mut c = Case::new();
+    c.config(|v| v["simulation"] = simulation());
+    c.rejected("wall-unix forbids simulation");
+    let mut c = Case::new();
+    c.config(|v| v["simulation"] = Value::Null);
+    c.rejected("configuration schema");
+    for (field, bad, reason) in [
+        ("epoch_ns", json!(0), "positive shared session.epoch_ns"),
+        ("expected_publisher", json!("relative"), "authority identity"),
+        ("queue_capacity", json!(0), "timing/queue limits"),
+    ] {
+        let mut c = Case::new();
+        c.config(|v| {
+            v["input_time_domain"] = json!("ros1-sim");
+            v["simulation"] = simulation();
+            v["simulation"][field] = bad;
+        });
+        c.rejected(reason);
+    }
+}

@@ -438,7 +438,9 @@ pub fn prepare(raw: &str, bundle_root: &Path, state_root: &Path) -> Result<Prepa
         generation,
         manifest_path: final_path.join("node.toml"),
         audit_path,
-        input_time_domain: "wall-unix",
+        input_time_domain: match configuration.input_time_domain {
+            TimeDomain::WallUnix => "wall-unix", TimeDomain::Ros1Sim => "ros1-sim",
+        },
         live_readiness: false,
     };
     staged.write_new("node.toml", manifest.as_bytes())?;

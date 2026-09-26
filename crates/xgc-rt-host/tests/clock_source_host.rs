@@ -348,3 +348,23 @@ fn absent_source_retains_wall_execution_without_starting_native_clock_service() 
     assert!(summary.plugins[0].steps > 0);
     assert_eq!(unsafe { f.lib.get::<unsafe extern "C" fn() -> i32>(b"test_clock_created\0").unwrap()() }, 0);
 }
+
+#[test]
+fn normal_advances_before_a_distant_epoch_do_not_accumulate_as_a_jump() {
+    let mut f = Fixture::new("future-epoch");
+    f.manifest.session.epoch_ns = Some(1_000_000_000);
+    let host = f.host();
+    let stop = Arc::new(AtomicBool::new(false));
+    let s = stop.clone();
+    let thread = std::thread::spawn(move || host.run(&s).unwrap());
+    f.epoch_ready();
+    for n in 1..=40 {
+        f.stamp(n * 5_000_000);
+        std::thread::sleep(Duration::from_millis(6));
+    }
+    stop.store(true, Ordering::Release);
+    let summary = thread.join().unwrap();
+    assert!(summary.aborted.is_none(), "{:?}", summary.aborted);
+    assert_eq!(summary.rounds, 0);
+    assert_eq!(f.steps(), 0, "observing pre-epoch time cannot run domain steps");
+}
