@@ -1,0 +1,16 @@
+[package]
+name = "transport-zenoh"
+description = "The Zenoh transport as a transport plugin (xgc_rt_transport_v1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+xgc-rt-core.workspace = true
+xgc-rt-transport-zenoh.workspace = true
+toml.workspace = true

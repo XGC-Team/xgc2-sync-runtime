@@ -153,6 +153,73 @@ typedef struct xgc_plugin_descriptor {
 typedef const xgc_plugin_descriptor* (*xgc_rt_plugin_v1_fn)(void);
 const xgc_plugin_descriptor* xgc_rt_plugin_v1(void);
 
+/* ---------------------------------------------------------------------------
+ * Transport plugin ABI, version 1: how a host moves envelope frames between
+ * nodes (processes). Loopback and Zenoh are transport plugins; the manifest
+ * names one with [transport] path = "...", exactly as [[plugin]] path.
+ *
+ * A transport moves opaque frames. It never stamps, audits or decodes them:
+ * the host does that beside every send and receive, so every transport is
+ * audited identically. The host makes every call except the sink from one
+ * thread at a time; the transport calls the sink from its own IO threads,
+ * and the sink copies the frame and returns without blocking. The sink is
+ * never called after `close` returns.
+ * ------------------------------------------------------------------------- */
+
+#define XGC_RT_TRANSPORT_ABI_VERSION 1u
+
+typedef struct xgc_transport_channel {
+  uint32_t id;            /* the channel id frames carry */
+  xgc_qos qos;
+  const char* name;
+} xgc_transport_channel;
+
+/* Valid for the duration of `open`; the transport copies what it keeps. */
+typedef struct xgc_transport_context {
+  const char* session;
+  const char* node;       /* this node's roster name */
+  uint16_t node_id;       /* its roster index */
+  uint16_t reserved;
+  uint32_t roster_count;
+  const char* const* roster;
+  uint32_t channel_count;
+  const xgc_transport_channel* channels;
+  const char* options;    /* the manifest's [transport] table as TOML text,
+                             without kind, path and sha256 */
+} xgc_transport_context;
+
+/* One received frame; `frame` is valid only during the call. */
+typedef void (*xgc_transport_sink)(void* sink_ctx, const uint8_t* frame, uint32_t len);
+
+typedef struct xgc_transport_vtbl {
+  void* (*create)(void);
+  xgc_status (*open)(void* self, const xgc_transport_context* ctx, xgc_transport_sink sink, void* sink_ctx);
+  /* This node publishes `channel`. */
+  xgc_status (*declare_out)(void* self, uint32_t channel);
+  /* Deliver `channel` from exactly these origins. */
+  xgc_status (*declare_in)(void* self, uint32_t channel, const uint16_t* origins, uint32_t count);
+  xgc_status (*send)(void* self, uint32_t channel, const uint8_t* frame, uint32_t len);
+  /* Block up to `timeout_ns` until every declared out-channel has a matching
+   * remote subscriber: 1 ready, 0 timed out. */
+  int32_t (*wait_ready)(void* self, uint64_t timeout_ns);
+  void (*close)(void* self);
+  void (*destroy)(void* self);
+  /* The reason for the last XGC_ERR* return, or "" (owned by the transport,
+   * valid until its next call). */
+  const char* (*last_error)(void* self);
+} xgc_transport_vtbl;
+
+typedef struct xgc_transport_descriptor {
+  uint32_t abi_version;   /* must equal XGC_RT_TRANSPORT_ABI_VERSION */
+  uint32_t reserved;
+  const char* kind;       /* e.g. "loopback", "zenoh" */
+  const xgc_transport_vtbl* vtbl;
+} xgc_transport_descriptor;
+
+/* The single exported symbol of a transport plugin. */
+typedef const xgc_transport_descriptor* (*xgc_rt_transport_v1_fn)(void);
+const xgc_transport_descriptor* xgc_rt_transport_v1(void);
+
 #ifdef __cplusplus
 }
 #endif
