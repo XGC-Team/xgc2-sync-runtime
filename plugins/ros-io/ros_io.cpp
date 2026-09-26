@@ -99,10 +99,14 @@
 #include <sensor_msgs/Imu.h>
 #include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
+#include <std_msgs/UInt8MultiArray.h>
 
 #include "../common/flat_config.hpp"
 #include "../common/reference_wire.hpp"
+#include "ros_dmpc_edge.hpp"
 #include "ros_edge.hpp"
+#include "ros_paired_pose.hpp"
+#include "xgc_dmpc_planner_v1.h"
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
 
@@ -143,6 +147,12 @@ enum Port : uint32_t {
   kHoverThrust,
   kControllerState,
   kFormationTick,
+  kPairedState,
+  kSceneSnapshot,
+  kSceneHeartbeat,
+  kMissionRequest,
+  kTimelineAck,
+  kTimelineStatus,
   kPortCount
 };
 
@@ -151,7 +161,8 @@ const char* const kPortNames[kPortCount] = {
     "rigid_state_estimate", "fcu_state", "local_pose", "local_velocity", "fcu_imu", "battery", "command",
     "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
     "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled",
-    "hover_thrust", "controller_state", "formation_tick"};
+    "hover_thrust", "controller_state", "formation_tick", "paired_state", "scene_snapshot",
+    "scene_heartbeat", "mission_request", "timeline_ack", "timeline_status"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -184,7 +195,15 @@ std::string text(const char (&in)[N]) {
 struct RosIo {
   const xgc_host_api* host;
   std::string topics[kPortCount];
+  std::string scene_snapshot_topic;
+  std::string scene_state_topic;
   std::string node_name{"xgc_ros_io"};
+  bool have_pose = false;
+  bool have_twist = false;
+  xgc_pose_v1 pose_cache{};
+  xgc_twist_v1 twist_cache{};
+  xgc2_geometry_msgs::SceneSnapshot::ConstPtr snapshot;
+  xgc2_geometry_msgs::SceneState::ConstPtr scene_state;
   std::string frame_id{"world"};
   int queue_size{10};
   double slice_ms{0.0};
@@ -207,6 +226,50 @@ struct RosIo {
   bool calls_stop{false};
 
   ~RosIo() { stop_calls(); }
+
+  void publish_pair() {
+    if (!enabled(kPairedState) || !same_raw_header(have_pose, have_twist, pose_cache.stamp, twist_cache.stamp)) return;
+    xgc_dmpc_paired_state_v1 paired{};
+    fill_paired(pose_cache, twist_cache.stamp, twist_cache.linear[0], twist_cache.linear[1], twist_cache.linear[2],
+                &paired);
+    write(kPairedState, paired);
+  }
+
+  void publish_fixed(Port port, const std_msgs::UInt8MultiArray::ConstPtr& message, size_t size) {
+    if (message->data.size() != size) {
+      log(XGC_LOG_WARN, "ros_io: fixed DMPC payload has the wrong length");
+      return;
+    }
+    write_bytes(port, message->data.data(), size);
+  }
+
+  void on_scene_snapshot(const xgc2_geometry_msgs::SceneSnapshot::ConstPtr& message) {
+    snapshot = message;
+    publish_scene();
+  }
+
+  void on_scene_state(const xgc2_geometry_msgs::SceneState::ConstPtr& message) {
+    scene_state = message;
+    publish_scene();
+  }
+
+  void publish_scene() {
+    if (!snapshot || !scene_state) return;
+    std::vector<uint8_t> blob;
+    std::string error;
+    if (!xgc_dmpc_pack_scene_blob(*snapshot, *scene_state, &blob, &error)) {
+      log(XGC_LOG_WARN, "ros_io: " + error);
+      return;
+    }
+    write_bytes(kSceneSnapshot, blob.data(), blob.size());
+    xgc_dmpc_scene_heartbeat_v1 beat{};
+    beat.received_wall_sec = ros::WallTime::now().toSec();
+    write(kSceneHeartbeat, beat);
+  }
+
+  void on_mission_request(const std_msgs::UInt8MultiArray::ConstPtr& message) {
+    publish_fixed(kMissionRequest, message, sizeof(xgc_dmpc_mission_timeline_v1));
+  }
 
   void log(xgc_log_level level, const std::string& m) const { host->log(host->host, level, m.c_str()); }
 
@@ -244,6 +307,13 @@ struct RosIo {
     s.position[2] = m->pose.position.z;
     quat(s.q_wxyz, m->pose.orientation);
     write(kPose, s);
+    if (!note_pair_pose(enabled(kLocalPose), false, &pose_cache, m->header.stamp.toSec(), m->pose.position.x,
+                        m->pose.position.y, m->pose.position.z, m->pose.orientation.w, m->pose.orientation.x,
+                        m->pose.orientation.y, m->pose.orientation.z)) {
+      return;
+    }
+    have_pose = true;
+    publish_pair();
   }
 
   void on_attitude_target(const mavros_msgs::AttitudeTarget::ConstPtr& m) {
@@ -294,6 +364,13 @@ struct RosIo {
     s.position[2] = m->pose.position.z;
     quat(s.q_wxyz, m->pose.orientation);
     write(kLocalPose, s);
+    if (!note_pair_pose(enabled(kLocalPose), true, &pose_cache, m->header.stamp.toSec(), m->pose.position.x,
+                        m->pose.position.y, m->pose.position.z, m->pose.orientation.w, m->pose.orientation.x,
+                        m->pose.orientation.y, m->pose.orientation.z)) {
+      return;
+    }
+    have_pose = true;
+    publish_pair();
   }
 
   void on_local_velocity(const geometry_msgs::TwistStamped::ConstPtr& m) {
@@ -302,6 +379,10 @@ struct RosIo {
     vec3(s.linear, m->twist.linear);
     vec3(s.angular, m->twist.angular);
     write(kLocalVelocity, s);
+    twist_cache = s;
+    twist_cache.stamp = m->header.stamp.toSec();
+    have_twist = true;
+    publish_pair();
   }
 
   void on_fcu_imu(const sensor_msgs::Imu::ConstPtr& m) {
@@ -653,6 +734,17 @@ struct RosIo {
       lines.swap(call_log);
     }
     for (const auto& l : lines) log(XGC_LOG_INFO, l);
+    auto publish_bytes = [&](Port port, size_t size) {
+      while (host->next(host->host, port, &v) == XGC_OK) {
+        if (v.len != size) continue;
+        std_msgs::UInt8MultiArray message;
+        message.data.assign(v.data, v.data + v.len);
+        pubs[port].publish(message);
+        ++to_ros;
+      }
+    };
+    publish_bytes(kTimelineAck, sizeof(xgc_dmpc_mission_ack_v1));
+    publish_bytes(kTimelineStatus, sizeof(xgc_dmpc_timeline_status_v1));
   }
 
   xgc_status activate() {
@@ -700,6 +792,16 @@ struct RosIo {
       subs.push_back(nh->subscribe(topics[kControllerState], queue_size, &RosIo::on_controller_state, this));
     if (enabled(kFormationTick))
       pubs[kFormationTick] = nh->advertise<formation_generator::FormationTick>(topics[kFormationTick], queue_size);
+    if (!scene_snapshot_topic.empty() && !scene_state_topic.empty()) {
+      subs.push_back(nh->subscribe(scene_snapshot_topic, 1, &RosIo::on_scene_snapshot, this));
+      subs.push_back(nh->subscribe(scene_state_topic, 1, &RosIo::on_scene_state, this));
+    }
+    if (enabled(kMissionRequest))
+      subs.push_back(nh->subscribe(topics[kMissionRequest], queue_size, &RosIo::on_mission_request, this));
+    if (enabled(kTimelineAck))
+      pubs[kTimelineAck] = nh->advertise<std_msgs::UInt8MultiArray>(topics[kTimelineAck], queue_size);
+    if (enabled(kTimelineStatus))
+      pubs[kTimelineStatus] = nh->advertise<std_msgs::UInt8MultiArray>(topics[kTimelineStatus], queue_size);
     if (enabled(kHoverThrust))
       subs.push_back(nh->subscribe(topics[kHoverThrust], queue_size, &RosIo::on_hover_thrust, this));
     if (enabled(kRefReset)) subs.push_back(nh->subscribe(topics[kRefReset], queue_size, &RosIo::on_ref_reset, this));
@@ -784,6 +886,15 @@ xgc_status configure(void* p, const char* config) {
   return guarded(self->host, "configure", [&] {
     const std::string t = config ? config : "";
     for (uint32_t i = 0; i < kPortCount; ++i) self->topics[i] = cfg::text_or(t, (std::string(kPortNames[i]) + "_topic").c_str(), "");
+    self->scene_snapshot_topic = cfg::text_or(t, "scene_snapshot_topic", "");
+    self->scene_state_topic = cfg::text_or(t, "scene_state_topic", "");
+    if (!self->scene_snapshot_topic.empty() && !self->scene_state_topic.empty()) {
+      for (Port port : {kSceneSnapshot, kSceneHeartbeat}) self->topics[port] = "scene";
+    }
+    if (!self->topics[kLocalVelocity].empty() &&
+        (!self->topics[kLocalPose].empty() || !self->topics[kPose].empty())) {
+      self->topics[kPairedState] = "paired";
+    }
     self->node_name = cfg::text_or(t, "node_name", "xgc_ros_io");
     self->frame_id = cfg::text_or(t, "frame_id", "world");
     if (!cfg::number(t, "slice_ms", &self->slice_ms) || self->slice_ms < 0.0) {
@@ -855,6 +966,12 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"hover_thrust", XGC_PORT_OUT_OPTIONAL, "xgc.hover_thrust/1", XGC_QOS_STATE},
     {"controller_state", XGC_PORT_OUT_OPTIONAL, "xgc.controller_status/1", XGC_QOS_STATE},
     {"formation_tick", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.formation_tick/1", XGC_QOS_CONTROL},
+    {"paired_state", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.paired_state/1", XGC_QOS_STATE},
+    {"scene_snapshot", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.scene_snapshot/1", XGC_QOS_STATE},
+    {"scene_heartbeat", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.scene_heartbeat/1", XGC_QOS_STATE},
+    {"mission_request", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.mission_timeline/1", XGC_QOS_EVENT},
+    {"timeline_ack", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.timeline_ack/1", XGC_QOS_EVENT},
+    {"timeline_status", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.timeline_status/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

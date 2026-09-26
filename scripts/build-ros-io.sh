@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the ros_io plugin against a ROS Noetic install.
 #
-# Usage: scripts/build-ros-io.sh OUT.so
+# Usage: scripts/build-ros-io.sh OUT.so [--scene-test OUT_TEST]
 #
 #   ROS_PREFIX  the Noetic prefix (default /opt/ros/noetic). A RoboStack
 #               conda environment works too; its own compiler is then used so
@@ -15,6 +15,18 @@
 # gencpp from the verbatim .msg copies in plugins/ros-io/msg, so the type names
 # and md5 sums equal the original packages'.
 set -euo pipefail
+if [[ $# -ne 1 && $# -ne 3 ]]; then
+  echo "usage: scripts/build-ros-io.sh OUT.so [--scene-test OUT_TEST]" >&2
+  exit 2
+fi
+scene_test=""
+if [[ $# -eq 3 ]]; then
+  if [[ "$2" != "--scene-test" ]]; then
+    echo "usage: scripts/build-ros-io.sh OUT.so [--scene-test OUT_TEST]" >&2
+    exit 2
+  fi
+  scene_test="$3"
+fi
 root="$(cd "$(dirname "$0")/.." && pwd)"
 prefix="${ROS_PREFIX:-/opt/ros/noetic}"
 [[ -f "$prefix/include/ros/ros.h" ]] || { echo "build-ros-io: no ROS Noetic at $prefix (set ROS_PREFIX)" >&2; exit 2; }
@@ -27,13 +39,25 @@ gen="$(dirname "$1")/ros-io-gen"
 rm -rf "$gen"
 for msg in formation_generator/AssumedTrajectory formation_generator/FormationTick periodic_sync/SyncTrigger rigid_state_estimator_msgs/RigidStateEstimate \
   multirotor_reference_trajectory_msgs/{AnalyticReference,SampledReference,FlatReferencePoint,WaypointReferenceRequest,ActivePolynomialReference,ReferenceStatus} \
-  hover_thrust_estimator_msgs/HoverThrustEstimate; do
+  hover_thrust_estimator_msgs/HoverThrustEstimate \
+  xgc2_geometry_msgs/{SceneGeometry,ScenePart,SceneObstacle,SceneObstacleState,SceneSnapshot,SceneState}; do
   pkg="${msg%/*}"
   "$python" "$prefix/lib/gencpp/gen_cpp.py" "$root/plugins/ros-io/msg/$msg.msg" -p "$pkg" \
     -Istd_msgs:"$prefix/share/std_msgs/msg" -Igeometry_msgs:"$prefix/share/geometry_msgs/msg" -Iperiodic_sync:"$root/plugins/ros-io/msg/periodic_sync" -I"$pkg:$root/plugins/ros-io/msg/$pkg" \
     -o "$gen/$pkg" -e "$prefix/share/gencpp" >/dev/null
 done
+edge_obj="$gen/ros_dmpc_edge.o"
+"$cxx" -std=c++17 -O2 -fPIC -Wall -Wextra -fvisibility=hidden \
+  -I "$root/abi/include" -I "$root/plugins/ros-io" -I "$gen" -isystem "$prefix/include" \
+  -c -o "$edge_obj" "$root/plugins/ros-io/ros_dmpc_edge.cpp"
 "$cxx" -std=c++17 -O2 -fPIC -Wall -Wextra -shared -fvisibility=hidden \
   -I "$root/abi/include" -I "$gen" -isystem "$prefix/include" \
   -o "$1" "$root/plugins/ros-io/ros_io.cpp" "$root/plugins/ros-io/ros_clock_source.cpp" \
+  "$edge_obj" \
   -L "$prefix/lib" -Wl,-rpath,"$prefix/lib" -lroscpp -lroscpp_serialization -lrosconsole -lrostime -lcpp_common
+if [[ -n "$scene_test" ]]; then
+  "$cxx" -std=c++17 -O2 -Wall -Wextra \
+    -I "$root/abi/include" -I "$root/plugins/ros-io" -I "$gen" -isystem "$prefix/include" \
+    -o "$scene_test" "$root/plugins/ros-io/ros_dmpc_edge_test.cpp" "$edge_obj" \
+    -L "$prefix/lib" -Wl,-rpath,"$prefix/lib" -lroscpp -lroscpp_serialization -lrosconsole -lrostime -lcpp_common
+fi
