@@ -8,9 +8,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-use xgc_rt_core::clock::WallClock;
 use xgc_rt_core::manifest::Manifest;
 use xgc_rt_core::transport::Transport;
 use xgc_rt_host::{Host, HostOptions};
@@ -64,10 +62,7 @@ fn run() -> Result<bool, String> {
         "zenoh" => Box::new(ZenohTransport::new(ZenohOptions::from_table(&manifest.transport.options).map_err(|e| e.0)?)),
         other => return Err(format!("transport kind {other:?} is not available in this build")),
     };
-    // One host clock, so the bound is 0 on loopback. Z2 sets it from chrony
-    // and the probe.
-    let clock = Arc::new(WallClock::new(0));
-    let host = Host::new(manifest, &base, transport, clock, opts).map_err(|e| e.to_string())?;
+    let host = Host::with_manifest_clock(manifest, &base, transport, opts).map_err(|e| e.to_string())?;
     let summary = host.run(&STOP).map_err(|e| e.to_string())?;
     println!("{}", serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?);
     Ok(summary.aborted.is_none() && summary.plugins.iter().all(|p| p.state != "error" && p.last_error.is_none()))

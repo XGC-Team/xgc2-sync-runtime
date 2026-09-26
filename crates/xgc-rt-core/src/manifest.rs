@@ -45,11 +45,31 @@ pub struct Manifest {
     /// Clock-bound probe (docs/time-model.md). Absent: the bound stays
     /// whatever the clock reports (0 on a single-host loopback run).
     pub clock: Option<ClockSpec>,
+    /// A pinned native source for simulator Session time; absent uses wall time.
+    pub clock_source: Option<ClockSourceSpec>,
     #[serde(rename = "channel", default)]
     pub channels: Vec<ChannelDecl>,
     #[serde(rename = "plugin", default)]
     pub plugins: Vec<PluginDecl>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClockSourceSpec {
+    pub kind: ClockSourceKind,
+    pub plugin: String,
+    pub topic: String,
+    pub expected_publisher: String,
+    pub world_instance_id: String,
+    pub startup_timeout_wall_ms: u64,
+    pub stale_after_wall_ms: u64,
+    pub max_advance_ns: i64,
+    pub poll_wall_ms: u64,
+    pub queue_capacity: u32,
+}
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockSourceKind { Ros1Sim }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -286,6 +306,32 @@ impl Manifest {
             Some(ms) if ms.is_finite() && ms > 0.0 && ms * 1e6 <= period_ns as f64 => (ms * 1e6).round() as i64,
             Some(_) => return err("publish_deadline_ms must be in (0, period_ms]".into()),
         };
+
+        if let Some(c) = &self.clock_source {
+            if self.clock.is_some() { return err("clock_source cannot be combined with wall clock probes".into()); }
+            if !s.epoch_ns.is_some_and(|e| e > 0 && e <= i64::MAX - 10_000_000_000) { return err("clock_source requires a positive shared session.epoch_ns".into()); }
+            if period_ns <= 0 || period_ns > 10_000_000_000 || s.run_for_ms.is_some_and(|ms| i64::try_from(ms).ok().and_then(|v| v.checked_mul(1_000_000)).and_then(|v| s.epoch_ns.unwrap().checked_add(v)).is_none()) {
+                return err("simulator schedule exceeds representable limits".into());
+            }
+            if c.startup_timeout_wall_ms == 0 || c.startup_timeout_wall_ms > 300_000
+                || c.poll_wall_ms == 0 || c.poll_wall_ms > 50
+                || c.stale_after_wall_ms < c.poll_wall_ms * 2 || c.stale_after_wall_ms > 60_000
+                || c.max_advance_ns <= 0 || c.max_advance_ns > 10_000_000_000
+                || !(1..=65536).contains(&c.queue_capacity) {
+                return err("clock_source timing/queue limits are invalid".into());
+            }
+            let ros_name = |v: &str| v.starts_with('/') && v.len() <= 255 && v[1..].split('/').all(|p| !p.is_empty() && p.bytes().enumerate().all(|(i,b)| b.is_ascii_alphabetic() || b == b'_' || i > 0 && b.is_ascii_digit()));
+            if !ros_name(&c.topic) || !ros_name(&c.expected_publisher)
+                || c.world_instance_id.is_empty() || c.world_instance_id.len() > 256
+                || c.world_instance_id.trim() != c.world_instance_id || c.world_instance_id.bytes().any(|b| b.is_ascii_control()) {
+                return err("clock_source authority identity is invalid".into());
+            }
+            let Some(p) = self.plugins.iter().find(|p| p.name == c.plugin) else { return err("clock_source plugin is absent".into()); };
+            if !p.sha256.as_ref().is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                || !p.config.get("node_name").and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty() && !v.contains('\0')) {
+                return err("clock_source requires a SHA256-pinned plugin and its frozen node_name".into());
+            }
+        }
 
         let mut channels = Vec::new();
         let mut channel_ids = BTreeMap::new();

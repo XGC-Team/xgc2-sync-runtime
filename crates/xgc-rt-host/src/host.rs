@@ -106,16 +106,17 @@ pub struct HealthLog {
     file: Mutex<Option<File>>,
     clock: Arc<dyn Clock>,
     echo: bool,
+    started: Instant,
 }
 
 impl HealthLog {
     fn open(path: &Path, clock: Arc<dyn Clock>, echo: bool) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: Mutex::new(Some(file)), clock, echo })
+        Ok(Self { file: Mutex::new(Some(file)), clock, echo, started: Instant::now() })
     }
 
     pub fn event(&self, value: serde_json::Value) {
-        let mut line = serde_json::json!({ "t": self.clock.now() });
+        let mut line = serde_json::json!({ "t": self.clock.now(), "steady_elapsed_ns": self.started.elapsed().as_nanos() as u64 });
         if let (Some(obj), serde_json::Value::Object(extra)) = (line.as_object_mut(), value) {
             obj.extend(extra);
         }
@@ -425,6 +426,7 @@ unsafe fn slot<'a>(host: *mut c_void) -> &'a mut Slot {
 unsafe extern "C" fn api_publish(host: *mut c_void, port: u32, round: u64, data: *const u8, len: u32) -> XgcStatus {
     let s = slot(host);
     let rt = s.rt.clone();
+    if rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable) { return XGC_OK; } // source stopped: discard, never re-stamp later
     let module = &rt.modules[s.module];
     if module.unbound.get(port as usize) == Some(&true) && module.lib.ports[port as usize].is_out {
         return XGC_OK; // an unbound optional output: dropped
@@ -653,6 +655,7 @@ impl ModuleThread {
         let mut last_round = None;
         let mut activated = false;
         let mut last_step = Instant::now();
+        let mut last_generation = None;
         loop {
             let schedule = {
                 let g = inst.inner.lock().unwrap();
@@ -661,7 +664,20 @@ impl ModuleThread {
                 }
                 g.schedule
             };
-            let now = rt.clock.now();
+            let source = rt.clock.dispatch_stamp();
+            if source.is_some_and(|s| !s.runnable || last_generation == Some(s.generation)) {
+                // Session time is frozen: dirty inputs/wake_ms cannot create
+                // more domain work. Stop remains a steady-time wakeup.
+                let mut g = inst.inner.lock().unwrap();
+                if source.is_some_and(|s| !s.runnable) {
+                    // Frozen input queues are not an output replay backlog.
+                    for input in g.inputs.iter_mut().flatten() { input.queue.clear(); }
+                    g.dirty = 0;
+                }
+                let _ = inst.wake.wait_timeout_while(g, Duration::from_millis(1), |g| !g.stop).unwrap();
+                continue;
+            }
+            let now = source.map_or_else(|| rt.clock.now(), |s| s.time);
             if let Some(k) = schedule.and_then(|s| s.round_at(now)) {
                 let schedule = schedule.unwrap();
                 if !activated {
@@ -677,6 +693,9 @@ impl ModuleThread {
                 if restart_due && !self.restart_in_place() {
                     return true;
                 }
+                if rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable || source.is_some_and(|old| old.generation != s.generation)) {
+                    continue; // activation/restart may have outlived this accepted source stamp
+                }
                 let advanced = last_round != Some(k);
                 if let Some(p) = last_round.filter(|p| k > p + 1 && module.trigger != Trigger::OnDirty) {
                     // Woke late (load or a long step): one step for the
@@ -688,7 +707,8 @@ impl ModuleThread {
                 if wake_due || advanced {
                     last_step = Instant::now();
                 }
-                if !self.step(&schedule, k, advanced, wake_due) {
+                last_generation = source.map(|s| s.generation);
+                if !self.step(&schedule, k, advanced, wake_due, source.map(|s| s.time)) {
                     return true;
                 }
             }
@@ -785,7 +805,7 @@ impl ModuleThread {
         self.bring_up() && self.activate()
     }
 
-    fn step(&mut self, schedule: &RoundSchedule, k: u64, advanced: bool, wake_due: bool) -> bool {
+    fn step(&mut self, schedule: &RoundSchedule, k: u64, advanced: bool, wake_due: bool, source_time: Option<i64>) -> bool {
         let rt = self.rt();
         let m = self.s().module;
         let module = &rt.modules[m];
@@ -813,7 +833,7 @@ impl ModuleThread {
         };
         let ctx = XgcStepCtx {
             round: k,
-            now: rt.clock.now(),
+            now: source_time.unwrap_or_else(|| rt.clock.now()),
             round_start: schedule.start(k),
             deadline: schedule.deadline(k),
             dirty_ports: dirty,
@@ -824,7 +844,7 @@ impl ModuleThread {
         self.s().reads.clear();
         module.steps.fetch_add(1, Ordering::Relaxed);
         let (f, instance) = (module.lib.vtbl.step, self.instance);
-        let t0 = rt.clock.now();
+        let t0 = source_time.unwrap_or_else(|| rt.clock.now());
         let began = Instant::now();
         self.inst().in_step.store(true, Ordering::Release);
         let status = self.call(|| unsafe { f(instance, &ctx) });
@@ -964,6 +984,7 @@ pub struct Host {
     started: Instant,
     run_dir: PathBuf,
     clock_service: Option<crate::clock_service::ClockService>,
+    clock_source: Option<crate::clock_source::ClockSource>,
 }
 
 pub struct HostOptions {
@@ -989,6 +1010,25 @@ impl Host {
         clock: Arc<dyn Clock>,
         opts: HostOptions,
     ) -> Result<Self, HostError> {
+        if manifest.clock_source.is_some() {
+            return herr("a manifest clock source requires Host::with_manifest_clock");
+        }
+        Self::build(manifest, base_dir, transport, clock, None, opts)
+    }
+
+    /// Production entry point. The manifest selects one source for both
+    /// colocated and distributed placement; absence preserves wall behavior.
+    pub fn with_manifest_clock(manifest: Manifest, base_dir: &Path, transport: Box<dyn Transport>, opts: HostOptions) -> Result<Self, HostError> {
+        manifest.resolve().map_err(|e| HostError(e.0))?;
+        let source = manifest.clock_source.as_ref().map(|c| Arc::new(xgc_rt_core::clock::SourceClock::new(Duration::from_millis(c.stale_after_wall_ms), c.max_advance_ns)));
+        let clock: Arc<dyn Clock> = match &source {
+            Some(c) => c.clone(),
+            None => Arc::new(xgc_rt_core::clock::WallClock::new(0)),
+        };
+        Self::build(manifest, base_dir, transport, clock, source, opts)
+    }
+
+    fn build(manifest: Manifest, base_dir: &Path, transport: Box<dyn Transport>, clock: Arc<dyn Clock>, source: Option<Arc<xgc_rt_core::clock::SourceClock>>, opts: HostOptions) -> Result<Self, HostError> {
         let started = Instant::now();
         let mut timings = StartupTimings::default();
         let resolved = manifest.resolve().map_err(|e| HostError(e.0))?;
@@ -1013,6 +1053,12 @@ impl Host {
             complete: false,
         };
         let audit = Arc::new(FileAudit::create(&run_dir, meta, clock.clone()).map_err(|e| HostError(format!("audit: {e}")))?);
+        if let Some(source) = &manifest.clock_source {
+            let identity = serde_json::json!({"schema":"xgc-clock-source/1", "kind":"ros1_sim", "world_instance_id":source.world_instance_id,
+                "topic":source.topic, "expected_publisher":source.expected_publisher, "epoch_ns":s.epoch_ns});
+            std::fs::write(audit.dir().join("clock_source.json"), serde_json::to_vec_pretty(&identity).unwrap())
+                .map_err(|e| HostError(format!("clock source audit identity: {e}")))?;
+        }
         let health = Arc::new(
             HealthLog::open(&audit.dir().join("health.jsonl"), clock.clone(), opts.echo_health)
                 .map_err(|e| HostError(format!("health log: {e}")))?,
@@ -1185,14 +1231,24 @@ impl Host {
         };
         timings.ports_ready_ms = ms_since(started);
 
+        let clock_source = match (manifest.clock_source.clone(), source) {
+            (Some(spec), Some(source)) => {
+                let module = modules.iter().find(|m| m.name == spec.plugin).unwrap();
+                let decl = manifest.plugins.iter().find(|p| p.name == spec.plugin).unwrap();
+                let node_name = decl.config["node_name"].as_str().unwrap();
+                Some(crate::clock_source::ClockSource::new(spec, module.lib.clone(), source, node_name).map_err(HostError)?)
+            }
+            _ => None,
+        };
         let rt = Arc::new(Runtime { node_id, link, clock, endpoint, health, steps, modules, started });
-        Ok(Self { manifest, resolved, rt, audit, transport_kind, timings, started, run_dir, clock_service })
+        Ok(Self { manifest, resolved, rt, audit, transport_kind, timings, started, run_dir, clock_service, clock_source })
     }
 
     /// Deliver link frames to every input that listens for their channel
     /// and origin.
     fn route(&mut self, frames: Vec<RxFrame>) {
         let rt = &self.rt;
+        if rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable) { return; }
         let mut batches: Vec<Vec<(u32, Arc<Sample>)>> = vec![Vec::new(); rt.modules.len()];
         for frame in frames {
             if let Some(cs) = self.clock_service.as_mut() {
@@ -1276,6 +1332,15 @@ impl Host {
         let rt = self.rt.clone();
         let mut abandoned = 0u32;
         let mut aborted = None;
+        if let Some(source) = self.clock_source.as_mut() {
+            source.start(rt.health.clone()).map_err(HostError)?;
+            if let Err(reason) = source.wait_first(stop) {
+                rt.health.event(serde_json::json!({"event":"clock_source_startup_failed", "reason":reason}));
+                let _ = source.shutdown();
+                self.audit.finish().map_err(|e| HostError(e.to_string()))?;
+                return Err(HostError(reason));
+            }
+        }
 
         // Start one thread per module; each creates and configures its own
         // instance. Wait for all, watching for hangs in create/configure.
@@ -1329,7 +1394,16 @@ impl Host {
         // Peers: every out-channel has a matching subscriber, or the timeout
         // passes. The aggregator then runs Degraded-by-evidence: the audit
         // shows the loss.
-        let ready = !rt.link || rt.endpoint.wait_ready(Duration::from_millis(self.manifest.session.peer_timeout_ms));
+        let peer_timeout = Duration::from_millis(self.manifest.session.peer_timeout_ms);
+        let ready = if !rt.link { true } else if let Some(source) = self.clock_source.as_ref() {
+            let began = Instant::now();
+            loop {
+                if stop.load(Ordering::Relaxed) || source.clock.snapshot().fault.is_some() { break false; }
+                let remaining = peer_timeout.saturating_sub(began.elapsed());
+                if remaining.is_zero() { break false; }
+                if rt.endpoint.wait_ready(remaining.min(MAX_WAIT)) { break true; }
+            }
+        } else { rt.endpoint.wait_ready(peer_timeout) };
         self.timings.peers_ready_ms = ms_since(self.started);
         if !ready {
             rt.health.event(serde_json::json!({ "event": "peers_timeout", "after_ms": self.timings.peers_ready_ms }));
@@ -1347,6 +1421,16 @@ impl Host {
         let schedule = RoundSchedule::new(e0, self.resolved.period_ns, self.resolved.publish_deadline_ns);
         let stop_at = s.run_for_ms.map(|ms| e0 + (ms as i64) * 1_000_000);
         rt.health.event(serde_json::json!({ "event": "epoch", "e0": e0, "period_ns": schedule.period }));
+        if let Some(source) = self.clock_source.as_ref() {
+            if source.clock.snapshot().fault.is_some() {
+                aborted = source.clock.snapshot().fault;
+            } else if !stop.load(Ordering::Relaxed) && rt.clock.now() >= e0 {
+                source.clock.fail("shared simulator epoch passed before startup completed; new Session required");
+                aborted = source.clock.snapshot().fault;
+            } else {
+                source.clock.arm(!stop.load(Ordering::Relaxed));
+            }
+        }
         for module in &rt.modules {
             module.instance().set_schedule(schedule);
         }
@@ -1354,7 +1438,18 @@ impl Host {
         let mut last_round: Option<u64> = None;
         let mut rounds = 0u64;
         let mut wakeups = 0u64;
+        let mut last_liveness = Instant::now();
         loop {
+            if let Some(source) = self.clock_source.as_ref() {
+                source.check_health();
+                source.clock.commit_host_time();
+                if let Some(reason) = source.clock.snapshot().fault { aborted = Some(reason); }
+                if last_liveness.elapsed() >= Duration::from_secs(1) {
+                    let snapshot = source.clock.snapshot();
+                    rt.health.event(serde_json::json!({"event":"host_liveness", "clock_runnable":snapshot.runnable, "clock_generation":snapshot.generation}));
+                    last_liveness = Instant::now();
+                }
+            }
             let now = rt.clock.now();
             if stop.load(Ordering::Relaxed) || stop_at.is_some_and(|t| now >= t) || aborted.is_some() {
                 break;
@@ -1388,6 +1483,10 @@ impl Host {
             }
             rt.endpoint.wait(timeout.min(MAX_WAIT));
             wakeups += 1;
+        }
+        // Close the external output gate before ordinary module deactivation.
+        if let Some(source) = self.clock_source.as_mut() {
+            if let Err(reason) = source.shutdown() { aborted = Some(reason); }
         }
         if let Some(reason) = &aborted {
             rt.health.event(serde_json::json!({ "event": "aborted", "reason": reason }));

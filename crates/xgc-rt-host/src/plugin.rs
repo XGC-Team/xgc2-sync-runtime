@@ -127,3 +127,22 @@ pub fn load(path: &Path, expected_sha256: Option<&str>) -> Result<LoadedPlugin, 
     };
     Ok(LoadedPlugin { name, version, sha256: digest, ports, vtbl, _library: library })
 }
+
+impl LoadedPlugin {
+    /// Resolve the separate clock-source ABI from this already hash-checked
+    /// library. The owning Arc must outlive all copied function pointers.
+    pub fn clock_source_vtable(&self) -> Result<crate::clock_source_abi::VTable, LoadError> {
+        use crate::clock_source_abi::*;
+        let entry = unsafe { self._library.get::<Entry>(ENTRY) }
+            .map(|v| *v).map_err(|e| LoadError(format!("{}: missing clock-source ABI: {e}", self.name)))?;
+        let desc = unsafe { entry().as_ref() }.ok_or_else(|| LoadError("NULL clock source descriptor".into()))?;
+        if desc.abi_version != VERSION || desc.reserved != 0 {
+            return Err(LoadError("unsupported clock source ABI".into()));
+        }
+        let v = unsafe { desc.vtbl.as_ref() }.ok_or_else(|| LoadError("NULL clock source vtable".into()))?;
+        if v.create.is_none() || v.start.is_none() || v.poll.is_none() || v.set_gate.is_none() || v.stop.is_none() || v.destroy.is_none() {
+            return Err(LoadError("incomplete clock source vtable".into()));
+        }
+        Ok(*v)
+    }
+}

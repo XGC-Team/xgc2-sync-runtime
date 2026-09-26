@@ -35,5 +35,5 @@ for msg in formation_generator/AssumedTrajectory formation_generator/FormationTi
 done
 "$cxx" -std=c++17 -O2 -fPIC -Wall -Wextra -shared -fvisibility=hidden \
   -I "$root/abi/include" -I "$gen" -isystem "$prefix/include" \
-  -o "$1" "$root/plugins/ros-io/ros_io.cpp" \
+  -o "$1" "$root/plugins/ros-io/ros_io.cpp" "$root/plugins/ros-io/ros_clock_source.cpp" \
   -L "$prefix/lib" -Wl,-rpath,"$prefix/lib" -lroscpp -lroscpp_serialization -lrosconsole -lrostime -lcpp_common
