@@ -169,3 +169,133 @@ cargo test -p xgc-rt-host --test deployment
 ```
 
 The deployment suite has no optional environment skip. It checks frozen identities, topology, explicit topics/transforms, strict JSON, wrong pins and unsupported time/platform/composition, path/symlink/FIFO rejection, atomic generations, concurrent writers and lifecycle locks. A tiny compiled C ELF probe verifies actual exec/PID/ROS environment and lock lifetime; it is deliberately not a ROS/native control acceptance claim. The separate native module gates and Agent/robot deployment acceptance must run against the exact final built plugins.
+
+## Numerical HIL composition
+
+`uav-dmpc-numeric-hil/v1` is a fixed model-only graph: `ros_io` supplies the
+scene/clock edge, `station_io` supplies the authorized command/mission edge,
+`dmpc_rounds` exchanges plans over the host's explicit Zenoh transport,
+`plan_dmpc` produces PositionTarget, and `numeric_vehicle` consumes that PVA
+and returns its own paired state and controller state. There is no actuator,
+Arm interface, IMU, estimator, hover estimator, or physical controller in this
+composition. The receipt has `role: "numeric-hil"` and `actuator_namespace: null`.
+The two existing control compositions retain their template bytes and
+`role: "control"`; their actuator namespace is the selected robot namespace.
+
+The HIL configuration is selected by its compiled composition ID. It does not
+accept the control profile's calibration, takeoff, or sensor-topic fields:
+
+```json
+{
+  "input_time_domain": "wall-unix",
+  "ros_master_uri": "http://127.0.0.1:11311",
+  "ros_ip": "127.0.0.1",
+  "epoch_ns": 1900000000000000000,
+  "members": [
+    {"uav_id": 1, "robot_namespace": "uav1", "planner_node": "board-a", "control_node": "board-a"},
+    {"uav_id": 2, "robot_namespace": "uav2", "planner_node": "board-b", "control_node": "board-b"}
+  ],
+  "mission_authority_node": "board-a",
+  "radio": {"listen": ["tcp/127.0.0.1:17442"], "connect": ["tcp/127.0.0.1:17441"]},
+  "station": {"robot_id": "xgc2e-12345678901234567890", "zenoh_connect": "tcp/127.0.0.1:17457", "command_socket": "/run/xgc2/hil-board-b.sock"},
+  "scene": {
+    "snapshot_topic": "/experiment/scene/snapshot",
+    "state_topic": "/experiment/scene/state",
+    "timeline_ack_topic": "/uav2/dmpc/timeline_ack",
+    "timeline_status_topic": "/uav2/dmpc/timeline_status"
+  },
+  "planner": {"algorithm": "legacy", "scene_id": "dmpc-uav8_comprehensive", "chain_n": 3, "state_dim": 9, "horizon": 40, "sampling_time": 0.1},
+  "initial_position": [1.2, -3.4, 0.0],
+  "initial_velocity": [0.1, 0.2, 0.0]
+}
+```
+
+This two-member example shows the renderer's membership contract. A release's
+actual planner may admit a narrower fleet/scene than the renderer; the current
+Comprehensive planner requires all eight slots and rejects other fleet counts
+at configure. Use the real scene slots, explicit initial state, and one shared
+Run epoch for a runnable deployment. A ROS simulation additionally supplies
+`simulation` as described above, with its `epoch_ns` equal to the planner epoch.
+Wall time forbids that block. The 1 ms host base period is unchanged; rounds use
+100 ms planner time and the shared epoch.
+
+Members are ordered experiment slots, not a discovery result. Robot identity
+and node identity differ: the member record names a planner node and a control
+node. This HIL graph requires them to coincide because it contains both the
+planner and model. A remote planner/control pair can be represented by the
+same member type, but needs its actual role-specific composition; selecting
+HIL for a split pair is rejected. Existing control configurations may additionally supply `robot_member`
+with those four fields; the renderer then requires `node_id == control_node`
+and the matching robot namespace. The planner node cannot select that control
+profile or acquire its actuator claim. Missing `robot_member` retains the
+legacy single-node input contract. This identity check does not select a DMPC graph. The fixed planner, full,
+and onboard SMC compositions are separate compiled IDs. Only a composition
+that contains the control role can claim the actuator namespace; namespace
+does not contain Session ID.
+
+The HIL bundle has exactly `ros_io`, `numeric_vehicle`, `plan_dmpc`,
+`dmpc_rounds`, and `station_io` plugin pins. Mixed control/HIL bundles are
+rejected. The authority node alone binds the station command and mission
+outputs; every consumer filters that same envelope origin. The rendered
+station config sets `command` and `mission` from those remaining binds. Neighbor-plan
+origins are planner-node roster indices, while local controller origin is the
+control-node index. Legacy plan admission expects nine state components,
+N+1 predicted columns, and no terminal-rest vector. Initial model state is
+never overwritten with a reference pose.
+
+The station command socket is an explicit per-instance target path (at most
+100 bytes); its parent must exist before launch. Clock and scene ROS traffic
+use the experiment's ROS authority. Neighbor plans use `radio` endpoints and
+station telemetry uses its separate GCS endpoint. Co-located comparison runs
+still use real explicit Zenoh endpoints between processes. Keep ROS world/clock
+on the physics path when impairing neighbor radio; the renderer does not alter
+network interfaces or create a clock bridge.
+
+## DMPC planner, full, and onboard SMC
+
+Three more fixed graphs use the same membership record. They do not add
+hover-thrust or an attitude-rate channel. The two hover templates and the
+numerical HIL graph are unchanged.
+
+| ID | Plugins | Actuator namespace |
+| --- | --- | --- |
+| `uav-dmpc-native/v1` | `ros_io`, `controller`, `plan_dmpc`, `dmpc_rounds`, `station_io` | selected robot |
+| `uav-dmpc-planner/v1` | `ros_io`, `plan_dmpc`, `dmpc_rounds`, `station_io` | none |
+| `uav-dmpc-smc/v1` | `ros_io`, `controller`, `station_io` | selected robot |
+
+`uav-dmpc-native/v1` requires `planner_node == control_node`. The planner and
+SMC graphs require those nodes to differ, and each process must be the node
+its composition names. These three graphs do not include `rigid_state` or the
+`estimate` channel. SMC reads MAVROS `local_pose` and `local_velocity` from
+`ros_io`, plus the planner PositionTarget through the existing 100 ms lifter
+(`planning_period = 0.1`). It does not bind `hover_thrust` or `attitude_rate`.
+The only actuator bindings are the existing `setpoint` and `fcu_request`
+ports. The controller, not this graph, fills that setpoint as an
+acceleration-only world-frame PositionTarget. State estimation and NMPC are
+not part of this acceptance.
+
+`paired_state` is the existing `ros_io` output. On the full graph,
+`plan_dmpc` and `station_io` read it from `SELF`. On the split graphs the
+control node's `ros_io` publishes it, and both the planner and `station_io`
+read it from `control_node`. The controller has no `paired_state` port. There
+is no new schema and no extra sync module. HIL still uses the 96-byte record
+from `numeric_vehicle`. Frame and origin stay on the existing PX4 local pose
+chain; this graph does not add a conversion.
+
+`ros_io` `vision_pose` (`xgc.pose/1`, input) is bound to the existing `pose`
+channel from `SELF` and republishes that external pose on `vision_pose_topic`.
+It is not fed from `local_pose`. Full and SMC `station_io` also reads
+`imu` from the `fcu_imu` channel (`xgc.imu/1`), `battery` (`xgc.battery/1`),
+and `fcu_state` (`xgc.fcu_state/1`). Missing samples stay absent.
+
+Takeoff altitude is explicit on the full and SMC configurations. There is no
+rigid-state role and no calibration block. The renderer does not invent IMU
+samples.
+Current planner ELF for a later load is
+`plan-dmpc-build/libplan_dmpc.so`
+`f89b1ff176c4575e4a3c4b8b159c96bcfc5ee11754d55566af1292eba6d475b5`,
+against ABI `xgc_dmpc_planner_v1.h`
+`ea8b00fe4726a7cc7f7ec5b642f1335a19456c0daf8c4caeb13f3c7012560733`
+(scene wire header 136, obstacle 192, part 120, vertex 24). The older bundle
+copy `55c3005f04c97ef574a714dfeb09f541b84cfb3b7e11290ce99d7abd65f34ecc` is not
+that ABI. This change does not launch those ELFs.

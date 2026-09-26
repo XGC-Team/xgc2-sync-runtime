@@ -1,0 +1,78 @@
+# uav-dmpc-smc/v1
+# Onboard SMC only. No hover-thrust plugin and no attitude-rate channel.
+# Actuator outputs are setpoint and fcu_request. paired_state is ros_io's
+# existing output. The control node publishes it; consumers use control_node.
+[session]
+id = "UNBOUND"
+node = "SELF"
+roster = ["SELF"]
+period_ms = 1
+epoch_ns = 1
+[transport]
+kind = "zenoh"
+listen = []
+connect = []
+[audit]
+dir = "UNBOUND"
+
+[[channel]]
+name = "imu"
+qos = "state"
+[[channel]]
+name = "pose"
+qos = "state"
+[[channel]]
+name = "fcu_state"
+qos = "state"
+[[channel]]
+name = "local_pose"
+qos = "state"
+[[channel]]
+name = "local_velocity"
+qos = "state"
+[[channel]]
+name = "fcu_imu"
+qos = "state"
+[[channel]]
+name = "battery"
+qos = "state"
+[[channel]]
+name = "command"
+qos = "event"
+[[channel]]
+name = "setpoint"
+qos = "control"
+[[channel]]
+name = "fcu_request"
+qos = "event"
+[[channel]]
+name = "controller_state"
+qos = "state"
+[[channel]]
+name = "paired_state"
+qos = "state"
+[[channel]]
+name = "position_target"
+qos = "control"
+
+[[plugin]]
+name = "ros_io"
+path = "ros_io"
+trigger = "on_round"
+config = {}
+bind = {imu={channel="imu"},pose={channel="pose"},vision_pose={channel="pose",from=["SELF"]},fcu_state={channel="fcu_state"},local_pose={channel="local_pose"},local_velocity={channel="local_velocity"},fcu_imu={channel="fcu_imu"},battery={channel="battery"},paired_state={channel="paired_state"},setpoint={channel="setpoint",from=["SELF"]},fcu_request={channel="fcu_request",from=["SELF"]},status={channel="controller_state",from=["SELF"]}}
+
+[[plugin]]
+name = "ctl-px4"
+path = "controller"
+trigger = "on_round"
+step_budget_ms = 10
+config = {time_source="session",tracking_backend="smc",planning_period=0.1}
+bind = {local_pose={channel="local_pose",from=["SELF"]},local_velocity={channel="local_velocity",from=["SELF"]},imu={channel="fcu_imu",from=["SELF"]},fcu_state={channel="fcu_state",from=["SELF"]},battery={channel="battery",from=["SELF"]},vrpn_pose={channel="pose",from=["SELF"]},command={channel="command",from=["AUTHORITY"]},alg_setpoint={channel="position_target",from=["PLANNER"]},setpoint={channel="setpoint"},fcu_request={channel="fcu_request"},status={channel="controller_state"}}
+
+[[plugin]]
+name = "station-io"
+path = "station_io"
+trigger = "on_round"
+config = {}
+bind = {paired_state={channel="paired_state",from=["CONTROL"]},imu={channel="fcu_imu",from=["SELF"]},battery={channel="battery",from=["SELF"]},fcu_state={channel="fcu_state",from=["SELF"]},controller_status={channel="controller_state",from=["SELF"]},command={channel="command"}}

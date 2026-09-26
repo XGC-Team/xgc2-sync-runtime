@@ -48,10 +48,11 @@ impl Case {
             host: pin("bin/xgc-rt-host"),
             plugins: Plugins {
                 ros_io: pin("plugins/ros.so"),
-                rigid_state: pin("plugins/rigid.so"),
-                hover_thrust: pin("plugins/hover.so"),
-                controller: pin("plugins/ctl.so"),
-                reference: pin("plugins/ref.so"),
+                rigid_state: Some(pin("plugins/rigid.so")),
+                hover_thrust: Some(pin("plugins/hover.so")),
+                controller: Some(pin("plugins/ctl.so")),
+                reference: Some(pin("plugins/ref.so")),
+                numeric_vehicle: None, plan_dmpc: None, dmpc_rounds: None, station_io: None,
             },
             libraries: vec![pin("lib/actual.so.1")],
             links: vec![BundleLink {
@@ -340,10 +341,10 @@ fn artifacts_and_descriptor_bytes_are_verified_before_state_creation() {
     fs::write(c.bundle.join(BUNDLE_FILE), b"{}").unwrap();
     c.rejected("descriptor bytes/digest mismatch");
     let mut c = Case::new();
-    c.descriptor(|b| b.libraries.push(b.plugins.controller.clone()));
+    c.descriptor(|b| b.libraries.push(b.plugins.controller.clone().unwrap()));
     c.rejected("duplicate or unsafe bundle path");
     let mut c = Case::new();
-    c.descriptor(|b| b.plugins.controller.path = "plugins/./ctl.so".into());
+    c.descriptor(|b| b.plugins.controller.as_mut().unwrap().path = "plugins/./ctl.so".into());
     c.rejected("unsafe bundle path");
 }
 #[test]
@@ -859,4 +860,305 @@ fn mixed_clock_deployments_and_invalid_host_source_are_rejected() {
         });
         c.rejected(reason);
     }
+}
+
+fn hil_case(authority_self: bool) -> Case {
+    let mut c = Case::new();
+    c.input.node_id = "board-b".into();
+    c.select_composition(HIL_COMPOSITION_ID);
+    c.descriptor(|b| {
+        b.plugins.numeric_vehicle = b.plugins.controller.take();
+        b.plugins.plan_dmpc = b.plugins.rigid_state.take();
+        b.plugins.dmpc_rounds = b.plugins.reference.take();
+        b.plugins.station_io = b.plugins.hover_thrust.take();
+    });
+    c.config(|v| *v = json!({
+        "input_time_domain":"wall-unix", "ros_master_uri":"http://127.0.0.1:11311", "ros_ip":"127.0.0.1",
+        "epoch_ns":1900000000000000000_i64,
+        "members":[
+            {"uav_id":1,"robot_namespace":"uav1","planner_node":"board-a","control_node":"board-a"},
+            {"uav_id":2,"robot_namespace":"uav2","planner_node":"board-b","control_node":"board-b"}],
+        "mission_authority_node":if authority_self {"board-b"} else {"board-a"},
+        "radio":{"listen":["tcp/127.0.0.1:17442"],"connect":["tcp/127.0.0.1:17441"]},
+        "station":{"robot_id":"xgc2e-12345678901234567890","zenoh_connect":"tcp/127.0.0.1:17457","command_socket":"/tmp/hil-board-b.sock"},
+        "scene":{"snapshot_topic":"/experiment/scene/snapshot","state_topic":"/experiment/scene/state",
+            "timeline_ack_topic":"/uav2/dmpc/timeline_ack","timeline_status_topic":"/uav2/dmpc/timeline_status"},
+        "planner":{"algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1},
+        "initial_position":[1.2,-3.4,0.0],"initial_velocity":[0.1,0.2,0.0]
+    }));
+    c
+}
+
+#[test]
+fn hil_fixed_graph_has_real_port_roles_and_no_actuator_or_fake_sensor() {
+    for authority_self in [false, true] {
+        let c = hil_case(authority_self);
+        let prepared = c.prepare().unwrap();
+        let m = manifest(&prepared);
+        assert_eq!(prepared.receipt.role, "numeric-hil");
+        assert_eq!(prepared.receipt.actuator_namespace, None);
+        assert_eq!(m["session"]["roster"], toml::Value::try_from(vec!["board-a", "board-b"]).unwrap());
+        assert_eq!(m["transport"]["kind"].as_str(), Some("zenoh"));
+        assert_eq!(m["session"]["period_ms"].as_integer(), Some(1));
+        let rounds = plugin(&m, "dmpc-rounds");
+        assert_eq!(rounds["config"]["origins"].as_array().unwrap(), &[0.into(),1.into()]);
+        assert_eq!(rounds["config"]["control_origin"].as_integer(), Some(1));
+        assert_eq!(rounds["config"]["planner_period_ms"].as_integer(), Some(100));
+        assert_eq!(rounds["config"]["planner_epoch_ns"], m["session"]["epoch_ns"]);
+        assert_eq!(rounds["bind"]["plan_in"]["from"].as_array().unwrap(), &["board-a".into()]);
+        let station = plugin(&m, "station-io");
+        assert_eq!(station["config"]["authority"].as_bool(), Some(authority_self));
+        assert_eq!(station["bind"].get("command").is_some(), authority_self);
+        assert_eq!(station["bind"].get("mission_request").is_some(), authority_self);
+        assert_eq!(station["config"]["command"].as_bool(), Some(station["bind"].get("command").is_some()));
+        assert_eq!(station["config"]["mission"].as_bool(), Some(station["bind"].get("mission_request").is_some()));
+        assert_eq!(plugin(&m,"numeric-vehicle")["bind"]["command"]["from"].as_array().unwrap(),
+            &[if authority_self {"board-b".into()} else {"board-a".into()}]);
+        let ros = plugin(&m,"ros_io");
+        for key in ["setpoint", "attitude_rate", "fcu_request", "command", "mission_request", "imu", "paired_state"] {
+            assert!(ros["bind"].get(key).is_none());
+            assert!(ros["config"].get(format!("{key}_topic")).is_none());
+        }
+        assert_eq!(plugin(&m,"numeric-vehicle")["config"]["initial_position"].as_array().unwrap()[0].as_float(), Some(1.2));
+        assert_eq!(plugin(&m,"plan-dmpc")["bind"]["neighbor_plan"]["from"].as_array().unwrap(), &["board-b".into()]);
+    }
+    let c = Case::new();
+    let p = c.prepare().unwrap();
+    assert_eq!(p.receipt.role, "control");
+    assert_eq!(p.receipt.actuator_namespace.as_deref(), Some("uav2"));
+}
+
+#[test]
+fn hil_rejects_mixed_graph_clock_authority_and_robot_ownership() {
+    let mut c = hil_case(false);
+    c.config(|v| v["mission_authority_node"] = json!("unlisted")); c.rejected("mission authority");
+    let mut c = hil_case(false);
+    c.config(|v| v["members"][1]["robot_namespace"] = json!("uav3")); c.rejected("namespace");
+    let mut c = hil_case(false);
+    c.config(|v| v["members"][1]["control_node"] = json!("control-board-b")); c.rejected("co-located");
+    let mut c = hil_case(false);
+    c.config(|v| v["members"][1]["planner_node"] = json!("board-a")); c.rejected("execution node");
+    let mut c = hil_case(false);
+    c.config(|v| v["calibration"] = json!({"verified":true})); c.rejected("unknown field");
+    let mut c = hil_case(false);
+    c.config(|v| v["radio"]["listen"] = json!([])); c.rejected("radio");
+    let mut c = hil_case(false);
+    c.config(|v| v["simulation"] = json!(null)); c.rejected("schema");
+    let mut c = hil_case(false);
+    c.descriptor(|b| b.plugins.controller = b.plugins.numeric_vehicle.clone()); c.rejected("roles");
+    let mut c = Case::new();
+    c.descriptor(|b| b.plugins.numeric_vehicle = b.plugins.controller.clone()); c.rejected("roles");
+}
+
+#[test]
+fn robot_identity_supports_remote_planner_and_control_without_granting_planner_actuators() {
+    let member = RobotMember { uav_id: 2, robot_namespace: "uav2".into(), planner_node: "gcs-planner-2".into(), control_node: "board-2".into() };
+    assert_eq!(member.role("gcs-planner-2"), Some(NodeRole::Planner));
+    assert_eq!(member.role("board-2"), Some(NodeRole::Control));
+    assert_eq!(member.role("uav2"), None);
+    let mut c = Case::new();
+    c.input.node_id = "board-2".into();
+    c.config(|v| v["robot_member"] = serde_json::to_value(&member).unwrap());
+    let p = c.prepare().unwrap();
+    assert_eq!(p.receipt.actuator_namespace.as_deref(), Some("uav2"));
+    drop(p);
+    c.input.node_id = "gcs-planner-2".into();
+    c.rejected("control node");
+    // No undeployed SMC/planner profile is advertised by a role-only model.
+    assert!(composition("uav-dmpc-remote-smc/v1").is_err());
+}
+
+#[test]
+fn hil_sim_uses_same_world_epoch_as_planner() {
+    let mut c = hil_case(false);
+    c.config(|v| {
+        v["input_time_domain"] = json!("ros1-sim"); v["epoch_ns"] = json!(2000000000_i64);
+        v["simulation"] = json!({"epoch_ns":2000000000_i64,"topic":"/clock","expected_publisher":"/world_clock",
+            "world_instance_id":"world-52","startup_timeout_wall_ms":5000,"stale_after_wall_ms":2000,
+            "max_advance_ns":1000000000_i64,"poll_wall_ms":2,"queue_capacity":64});
+    });
+    let p = c.prepare().unwrap(); let m = manifest(&p);
+    assert_eq!(p.receipt.input_time_domain, "ros1-sim");
+    assert_eq!(m["clock_source"]["plugin"].as_str(), Some("ros_io"));
+    assert_eq!(m["session"]["epoch_ns"], plugin(&m,"dmpc-rounds")["config"]["planner_epoch_ns"]);
+    drop(p);
+    c.config(|v| v["simulation"]["epoch_ns"] = json!(3000000000_i64)); c.rejected("epochs differ");
+}
+
+fn copy_pin(case: &Case, src: &str, dest: &str) -> BundleFile {
+    let bytes = fs::read(case.bundle.join(src)).unwrap();
+    fs::write(case.bundle.join(dest), &bytes).unwrap();
+    BundleFile { path: dest.into(), sha256: sha256(&bytes) }
+}
+
+fn vehicle_topics() -> Value {
+    json!({
+        "imu_topic":"/uav2/mavros/imu/data_raw","pose_topic":"/mocap/uav2/pose",
+        "vision_pose_topic":"/uav2/mavros/vision_pose/pose",
+        "fcu_state_topic":"/uav2/mavros/state","local_pose_topic":"/uav2/mavros/local_position/pose",
+        "local_velocity_topic":"/uav2/mavros/local_position/velocity_local","fcu_imu_topic":"/uav2/mavros/imu/data",
+        "battery_topic":"/uav2/mavros/battery","setpoint_topic":"/uav2/mavros/setpoint_raw/local",
+        "status_topic":"/uav2/custom/statustext","fcu_request_topic":"/uav2/mavros/cmd"
+    })
+}
+
+fn channel_names(m: &toml::Value) -> Vec<&str> {
+    m["channel"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect()
+}
+
+fn dmpc_case(kind: &str) -> Case {
+    let mut c = Case::new();
+    let plan = copy_pin(&c, "plugins/ctl.so", "plugins/plan.so");
+    let rounds = copy_pin(&c, "plugins/ctl.so", "plugins/rounds.so");
+    let station = copy_pin(&c, "plugins/ctl.so", "plugins/station.so");
+    let colocated = kind == "native";
+    c.input.node_id = if kind == "planner" { "gcs-b" } else { "board-b" }.into();
+    c.descriptor(|b| {
+        b.plugins.rigid_state = None;
+        b.plugins.hover_thrust = None;
+        b.plugins.reference = None;
+        b.plugins.numeric_vehicle = None;
+        b.plugins.station_io = Some(station);
+        if kind == "planner" { b.plugins.controller = None; }
+        if kind != "smc" {
+            b.plugins.plan_dmpc = Some(plan);
+            b.plugins.dmpc_rounds = Some(rounds);
+        }
+    });
+    let id = match kind {
+        "native" => NATIVE_COMPOSITION_ID,
+        "planner" => PLANNER_COMPOSITION_ID,
+        "smc" => SMC_COMPOSITION_ID,
+        _ => panic!("kind"),
+    };
+    c.select_composition(id);
+    let members = if colocated {
+        json!([
+            {"uav_id":1,"robot_namespace":"uav1","planner_node":"board-a","control_node":"board-a"},
+            {"uav_id":2,"robot_namespace":"uav2","planner_node":"board-b","control_node":"board-b"}
+        ])
+    } else {
+        json!([
+            {"uav_id":1,"robot_namespace":"uav1","planner_node":"gcs-a","control_node":"board-a"},
+            {"uav_id":2,"robot_namespace":"uav2","planner_node":"gcs-b","control_node":"board-b"}
+        ])
+    };
+    let mut body = json!({
+        "input_time_domain":"wall-unix","ros_master_uri":"http://127.0.0.1:11311","ros_ip":"127.0.0.1",
+        "epoch_ns":1900000000000000000_i64,
+        "members": members,
+        "mission_authority_node": if colocated {"board-a"} else {"gcs-a"},
+        "radio":{"listen":["tcp/127.0.0.1:17442"],"connect":["tcp/127.0.0.1:17441"]},
+        "station":{"robot_id":"xgc2e-12345678901234567890","zenoh_connect":"tcp/127.0.0.1:17457","command_socket":"/tmp/dmpc-board.sock"}
+    });
+    if kind != "smc" {
+        body["scene"] = json!({"snapshot_topic":"/experiment/scene/snapshot","state_topic":"/experiment/scene/state",
+            "timeline_ack_topic":"/uav2/dmpc/timeline_ack","timeline_status_topic":"/uav2/dmpc/timeline_status"});
+        body["planner"] = json!({"algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1});
+    }
+    if kind != "planner" {
+        body["takeoff_altitude_m"] = json!(1.5);
+        body["topics"] = vehicle_topics();
+    }
+    c.config(|v| *v = body);
+    c
+}
+
+#[test]
+fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
+    assert_eq!(composition_sha256(), "e9589ea20818504ab2e698ac0ffd8db21e0410581c41c70147e4ebe06b37b985");
+    assert_eq!(composition(PX4_LOCAL_COMPOSITION_ID).unwrap().sha256(), "8017449b0396217aae10b9de9548fafcf22bc5bb8e628760c86ad4efaaf6b9f4");
+    assert_eq!(composition(HIL_COMPOSITION_ID).unwrap().sha256(), "319edff2bffe20072d45f9a237a686ffe5ad1f82cdb36ef62e7a336ef1f747d2");
+
+    let native = dmpc_case("native");
+    let prepared = native.prepare().unwrap();
+    let m = manifest(&prepared);
+    let names = channel_names(&m);
+    for banned in ["estimate", "rigid_state", "hover_thrust", "attitude_rate", "vision_pose"] {
+        assert!(!names.contains(&banned), "{banned}");
+    }
+    assert_eq!(prepared.receipt.role, "dmpc-native");
+    assert_eq!(prepared.receipt.actuator_namespace.as_deref(), Some("uav2"));
+    let ros = plugin(&m, "ros_io");
+    assert!(ros["bind"]["paired_state"].get("from").is_none());
+    assert_eq!(ros["bind"]["paired_state"]["channel"].as_str(), Some("paired_state"));
+    assert_eq!(ros["bind"]["vision_pose"]["channel"].as_str(), Some("pose"));
+    assert_eq!(ros["bind"]["vision_pose"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert_ne!(ros["bind"]["vision_pose"]["channel"].as_str(), ros["bind"]["local_pose"]["channel"].as_str());
+    assert_eq!(ros["config"]["vision_pose_topic"].as_str(), Some("/uav2/mavros/vision_pose/pose"));
+    assert_eq!(ros["config"]["local_pose_topic"].as_str(), Some("/uav2/mavros/local_position/pose"));
+    assert_eq!(ros["config"]["local_velocity_topic"].as_str(), Some("/uav2/mavros/local_position/velocity_local"));
+    let ctl = plugin(&m, "ctl-px4");
+    assert!(ctl["bind"].get("paired_state").is_none());
+    assert!(ctl["bind"].get("estimate").is_none());
+    assert!(ctl["bind"].get("hover_thrust").is_none());
+    assert!(ctl["bind"].get("attitude_rate").is_none());
+    assert!(ctl["bind"].get("setpoint").is_some());
+    assert!(ctl["bind"].get("fcu_request").is_some());
+    assert_eq!(ctl["bind"]["local_pose"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert_eq!(ctl["config"]["tracking_backend"].as_str(), Some("smc"));
+    assert_eq!(plugin(&m, "plan-dmpc")["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    let station = plugin(&m, "station-io");
+    assert_eq!(station["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert_eq!(station["bind"]["imu"]["channel"].as_str(), Some("fcu_imu"));
+    assert_eq!(station["bind"]["battery"]["channel"].as_str(), Some("battery"));
+    assert_eq!(station["bind"]["fcu_state"]["channel"].as_str(), Some("fcu_state"));
+    assert_eq!(station["config"]["authority"].as_bool(), Some(false));
+    assert_eq!(station["config"]["command"].as_bool(), Some(station["bind"].get("command").is_some()));
+    assert_eq!(station["config"]["mission"].as_bool(), Some(station["bind"].get("mission_request").is_some()));
+    assert!(m["plugin"].as_array().unwrap().iter().all(|p| p["name"].as_str() != Some("rigid-state") && p["name"].as_str() != Some("hover-thrust")));
+
+    let planner = dmpc_case("planner");
+    let prepared = planner.prepare().unwrap();
+    let m = manifest(&prepared);
+    assert_eq!(prepared.receipt.role, "dmpc-planner");
+    assert_eq!(prepared.receipt.actuator_namespace, None);
+    assert!(plugin(&m, "ros_io")["bind"].get("paired_state").is_none());
+    assert_eq!(plugin(&m, "plan-dmpc")["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    let station = plugin(&m, "station-io");
+    assert_eq!(station["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert!(station["bind"].get("imu").is_none());
+    assert_eq!(station["config"]["authority"].as_bool(), Some(false));
+    assert_eq!(station["config"]["command"].as_bool(), Some(station["bind"].get("command").is_some()));
+    assert_eq!(station["config"]["mission"].as_bool(), Some(station["bind"].get("mission_request").is_some()));
+
+    let smc = dmpc_case("smc");
+    let prepared = smc.prepare().unwrap();
+    let m = manifest(&prepared);
+    assert_eq!(prepared.receipt.role, "dmpc-smc");
+    assert_eq!(prepared.receipt.actuator_namespace.as_deref(), Some("uav2"));
+    assert!(plugin(&m, "ros_io")["bind"]["paired_state"].get("from").is_none());
+    assert_eq!(plugin(&m, "ros_io")["bind"]["vision_pose"]["channel"].as_str(), Some("pose"));
+    assert!(plugin(&m, "ctl-px4")["bind"].get("paired_state").is_none());
+    assert!(plugin(&m, "ctl-px4")["bind"].get("attitude_rate").is_none());
+    let station = plugin(&m, "station-io");
+    assert_eq!(station["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert_eq!(station["bind"]["imu"]["channel"].as_str(), Some("fcu_imu"));
+    assert_eq!(station["bind"]["battery"]["channel"].as_str(), Some("battery"));
+    assert_eq!(station["bind"]["fcu_state"]["channel"].as_str(), Some("fcu_state"));
+    assert_eq!(station["config"]["authority"].as_bool(), Some(false));
+    assert_eq!(station["config"]["command"].as_bool(), Some(false));
+    assert_eq!(station["config"]["mission"].as_bool(), Some(false));
+    assert!(station["bind"].get("command").is_none());
+    assert!(station["bind"].get("mission_request").is_none());
+    assert!(!channel_names(&m).contains(&"estimate"));
+}
+
+#[test]
+fn dmpc_graphs_reject_ekf_hover_and_the_wrong_node() {
+    let mut c = dmpc_case("native");
+    c.config(|v| v["calibration"] = json!({"verified": false}));
+    c.rejected("unknown field");
+    let mut c = dmpc_case("native");
+    c.descriptor(|b| b.plugins.rigid_state = b.plugins.controller.clone());
+    c.rejected("roles");
+    let mut c = dmpc_case("native");
+    c.descriptor(|b| b.plugins.hover_thrust = b.plugins.controller.clone());
+    c.rejected("roles");
+    let mut c = dmpc_case("smc");
+    c.input.node_id = "gcs-b".into();
+    c.rejected("control node");
+    let mut c = dmpc_case("planner");
+    c.input.node_id = "board-b".into();
+    c.rejected("planner node");
 }

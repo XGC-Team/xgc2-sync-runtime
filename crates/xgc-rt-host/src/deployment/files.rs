@@ -258,6 +258,7 @@ fn verify_bundle(root: &Path, deployment: &Deployment) -> Result<(Bundle, File)>
         bundle.libraries.len() <= 256 && bundle.links.len() <= 256,
         "bundle closure is too large",
     )?;
+    bundle.plugins.validate_roles(&deployment.composition_id)?;
     let mut paths = BTreeSet::new();
     let mut host = None;
     for file in std::iter::once(&bundle.host)
@@ -322,6 +323,8 @@ pub struct Receipt {
     pub manifest_path: PathBuf,
     pub audit_path: PathBuf,
     pub input_time_domain: &'static str,
+    pub role: &'static str,
+    pub actuator_namespace: Option<String>,
     pub live_readiness: bool,
 }
 
@@ -329,7 +332,7 @@ pub struct Prepared {
     pub receipt: Receipt,
     pub host_path: PathBuf,
     pub bundle_root: PathBuf,
-    pub configuration: Configuration,
+    pub configuration: RunConfiguration,
     /// CLOEXEC until this prepared instance deliberately launches its host.
     _lock: File,
     host: File,
@@ -352,8 +355,8 @@ impl Prepared {
                     .ok_or("non-UTF8 manifest path")?,
             ])
             .env_remove("ROS_HOSTNAME")
-            .env("ROS_MASTER_URI", &self.configuration.ros_master_uri)
-            .env("ROS_IP", &self.configuration.ros_ip)
+            .env("ROS_MASTER_URI", self.configuration.ros_master_uri())
+            .env("ROS_IP", self.configuration.ros_ip())
             .env(
                 "ROS_NAMESPACE",
                 format!("/{}", self.receipt.robot_namespace),
@@ -438,9 +441,11 @@ pub fn prepare(raw: &str, bundle_root: &Path, state_root: &Path) -> Result<Prepa
         generation,
         manifest_path: final_path.join("node.toml"),
         audit_path,
-        input_time_domain: match configuration.input_time_domain {
+        input_time_domain: match configuration.time_domain() {
             TimeDomain::WallUnix => "wall-unix", TimeDomain::Ros1Sim => "ros1-sim",
         },
+        role: configuration.role(),
+        actuator_namespace: configuration.actuator_namespace(&deployment.robot_namespace).map(str::to_string),
         live_readiness: false,
     };
     staged.write_new("node.toml", manifest.as_bytes())?;

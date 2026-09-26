@@ -1,6 +1,10 @@
 //! Release-owned deployment, separate from the software-plant fixture.
 //! No live ROS/config discovery: inputs freeze the run and its clock authority.
+mod dmpc;
 mod files;
+mod hil;
+pub use hil::{HilConfiguration, RobotMember, NodeRole};
+pub(crate) use hil::{Planner, Radio, Scene, Station};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,11 +19,18 @@ pub const COMPOSITION_ID: &str = "uav-control-dfbc-native-hover/v1";
 pub const COMPOSITION: &str = include_str!("composition.toml");
 pub const PX4_LOCAL_COMPOSITION_ID: &str = "uav-control-px4-local-native-hover/v1";
 pub const PX4_LOCAL_COMPOSITION: &str = include_str!("composition-px4-local.toml");
+pub const HIL_COMPOSITION_ID: &str = "uav-dmpc-numeric-hil/v1";
+pub const HIL_COMPOSITION: &str = include_str!("composition-numeric-hil.toml");
+pub const NATIVE_COMPOSITION_ID: &str = "uav-dmpc-native/v1";
+pub const NATIVE_COMPOSITION: &str = include_str!("composition-dmpc-native.toml");
+pub const PLANNER_COMPOSITION_ID: &str = "uav-dmpc-planner/v1";
+pub const PLANNER_COMPOSITION: &str = include_str!("composition-dmpc-planner.toml");
+pub const SMC_COMPOSITION_ID: &str = "uav-dmpc-smc/v1";
+pub const SMC_COMPOSITION: &str = include_str!("composition-dmpc-smc.toml");
 pub const BUNDLE_FILE: &str = "DEPLOYMENT-BUNDLE.json";
 pub const MAX_INPUT: usize = 64 * 1024;
 
-/// Release-owned graphs. Both use the same strict five-artifact bundle and
-/// typed input contract; the deployment cannot add roles or edit a graph.
+/// Release-owned graphs. The deployment cannot add roles or edit a graph.
 pub struct Composition {
     pub id: &'static str,
     pub bytes: &'static str,
@@ -29,7 +40,7 @@ impl Composition {
         sha256(self.bytes.as_bytes())
     }
 }
-static COMPOSITIONS: [Composition; 2] = [
+static COMPOSITIONS: [Composition; 6] = [
     Composition {
         id: COMPOSITION_ID,
         bytes: COMPOSITION,
@@ -38,6 +49,10 @@ static COMPOSITIONS: [Composition; 2] = [
         id: PX4_LOCAL_COMPOSITION_ID,
         bytes: PX4_LOCAL_COMPOSITION,
     },
+    Composition { id: HIL_COMPOSITION_ID, bytes: HIL_COMPOSITION },
+    Composition { id: NATIVE_COMPOSITION_ID, bytes: NATIVE_COMPOSITION },
+    Composition { id: PLANNER_COMPOSITION_ID, bytes: PLANNER_COMPOSITION },
+    Composition { id: SMC_COMPOSITION_ID, bytes: SMC_COMPOSITION },
 ];
 
 pub fn composition(id: &str) -> Result<&'static Composition> {
@@ -127,7 +142,63 @@ pub struct Configuration {
     pub topics: Topics,
     pub calibration: Calibration,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub robot_member: Option<RobotMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub simulation: Option<Simulation>,
+}
+
+/// Configuration shape is selected by the compiled composition, not an untagged fallback.
+#[derive(Clone, Debug)]
+pub enum RunConfiguration {
+    Control(Configuration),
+    Hil(HilConfiguration),
+    Native(dmpc::NativeConfiguration),
+    Planner(dmpc::PlannerConfiguration),
+    Smc(dmpc::SmcConfiguration),
+}
+impl RunConfiguration {
+    pub fn time_domain(&self) -> &TimeDomain {
+        match self {
+            Self::Control(c) => &c.input_time_domain,
+            Self::Hil(c) => &c.input_time_domain,
+            Self::Native(c) => &c.input_time_domain,
+            Self::Planner(c) => &c.input_time_domain,
+            Self::Smc(c) => &c.input_time_domain,
+        }
+    }
+    pub fn ros_master_uri(&self) -> &str {
+        match self {
+            Self::Control(c) => &c.ros_master_uri,
+            Self::Hil(c) => &c.ros_master_uri,
+            Self::Native(c) => &c.ros_master_uri,
+            Self::Planner(c) => &c.ros_master_uri,
+            Self::Smc(c) => &c.ros_master_uri,
+        }
+    }
+    pub fn ros_ip(&self) -> &str {
+        match self {
+            Self::Control(c) => &c.ros_ip,
+            Self::Hil(c) => &c.ros_ip,
+            Self::Native(c) => &c.ros_ip,
+            Self::Planner(c) => &c.ros_ip,
+            Self::Smc(c) => &c.ros_ip,
+        }
+    }
+    pub fn role(&self) -> &'static str {
+        match self {
+            Self::Control(_) => "control",
+            Self::Hil(_) => "numeric-hil",
+            Self::Native(_) => "dmpc-native",
+            Self::Planner(_) => "dmpc-planner",
+            Self::Smc(_) => "dmpc-smc",
+        }
+    }
+    pub fn actuator_namespace<'a>(&self, namespace: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Control(_) | Self::Native(_) | Self::Smc(_) => Some(namespace),
+            Self::Hil(_) | Self::Planner(_) => None,
+        }
+    }
 }
 
 // Missing optional blocks preserve existing inputs; explicit null is not a block.
@@ -239,14 +310,14 @@ pub struct Provenance {
 }
 
 impl Deployment {
-    pub fn parse(raw: &str) -> Result<(Self, Configuration)> {
+    pub fn parse(raw: &str) -> Result<(Self, RunConfiguration)> {
         require(raw.len() <= MAX_INPUT, "deployment exceeds 64 KiB")?;
         let deployment: Self =
             serde_json::from_str(raw).map_err(|e| format!("deployment schema: {e}"))?;
         let config = deployment.validate()?;
         Ok((deployment, config))
     }
-    pub fn validate(&self) -> Result<Configuration> {
+    pub fn validate(&self) -> Result<RunConfiguration> {
         require(self.schema_version == 1, "unsupported deployment schema")?;
         require(
             name(&self.session_id) && name(&self.node_id),
@@ -273,10 +344,34 @@ impl Deployment {
                 && sha256(self.configuration_json.as_bytes()) == self.configuration_sha256,
             "configuration bytes/digest mismatch",
         )?;
+        if self.composition_id == HIL_COMPOSITION_ID {
+            let config: HilConfiguration = serde_json::from_str(&self.configuration_json)
+                .map_err(|e| format!("HIL configuration schema: {e}"))?;
+            config.validate(self)?;
+            return Ok(RunConfiguration::Hil(config));
+        }
+        if self.composition_id == NATIVE_COMPOSITION_ID {
+            let config: dmpc::NativeConfiguration = serde_json::from_str(&self.configuration_json)
+                .map_err(|e| format!("native DMPC configuration schema: {e}"))?;
+            config.validate(self)?;
+            return Ok(RunConfiguration::Native(config));
+        }
+        if self.composition_id == PLANNER_COMPOSITION_ID {
+            let config: dmpc::PlannerConfiguration = serde_json::from_str(&self.configuration_json)
+                .map_err(|e| format!("planner configuration schema: {e}"))?;
+            config.validate(self)?;
+            return Ok(RunConfiguration::Planner(config));
+        }
+        if self.composition_id == SMC_COMPOSITION_ID {
+            let config: dmpc::SmcConfiguration = serde_json::from_str(&self.configuration_json)
+                .map_err(|e| format!("SMC configuration schema: {e}"))?;
+            config.validate(self)?;
+            return Ok(RunConfiguration::Smc(config));
+        }
         let config: Configuration = serde_json::from_str(&self.configuration_json)
             .map_err(|e| format!("configuration schema: {e}"))?;
-        config.validate(&self.robot_namespace)?;
-        Ok(config)
+        config.validate(&self.robot_namespace, &self.node_id)?;
+        Ok(RunConfiguration::Control(config))
     }
     pub fn identity_bytes(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(self).map_err(|e| e.to_string())
@@ -284,42 +379,19 @@ impl Deployment {
 }
 
 impl Configuration {
-    fn validate(&self, namespace: &str) -> Result<()> {
+    fn validate(&self, namespace: &str, node: &str) -> Result<()> {
+        if let Some(member) = &self.robot_member {
+            require(member.uav_id > 0 && ros_namespace(&member.robot_namespace)
+                && name(&member.planner_node) && name(&member.control_node), "invalid robot member")?;
+            require(member.robot_namespace == namespace && member.control_node == node,
+                "control composition must run on the selected robot control node")?;
+        }
         require(
             matches!((&self.input_time_domain, &self.simulation),
                 (TimeDomain::WallUnix, None) | (TimeDomain::Ros1Sim, Some(_))),
             "ros1-sim requires simulation; wall-unix forbids simulation",
         )?;
-        let ip: Ipv4Addr = self
-            .ros_ip
-            .parse()
-            .map_err(|_| "ros_ip must be a unicast IPv4 literal")?;
-        require(
-            !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::BROADCAST,
-            "ros_ip must be a unicast IPv4 literal",
-        )?;
-        let address = self
-            .ros_master_uri
-            .strip_prefix("http://")
-            .ok_or("ROS master must be http://IPv4:port")?;
-        let (host, port) = address
-            .rsplit_once(':')
-            .ok_or("ROS master must be http://IPv4:port")?;
-        let host: Ipv4Addr = host
-            .parse()
-            .map_err(|_| "ROS master must be http://IPv4:port")?;
-        require(
-            !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
-            "invalid ROS master port",
-        )?;
-        let port: u16 = port.parse().map_err(|_| "invalid ROS master port")?;
-        require(
-            port > 0
-                && !host.is_unspecified()
-                && !host.is_multicast()
-                && host != Ipv4Addr::BROADCAST,
-            "invalid ROS master endpoint",
-        )?;
+        ros_endpoint(&self.ros_master_uri, &self.ros_ip)?;
         require(
             self.takeoff_altitude_m.is_finite() && self.takeoff_altitude_m > 0.0,
             "takeoff_altitude_m must be finite and positive",
@@ -343,27 +415,62 @@ impl Configuration {
                 )?;
             }
         }
-        let c = &self.calibration;
-        require(
-            c.field_offset_xyz
-                .iter()
-                .chain(&c.field_offset_rpy)
-                .chain(&c.imu_to_vrpn_marker_xyz)
-                .chain(&c.imu_to_vrpn_marker_rpy)
-                .all(|v| v.is_finite()),
-            "nonfinite calibration transform",
-        )?;
-        require(
-            c.verified == (c.provenance.kind != CalibrationKind::Unverified),
-            "calibration verification/provenance disagreement",
-        )?;
-        require(
-            identifier(&c.provenance.source_id)
-                && identifier(&c.provenance.robot_asset_id)
-                && digest(&c.provenance.source_sha256),
-            "explicit calibration provenance is required",
-        )
+        validate_calibration(&self.calibration)
     }
+}
+
+pub(crate) fn validate_calibration(c: &Calibration) -> Result<()> {
+    require(
+        c.field_offset_xyz
+            .iter()
+            .chain(&c.field_offset_rpy)
+            .chain(&c.imu_to_vrpn_marker_xyz)
+            .chain(&c.imu_to_vrpn_marker_rpy)
+            .all(|v| v.is_finite()),
+        "nonfinite calibration transform",
+    )?;
+    require(
+        c.verified == (c.provenance.kind != CalibrationKind::Unverified),
+        "calibration verification/provenance disagreement",
+    )?;
+    require(
+        identifier(&c.provenance.source_id)
+            && identifier(&c.provenance.robot_asset_id)
+            && digest(&c.provenance.source_sha256),
+        "explicit calibration provenance is required",
+    )
+}
+
+fn ros_endpoint(ros_master_uri: &str, ros_ip: &str) -> Result<()> {
+        let ip: Ipv4Addr = ros_ip
+            .parse()
+            .map_err(|_| "ros_ip must be a unicast IPv4 literal")?;
+        require(
+            !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::BROADCAST,
+            "ros_ip must be a unicast IPv4 literal",
+        )?;
+        let address = ros_master_uri
+            .strip_prefix("http://")
+            .ok_or("ROS master must be http://IPv4:port")?;
+        let (host, port) = address
+            .rsplit_once(':')
+            .ok_or("ROS master must be http://IPv4:port")?;
+        let host: Ipv4Addr = host
+            .parse()
+            .map_err(|_| "ROS master must be http://IPv4:port")?;
+        require(
+            !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+            "invalid ROS master port",
+        )?;
+        let port: u16 = port.parse().map_err(|_| "invalid ROS master port")?;
+        require(
+            port > 0
+                && !host.is_unspecified()
+                && !host.is_multicast()
+                && host != Ipv4Addr::BROADCAST,
+            "invalid ROS master endpoint",
+        )?;
+        Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -382,20 +489,50 @@ pub struct BundleLink {
 #[serde(deny_unknown_fields)]
 pub struct Plugins {
     pub ros_io: BundleFile,
-    pub rigid_state: BundleFile,
-    pub hover_thrust: BundleFile,
-    pub controller: BundleFile,
-    pub reference: BundleFile,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub rigid_state: Option<BundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub hover_thrust: Option<BundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub controller: Option<BundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub reference: Option<BundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub numeric_vehicle: Option<BundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub plan_dmpc: Option<BundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub dmpc_rounds: Option<BundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub station_io: Option<BundleFile>,
 }
 impl Plugins {
-    pub fn entries(&self) -> [(&str, &BundleFile); 5] {
-        [
-            ("ros_io", &self.ros_io),
-            ("rigid_state", &self.rigid_state),
-            ("hover_thrust", &self.hover_thrust),
-            ("controller", &self.controller),
-            ("reference", &self.reference),
-        ]
+    pub fn entries(&self) -> Vec<(&str, &BundleFile)> {
+        let mut entries = vec![("ros_io", &self.ros_io)];
+        if let Some(pin) = &self.rigid_state { entries.push(("rigid_state", pin)); }
+        if let Some(pin) = &self.hover_thrust { entries.push(("hover_thrust", pin)); }
+        if let Some(pin) = &self.controller { entries.push(("controller", pin)); }
+        if let Some(pin) = &self.reference { entries.push(("reference", pin)); }
+        if let Some(pin) = &self.numeric_vehicle { entries.push(("numeric_vehicle", pin)); }
+        if let Some(pin) = &self.plan_dmpc { entries.push(("plan_dmpc", pin)); }
+        if let Some(pin) = &self.dmpc_rounds { entries.push(("dmpc_rounds", pin)); }
+        if let Some(pin) = &self.station_io { entries.push(("station_io", pin)); }
+        entries
+    }
+    fn validate_roles(&self, id: &str) -> Result<()> {
+        let expected: &[&str] = if id == HIL_COMPOSITION_ID {
+            &["ros_io", "numeric_vehicle", "plan_dmpc", "dmpc_rounds", "station_io"]
+        } else if id == NATIVE_COMPOSITION_ID {
+            &["ros_io", "controller", "plan_dmpc", "dmpc_rounds", "station_io"]
+        } else if id == PLANNER_COMPOSITION_ID {
+            &["ros_io", "plan_dmpc", "dmpc_rounds", "station_io"]
+        } else if id == SMC_COMPOSITION_ID {
+            &["ros_io", "controller", "station_io"]
+        } else {
+            &["ros_io", "rigid_state", "hover_thrust", "controller", "reference"]
+        };
+        let roles: BTreeSet<_> = self.entries().into_iter().map(|(role, _)| role).collect();
+        require(roles == expected.iter().copied().collect(), "bundle plugin roles do not match fixed composition")
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -432,6 +569,7 @@ pub fn render(
 ) -> Result<String> {
     let config = deployment.validate()?;
     let composition = composition(&deployment.composition_id)?;
+    bundle.plugins.validate_roles(composition.id)?;
     require(
         bundle.schema_version == 1
             && bundle.platform == deployment.platform
@@ -442,6 +580,13 @@ pub fn render(
         absolute(bundle_root) && absolute(audit),
         "render paths must be absolute",
     )?;
+    let config = match config {
+        RunConfiguration::Hil(config) => return hil::render(deployment, &config, bundle, bundle_root, audit),
+        RunConfiguration::Native(config) => return dmpc::render_native(deployment, &config, bundle, bundle_root, audit),
+        RunConfiguration::Planner(config) => return dmpc::render_planner(deployment, &config, bundle, bundle_root, audit),
+        RunConfiguration::Smc(config) => return dmpc::render_smc(deployment, &config, bundle, bundle_root, audit),
+        RunConfiguration::Control(config) => config,
+    };
     let mut value: toml::Value = composition
         .bytes
         .parse()
