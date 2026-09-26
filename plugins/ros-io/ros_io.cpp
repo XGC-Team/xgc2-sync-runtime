@@ -19,6 +19,10 @@
 //     battery          sensor_msgs/BatteryState             -> xgc.battery/1
 //     command          std_msgs/String                      -> xgc.command/1
 //     alg_setpoint     mavros_msgs/PositionTarget           -> xgc.position_target/1 (a planner's setpoint)
+//     ref_analytic     multirotor_reference_trajectory_msgs/AnalyticReference       -> xgc.ref.analytic/1
+//     ref_waypoint     multirotor_reference_trajectory_msgs/WaypointReferenceRequest -> xgc.ref.waypoint_request/1
+//     ref_sampled      multirotor_reference_trajectory_msgs/SampledReference        -> xgc.ref.sampled/1
+//     ref_reset        std_msgs/Empty                        -> xgc.ref.reset/1
 //   module inputs -> ROS
 //     vision_pose      xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
 //     neighbor_plans   xgc.dmpc.assumed_trajectory/1 -> formation_generator/AssumedTrajectory
@@ -32,6 +36,11 @@
 //                      <ns>/cmd/command (MAV_CMD 400), set_mode calls <ns>/set_mode.
 //                      Calls run in order on a worker thread, as the ROS node ran them
 //                      off its control loop; nothing is reported back to the module.
+//     ref_status       xgc.ref.status/1             -> multirotor_reference_trajectory_msgs/ReferenceStatus (latched)
+//     ref_active_analytic   xgc.ref.analytic/1      -> .../AnalyticReference (latched)
+//     ref_active_polynomial xgc.ref.polynomial/1    -> .../ActivePolynomialReference (latched)
+//     ref_active_sampled    xgc.ref.sampled/1       -> .../SampledReference (latched)
+//   (the ref_* outputs are latched, as the reference trajectory node's are)
 //
 // Threading: ROS callbacks run on this plugin's own thread. Each step first
 // publishes what the modules wrote since the last step, then services this
@@ -64,15 +73,22 @@
 #include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/SetMode.h>
 #include <mavros_msgs/State.h>
+#include <multirotor_reference_trajectory_msgs/ActivePolynomialReference.h>
+#include <multirotor_reference_trajectory_msgs/AnalyticReference.h>
+#include <multirotor_reference_trajectory_msgs/ReferenceStatus.h>
+#include <multirotor_reference_trajectory_msgs/SampledReference.h>
+#include <multirotor_reference_trajectory_msgs/WaypointReferenceRequest.h>
 #include <periodic_sync/SyncTrigger.h>
 #include <rigid_state_estimator_msgs/RigidStateEstimate.h>
 #include <ros/callback_queue.h>
 #include <ros/ros.h>
 #include <sensor_msgs/BatteryState.h>
 #include <sensor_msgs/Imu.h>
+#include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
 
 #include "../common/flat_config.hpp"
+#include "../common/reference_wire.hpp"
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
 
@@ -100,13 +116,22 @@ enum Port : uint32_t {
   kAttitudeRate,
   kStatus,
   kFcuRequest,
+  kRefAnalytic,
+  kRefWaypoint,
+  kRefSampled,
+  kRefReset,
+  kRefStatus,
+  kRefActiveAnalytic,
+  kRefActivePolynomial,
+  kRefActiveSampled,
   kPortCount
 };
 
 const char* const kPortNames[kPortCount] = {
     "imu",       "pose",       "attitude_target", "own_plan", "vision_pose", "neighbor_plans", "sync_trigger",
     "rigid_state_estimate", "fcu_state", "local_pose", "local_velocity", "fcu_imu", "battery", "command",
-    "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request"};
+    "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
+    "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -298,6 +323,23 @@ struct RosIo {
     s.coordinate_frame = m->coordinate_frame;
     write(kAlgSetpoint, s);
   }
+
+  void on_ref_analytic(const multirotor_reference_trajectory_msgs::AnalyticReference::ConstPtr& m) {
+    const auto bytes = xgc_ref_wire::encode_analytic(*m);
+    write_bytes(kRefAnalytic, bytes.data(), bytes.size());
+  }
+
+  void on_ref_waypoint(const multirotor_reference_trajectory_msgs::WaypointReferenceRequest::ConstPtr& m) {
+    const auto bytes = xgc_ref_wire::encode_waypoint_request(*m);
+    write_bytes(kRefWaypoint, bytes.data(), bytes.size());
+  }
+
+  void on_ref_sampled(const multirotor_reference_trajectory_msgs::SampledReference::ConstPtr& m) {
+    const auto bytes = xgc_ref_wire::encode_sampled(*m);
+    write_bytes(kRefSampled, bytes.data(), bytes.size());
+  }
+
+  void on_ref_reset(const std_msgs::Empty::ConstPtr&) { write(kRefReset, xgc_ref_reset_v1{}); }
 
   // --- fcu_request service calls -------------------------------------------
 
@@ -505,6 +547,30 @@ struct RosIo {
       calls_cv.notify_one();
       ++to_ros;
     }
+    while (host->next(host->host, kRefStatus, &v) == XGC_OK) {
+      multirotor_reference_trajectory_msgs::ReferenceStatus m;
+      if (!xgc_ref_wire::decode_status(v.data, v.len, m)) continue;
+      pubs[kRefStatus].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kRefActiveAnalytic, &v) == XGC_OK) {
+      multirotor_reference_trajectory_msgs::AnalyticReference m;
+      if (!xgc_ref_wire::decode_analytic(v.data, v.len, m)) continue;
+      pubs[kRefActiveAnalytic].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kRefActivePolynomial, &v) == XGC_OK) {
+      multirotor_reference_trajectory_msgs::ActivePolynomialReference m;
+      if (!xgc_ref_wire::decode_polynomial(v.data, v.len, m)) continue;
+      pubs[kRefActivePolynomial].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kRefActiveSampled, &v) == XGC_OK) {
+      multirotor_reference_trajectory_msgs::SampledReference m;
+      if (!xgc_ref_wire::decode_sampled(v.data, v.len, m)) continue;
+      pubs[kRefActiveSampled].publish(m);
+      ++to_ros;
+    }
     std::vector<std::string> lines;
     {
       std::lock_guard<std::mutex> lock(calls_mutex);
@@ -547,6 +613,22 @@ struct RosIo {
       pubs[kAttitudeRate] = nh->advertise<mavros_msgs::AttitudeTarget>(topics[kAttitudeRate], queue_size);
     if (enabled(kStatus)) pubs[kStatus] = nh->advertise<std_msgs::String>(topics[kStatus], queue_size);
     if (enabled(kFcuRequest)) caller = std::thread([this] { call_loop(); });
+    if (enabled(kRefAnalytic))
+      subs.push_back(nh->subscribe(topics[kRefAnalytic], queue_size, &RosIo::on_ref_analytic, this));
+    if (enabled(kRefWaypoint))
+      subs.push_back(nh->subscribe(topics[kRefWaypoint], queue_size, &RosIo::on_ref_waypoint, this));
+    if (enabled(kRefSampled))
+      subs.push_back(nh->subscribe(topics[kRefSampled], queue_size, &RosIo::on_ref_sampled, this));
+    if (enabled(kRefReset)) subs.push_back(nh->subscribe(topics[kRefReset], queue_size, &RosIo::on_ref_reset, this));
+    namespace rmsg = multirotor_reference_trajectory_msgs;
+    if (enabled(kRefStatus)) pubs[kRefStatus] = nh->advertise<rmsg::ReferenceStatus>(topics[kRefStatus], queue_size, true);
+    if (enabled(kRefActiveAnalytic))
+      pubs[kRefActiveAnalytic] = nh->advertise<rmsg::AnalyticReference>(topics[kRefActiveAnalytic], queue_size, true);
+    if (enabled(kRefActivePolynomial))
+      pubs[kRefActivePolynomial] =
+          nh->advertise<rmsg::ActivePolynomialReference>(topics[kRefActivePolynomial], queue_size, true);
+    if (enabled(kRefActiveSampled))
+      pubs[kRefActiveSampled] = nh->advertise<rmsg::SampledReference>(topics[kRefActiveSampled], queue_size, true);
     return XGC_OK;
   }
 
@@ -662,6 +744,14 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"attitude_rate", XGC_PORT_IN_OPTIONAL, "xgc.body_rate_thrust/1", XGC_QOS_CONTROL},
     {"status", XGC_PORT_IN_OPTIONAL, "xgc.controller_status/1", XGC_QOS_STATE},
     {"fcu_request", XGC_PORT_IN_OPTIONAL, "xgc.fcu_request/1", XGC_QOS_EVENT},
+    {"ref_analytic", XGC_PORT_OUT_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_EVENT},
+    {"ref_waypoint", XGC_PORT_OUT_OPTIONAL, "xgc.ref.waypoint_request/1", XGC_QOS_EVENT},
+    {"ref_sampled", XGC_PORT_OUT_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_EVENT},
+    {"ref_reset", XGC_PORT_OUT_OPTIONAL, "xgc.ref.reset/1", XGC_QOS_EVENT},
+    {"ref_status", XGC_PORT_IN_OPTIONAL, "xgc.ref.status/1", XGC_QOS_STATE},
+    {"ref_active_analytic", XGC_PORT_IN_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_STATE},
+    {"ref_active_polynomial", XGC_PORT_IN_OPTIONAL, "xgc.ref.polynomial/1", XGC_QOS_STATE},
+    {"ref_active_sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

@@ -226,6 +226,134 @@ typedef struct xgc_controller_status_v1 {
   char state[48];         /* NUL-terminated */
 } xgc_controller_status_v1;
 
+/* --- Reference trajectories (ref-trajectory <-> ros_io, ctl) -------------
+ * Field for field the multirotor_reference_trajectory_msgs messages, times
+ * kept as their exact sec/nsec. Each head is followed by its variable parts,
+ * in the order the comment lists them. plugins/common/reference_wire.hpp
+ * encodes and decodes them. */
+
+/* std_msgs/Header, exact. */
+typedef struct xgc_ref_header_v1 {
+  uint32_t seq;
+  uint32_t stamp_sec;
+  uint32_t stamp_nsec;
+  uint32_t reserved;
+  char frame_id[32];      /* NUL-terminated */
+} xgc_ref_header_v1;
+
+/* "xgc.ref.analytic/1": AnalyticReference; then params_len doubles. */
+typedef struct xgc_ref_analytic_v1 {
+  xgc_ref_header_v1 header;
+  uint32_t request_id;
+  uint32_t trajectory_id;
+  uint32_t revision;
+  uint32_t flags;
+  uint32_t start_sec;
+  uint32_t start_nsec;
+  uint16_t analytic_type;
+  uint16_t reserved;
+  uint32_t params_len;
+  double duration;
+  double origin_position[3];
+  double origin_q_xyzw[4];
+} xgc_ref_analytic_v1;
+
+/* One FlatReferencePoint. */
+typedef struct xgc_ref_flat_point_v1 {
+  double t_from_start;
+  double position[3];
+  double velocity[3];
+  double acceleration[3];
+  double jerk[3];
+  double snap[3];
+  double yaw;
+  double yaw_rate;
+  double yaw_accel;
+} xgc_ref_flat_point_v1;
+
+/* "xgc.ref.sampled/1": SampledReference; then points_len xgc_ref_flat_point_v1. */
+typedef struct xgc_ref_sampled_v1 {
+  xgc_ref_header_v1 header;
+  uint32_t trajectory_id;
+  uint32_t revision;
+  uint32_t flags;
+  uint32_t points_len;
+  uint32_t start_sec;
+  uint32_t start_nsec;
+  double sample_dt;
+} xgc_ref_sampled_v1;
+
+/* "xgc.ref.waypoint_request/1": WaypointReferenceRequest; then
+ * waypoints_len poses (7 doubles: position xyz, orientation xyzw),
+ * constraint_types_len uint8 (zero-padded to a multiple of 8 bytes),
+ * region_size_len vectors (3 doubles) and segment_times_len doubles. */
+typedef struct xgc_ref_waypoint_request_v1 {
+  xgc_ref_header_v1 header;
+  uint32_t request_id;
+  uint32_t trajectory_id;
+  uint32_t revision;
+  uint32_t flags;
+  uint32_t waypoints_len;
+  uint32_t constraint_types_len;
+  uint32_t region_size_len;
+  uint32_t segment_times_len;
+  double start_velocity[3];
+  double start_acceleration[3];
+  double end_velocity[3];
+  double end_acceleration[3];
+  double desired_speed;
+  double time_weight;
+  double max_body_rate;
+  double max_tilt;
+  double min_thrust;
+  double max_thrust;
+  uint32_t max_iterations;
+  uint8_t objective;
+  uint8_t reserved[3];
+  double rel_cost_tol;
+  double max_velocity;
+  double max_acceleration;
+  double max_jerk;
+  double max_snap;
+} xgc_ref_waypoint_request_v1;
+
+/* "xgc.ref.polynomial/1": ActivePolynomialReference; then
+ * segment_durations_len, coeff_x_len, coeff_y_len, coeff_z_len and
+ * coeff_yaw_len doubles, in that order. */
+typedef struct xgc_ref_polynomial_v1 {
+  xgc_ref_header_v1 header;
+  uint32_t trajectory_id;
+  uint32_t revision;
+  uint32_t flags;
+  uint8_t order;
+  uint8_t reserved[3];
+  uint32_t start_sec;
+  uint32_t start_nsec;
+  double duration;
+  uint32_t segment_durations_len;
+  uint32_t coeff_x_len;
+  uint32_t coeff_y_len;
+  uint32_t coeff_z_len;
+  uint32_t coeff_yaw_len;
+  uint32_t reserved2;
+} xgc_ref_polynomial_v1;
+
+/* "xgc.ref.status/1": ReferenceStatus. */
+typedef struct xgc_ref_status_v1 {
+  xgc_ref_header_v1 header;
+  uint8_t state;
+  uint8_t active_type;
+  uint8_t reserved[2];
+  uint32_t flags;
+  uint32_t active_trajectory_id;
+  uint32_t active_revision;
+} xgc_ref_status_v1;
+
+/* "xgc.ref.reset/1": a reset request (std_msgs/Empty); the payload is unused. */
+typedef struct xgc_ref_reset_v1 {
+  uint64_t reserved;
+} xgc_ref_reset_v1;
+
 #ifdef __cplusplus
 #define XGC_SCHEMA_ASSERT static_assert
 #else
@@ -250,6 +378,14 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_position_target_v1) == 104, "xgc_position_target_v1
 XGC_SCHEMA_ASSERT(sizeof(xgc_body_rate_thrust_v1) == 40, "xgc_body_rate_thrust_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_request_v1) == 48, "xgc_fcu_request_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_controller_status_v1) == 56, "xgc_controller_status_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_header_v1) == 48, "xgc_ref_header_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_analytic_v1) == 144, "xgc_ref_analytic_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_flat_point_v1) == 152, "xgc_ref_flat_point_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_sampled_v1) == 80, "xgc_ref_sampled_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_waypoint_request_v1) == 272, "xgc_ref_waypoint_request_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_polynomial_v1) == 104, "xgc_ref_polynomial_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_status_v1) == 64, "xgc_ref_status_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_ref_reset_v1) == 8, "xgc_ref_reset_v1");
 
 #ifdef __cplusplus
 }

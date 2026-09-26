@@ -8,8 +8,9 @@
 #               boost and libstdc++ match roscpp.
 #   CXX         overrides the compiler.
 #
-# formation_generator/AssumedTrajectory, periodic_sync/SyncTrigger and
-# rigid_state_estimator_msgs/RigidStateEstimate headers are generated with
+# formation_generator/AssumedTrajectory, periodic_sync/SyncTrigger,
+# rigid_state_estimator_msgs/RigidStateEstimate and the
+# multirotor_reference_trajectory_msgs headers are generated with
 # gencpp from the verbatim .msg copies in plugins/ros-io/msg, so the type names
 # and md5 sums equal the original packages'.
 set -euo pipefail
@@ -23,7 +24,8 @@ if [[ -z "$cxx" ]]; then
 fi
 gen="$(dirname "$1")/ros-io-gen"
 rm -rf "$gen"
-for msg in formation_generator/AssumedTrajectory periodic_sync/SyncTrigger rigid_state_estimator_msgs/RigidStateEstimate; do
+for msg in formation_generator/AssumedTrajectory periodic_sync/SyncTrigger rigid_state_estimator_msgs/RigidStateEstimate \
+  multirotor_reference_trajectory_msgs/{AnalyticReference,SampledReference,FlatReferencePoint,WaypointReferenceRequest,ActivePolynomialReference,ReferenceStatus}; do
   pkg="${msg%/*}"
   "$python" "$prefix/lib/gencpp/gen_cpp.py" "$root/plugins/ros-io/msg/$msg.msg" -p "$pkg" \
     -Istd_msgs:"$prefix/share/std_msgs/msg" -Igeometry_msgs:"$prefix/share/geometry_msgs/msg" -I"$pkg:$root/plugins/ros-io/msg/$pkg" \
