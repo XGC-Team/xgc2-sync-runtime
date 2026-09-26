@@ -15,7 +15,7 @@ use crate::plugin::sha256_hex;
 pub struct SoTransport {
     vtbl: VTable,
     handle: *mut c_void,
-    kind: &'static str,
+    kind: String,
     options: CString,
     // The sink the plugin calls; boxed so its address is stable. Dropped
     // only after the plugin is closed.
@@ -78,12 +78,14 @@ impl SoTransport {
         if missing.iter().any(|&m| m) {
             return Err(TransportError(format!("{where_}: incomplete vtable")));
         }
+        // Options are pure config. Create only after they are ready: a
+        // failure here must not leave a plugin instance without a Drop.
+        let options = CString::new(toml::to_string(options).map_err(|e| error("transport options", e))?).map_err(|e| error("transport options", e))?;
         let handle = unsafe { (vtbl.create.unwrap())() };
         if handle.is_null() {
             return Err(TransportError(format!("{where_}: create failed")));
         }
-        let options = CString::new(toml::to_string(options).map_err(|e| error("transport options", e))?).map_err(|e| error("transport options", e))?;
-        Ok(Self { vtbl, handle, kind: Box::leak(plugin_kind.to_owned().into_boxed_str()), options, sink: None, library: Some(library) })
+        Ok(Self { vtbl, handle, kind: plugin_kind.to_owned(), options, sink: None, library: Some(library) })
     }
 
     fn check(&self, status: i32, what: &str) -> Result<(), TransportError> {
@@ -96,8 +98,8 @@ impl SoTransport {
 }
 
 impl Transport for SoTransport {
-    fn kind(&self) -> &'static str {
-        self.kind
+    fn kind(&self) -> &str {
+        &self.kind
     }
 
     fn open(&mut self, ctx: &TransportContext, sink: RxSink) -> Result<(), TransportError> {

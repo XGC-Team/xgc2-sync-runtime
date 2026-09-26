@@ -118,7 +118,7 @@ fn serde_json_like(items: &[String]) -> String {
 }
 
 impl Transport for ZenohTransport {
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         "zenoh"
     }
 

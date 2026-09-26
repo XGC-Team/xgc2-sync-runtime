@@ -155,7 +155,7 @@ impl LoopbackTransport {
 }
 
 impl Transport for LoopbackTransport {
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         "loopback"
     }
 
