@@ -159,7 +159,7 @@ impl MissionPhase {
                 }
                 _ => all_fresh,
             };
-        if ready && !self.requested && self.barrier != Some(Barrier::Clock) {
+        if ready && !self.requested && self.barrier != Some(Barrier::Operator) && self.barrier != Some(Barrier::Clock) {
             self.requested = true;
         }
         let mut rolling = self.requested && ready;
@@ -239,9 +239,6 @@ mod tests {
         assert_eq!(c.tick(5, 0.4, 0.4, true).map(|r| r.0), Some(false));
         c.command("start");
         assert_eq!(c.tick(6, 0.5, 0.5, true).map(|r| r.0), Some(true));
-        // Reset zeros the phase; as in the station clock, it re-arms by
-        // itself once every robot is back in Custom1 (the robots leave Custom1
-        // on hold/reset).
         c.command("reset");
         c.observe("a", "Hover", 0.6);
         assert_eq!(c.tick(7, 0.6, 0.6, true), Some((false, 0.0)));
@@ -270,6 +267,31 @@ mod tests {
             }
             assert_eq!(last.unwrap().0, rolls_on, "{gate:?}");
             assert_eq!(c.peers_lost > 0, rolls_on, "{gate:?}: loss is counted while rolling on");
+        }
+    }
+
+    #[test]
+    fn hold_while_custom1_stays_fresh_does_not_rearm_until_track() {
+        for gate in [PeerGate::Start, PeerGate::Always] {
+            let mut c = phase(gate);
+            c.observe("a", "Custom1", 0.0);
+            c.observe("b", "Custom1", 0.0);
+            c.command("track");
+            assert_eq!(c.tick(1, 0.0, 0.0, true).map(|r| r.0), Some(true), "{gate:?}");
+            c.command("hold");
+            for k in 2..6u64 {
+                let t = k as f64 * 0.1;
+                c.observe("a", "Custom1", t);
+                c.observe("b", "Custom1", t);
+                assert_eq!(c.tick(k, t, t, true), Some((false, 0.0)), "{gate:?} round {k}");
+            }
+            c.observe("a", "Custom1", 0.6);
+            c.observe("b", "Custom1", 0.6);
+            assert_eq!(c.tick(6, 0.6, 0.6, true).map(|r| r.0), Some(false), "{gate:?}");
+            c.command("track");
+            c.observe("a", "Custom1", 0.7);
+            c.observe("b", "Custom1", 0.7);
+            assert_eq!(c.tick(7, 0.7, 0.7, true).map(|r| r.0), Some(true), "{gate:?}");
         }
     }
 
