@@ -3,8 +3,18 @@
 //! (formation_generator tools/dmpc_fleet_replay.cpp, one DmpcAgent per robot
 //! in one process) recorded for one robot: its plan and its setpoint every
 //! round, from the same inputs. A feeder node plays the recorded inputs
-//! (measured state, neighbor plans with their rounds, formation ticks) round
-//! by round and collects plan_out and setpoint.
+//! (measured state, the shared scene, neighbor plans with their rounds,
+//! formation ticks) round by round and collects plan_out and setpoint.
+//!
+//! Three fleets:
+//! - five knot_fs150 robots without the scene (obstacle constraints off);
+//! - the unmodified knot_fs150 scenario with its scene.yaml (two static
+//!   posts, which change robot 1's setpoints in every round), with the scene
+//!   state withheld for rounds 30..39: robot 1 holds position once the state
+//!   is older than scene_state_timeout, and resumes;
+//! - the unmodified mixed_circle scenario (five UAVs, four Scout UGVs) with
+//!   its scene.yaml (static obstacles and one constant-velocity mover), from
+//!   the spawn poses of its swarm_pose.yaml; robot 1 is a UAV.
 //!
 //! Needs:
 //!   DMPC_LIB_DIR              libformation_generator_dmpc_{core,params,config}.so
@@ -21,7 +31,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use xgc_rt_audit::{FileAudit, NodeMeta};
@@ -33,20 +43,22 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
 // Channel ids = plan-dmpc port indices (the replay files use those).
-const CHANNELS: [(&str, Qos); 5] = [
+const CHANNELS: [(&str, Qos); 7] = [
     ("formation_tick", Qos::Control),
     ("plan_in", Qos::Control),
     ("plan_out", Qos::Control),
     ("own_state", Qos::State),
     ("setpoint", Qos::Control),
+    ("scene_snapshot", Qos::Event),
+    ("scene_state", Qos::State),
 ];
-const INPUTS: [u32; 3] = [0, 1, 3];
+const INPUTS: [u32; 5] = [0, 1, 3, 5, 6];
 const TICK: u32 = 0;
 const PLAN_OUT: u32 = 2;
 const SETPOINT: u32 = 4;
-const ROUNDS: u64 = 60;
 const HOLD: u64 = 10;
-const ROBOTS: u32 = 5;
+/// xgc.position_target/1 type_mask of the node's position hold.
+const POSITION_HOLD_MASK: u16 = 8 | 16 | 32 | 64 | 128 | 256 | 2048;
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).filter(|p| p.exists())
@@ -68,21 +80,61 @@ fn read_records(path: &Path) -> Vec<(u64, u32, Vec<u8>)> {
     records
 }
 
-fn plan_dmpc_lib(lib_dir: &Path) -> PathBuf {
-    let out = common::workspace_root().join("target/plugin-tests/cpp");
-    std::fs::create_dir_all(&out).unwrap();
-    let lib = out.join("libplan_dmpc.so");
-    let status = Command::new(common::workspace_root().join("scripts/build-plan-dmpc.sh"))
-        .arg(&lib)
-        .env("DMPC_LIB_DIR", lib_dir)
-        .status()
-        .expect("run build-plan-dmpc.sh");
-    assert!(status.success(), "building plan-dmpc failed");
-    lib
+fn plan_dmpc_lib(lib_dir: &Path) -> &'static PathBuf {
+    static LIB: OnceLock<PathBuf> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let out = common::workspace_root().join("target/plugin-tests/cpp");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("libplan_dmpc.so");
+        let status = Command::new(common::workspace_root().join("scripts/build-plan-dmpc.sh"))
+            .arg(&lib)
+            .env("DMPC_LIB_DIR", lib_dir)
+            .status()
+            .expect("run build-plan-dmpc.sh");
+        assert!(status.success(), "building plan-dmpc failed");
+        lib
+    })
+}
+
+// The cases run one at a time: the planner's core log clock and throttles
+// are process-wide.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+#[test]
+fn plan_dmpc_module_reproduces_the_fleet_replay_without_the_scene() {
+    replay("plan-dmpc-replay", "knot_fs150_uav", 5, &[], 60, 0);
 }
 
 #[test]
-fn plan_dmpc_module_reproduces_the_fleet_replay_byte_for_byte() {
+fn plan_dmpc_module_reproduces_the_fleet_replay_with_the_knot_fs150_scene() {
+    replay(
+        "plan-dmpc-replay-knot",
+        "knot_fs150_full_uav",
+        5,
+        &["--scene", "config/scenarios/knot_fs150/scene.yaml", "--scene-gap", "30:40"],
+        80,
+        5,
+    );
+}
+
+#[test]
+fn plan_dmpc_module_reproduces_the_fleet_replay_with_the_mixed_circle_mover() {
+    replay(
+        "plan-dmpc-replay-mixed",
+        "mixed_circle_agent",
+        9,
+        &["--scene", "config/scenarios/mixed_circle/scene.yaml", "--spawn", "config/scenarios/mixed_circle/swarm_pose.yaml"],
+        80,
+        0,
+    );
+}
+
+/// Robot 1 of the fleet `test/replay/plan_dmpc/{manifest}{1..robots}.yaml`
+/// over `rounds`; `options` are dmpc_fleet_replay's (a path argument is
+/// relative to the package). The reference must hold position in exactly
+/// `holds` rounds.
+fn replay(name: &str, manifest: &str, robots: u32, options: &[&str], rounds: u64, holds: usize) {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (Some(lib_dir), Some(fg_root)) = (env_path("DMPC_LIB_DIR"), env_path("FORMATION_GENERATOR_ROOT")) else {
         eprintln!("skipped: set DMPC_LIB_DIR and FORMATION_GENERATOR_ROOT");
         return;
@@ -91,23 +143,36 @@ fn plan_dmpc_module_reproduces_the_fleet_replay_byte_for_byte() {
     assert!(tool.is_file(), "no fleet replay tool at {}", tool.display());
     let lib = plan_dmpc_lib(&lib_dir);
 
-    // The reference: robot 1 of the knot_fs150 fleet (without the scene).
-    let dir = common::scratch("plan-dmpc-replay");
+    let dir = common::scratch(name);
     let manifests: Vec<PathBuf> =
-        (1..=ROBOTS).map(|i| fg_root.join(format!("test/replay/plan_dmpc/knot_fs150_uav{i}.yaml"))).collect();
+        (1..=robots).map(|i| fg_root.join(format!("test/replay/plan_dmpc/{manifest}{i}.yaml"))).collect();
     let (inputs_path, outputs_path) = (dir.join("inputs.bin"), dir.join("outputs.bin"));
-    let status = Command::new(&tool)
-        .args(["--record", "1", "--rounds", &ROUNDS.to_string(), "--hold", &HOLD.to_string()])
+    let mut command = Command::new(&tool);
+    command
+        .args(["--record", "1", "--rounds", &rounds.to_string(), "--hold", &HOLD.to_string()])
         .arg("--inputs").arg(&inputs_path)
-        .arg("--outputs").arg(&outputs_path)
-        .args(&manifests)
-        .status()
-        .expect("run dmpc_fleet_replay");
+        .arg("--outputs").arg(&outputs_path);
+    for option in options {
+        if option.starts_with("config/") {
+            command.arg(fg_root.join(option));
+        } else {
+            command.arg(option);
+        }
+    }
+    let status = command.args(&manifests).status().expect("run dmpc_fleet_replay");
     assert!(status.success(), "dmpc_fleet_replay failed");
     let inputs = read_records(&inputs_path);
     let expected = read_records(&outputs_path);
     let expected_rolling = expected.iter().filter(|(r, p, _)| *p == SETPOINT && *r >= HOLD).count() as u64;
-    assert!(expected_rolling > (ROUNDS - HOLD) * 9 / 10, "the reference must actually fly: {expected_rolling} rolling setpoints");
+    assert!(expected_rolling > (rounds - HOLD) * 9 / 10, "the reference must actually fly: {expected_rolling} rolling setpoints");
+    // Scene holds: a setpoint without a plan in the same round.
+    let plan_rounds: Vec<u64> = expected.iter().filter(|(_, p, _)| *p == PLAN_OUT).map(|(r, _, _)| *r).collect();
+    let hold_rounds: Vec<u64> = expected
+        .iter()
+        .filter(|(r, p, d)| *p == SETPOINT && !plan_rounds.contains(r) && u16::from_le_bytes([d[96], d[97]]) == POSITION_HOLD_MASK)
+        .map(|(r, _, _)| *r)
+        .collect();
+    assert_eq!(hold_rounds.len(), holds, "scene-hold rounds of the reference: {hold_rounds:?}");
 
     let channels: String = CHANNELS
         .iter()
@@ -135,7 +200,7 @@ path = "{lib}"
 trigger = "on_dirty"
 step_budget_ms = 1000.0
 config = {{ param_manifest = "{param_manifest}" }}
-bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, plan_in = {{ channel = "plan_in", from = ["feeder"] }}, own_state = {{ channel = "own_state", from = ["feeder"] }}, plan_out = {{ channel = "plan_out" }}, setpoint = {{ channel = "setpoint" }} }}
+bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, plan_in = {{ channel = "plan_in", from = ["feeder"] }}, own_state = {{ channel = "own_state", from = ["feeder"] }}, scene_snapshot = {{ channel = "scene_snapshot", from = ["feeder"] }}, scene_state = {{ channel = "scene_state", from = ["feeder"] }}, plan_out = {{ channel = "plan_out" }}, setpoint = {{ channel = "setpoint" }} }}
 "#,
         lib = lib.display(),
         param_manifest = manifests[0].display(),

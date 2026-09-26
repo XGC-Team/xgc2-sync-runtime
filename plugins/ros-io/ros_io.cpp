@@ -25,6 +25,8 @@
 //     ref_reset        std_msgs/Empty                        -> xgc.ref.reset/1
 //     hover_thrust     hover_thrust_estimator_msgs/HoverThrustEstimate -> xgc.hover_thrust/1
 //     controller_state std_msgs/String (custom/statustext) -> xgc.controller_status/1 (stamp = receipt)
+//     scene_snapshot   xgc2_geometry_msgs/SceneSnapshot       -> xgc.scene.snapshot/1 (the shared scene,
+//     scene_state      xgc2_geometry_msgs/SceneState          -> xgc.scene.state/1     e.g. /xgc/scene/{snapshot,state})
 //   module inputs -> ROS
 //     vision_pose      xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
 //     neighbor_plans   xgc.dmpc.assumed_trajectory/1 -> formation_generator/AssumedTrajectory
@@ -97,11 +99,14 @@
 #include <ros/ros.h>
 #include <sensor_msgs/BatteryState.h>
 #include <sensor_msgs/Imu.h>
+#include <xgc2_geometry_msgs/SceneSnapshot.h>
+#include <xgc2_geometry_msgs/SceneState.h>
 #include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
 
 #include "../common/flat_config.hpp"
 #include "../common/reference_wire.hpp"
+#include "scene_wire.hpp"
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
 
@@ -140,6 +145,8 @@ enum Port : uint32_t {
   kHoverThrust,
   kControllerState,
   kFormationTick,
+  kSceneSnapshot,
+  kSceneState,
   kPortCount
 };
 
@@ -148,7 +155,7 @@ const char* const kPortNames[kPortCount] = {
     "rigid_state_estimate", "fcu_state", "local_pose", "local_velocity", "fcu_imu", "battery", "command",
     "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
     "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled",
-    "hover_thrust", "controller_state", "formation_tick"};
+    "hover_thrust", "controller_state", "formation_tick", "scene_snapshot", "scene_state"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -364,6 +371,16 @@ struct RosIo {
     s.stamp = ros::Time::now().toSec();
     text(s.state, m->data);
     write(kControllerState, s);
+  }
+
+  void on_scene_snapshot(const xgc2_geometry_msgs::SceneSnapshot::ConstPtr& m) {
+    const auto bytes = xgc_scene_wire::encode_snapshot(*m);
+    write_bytes(kSceneSnapshot, bytes.data(), bytes.size());
+  }
+
+  void on_scene_state(const xgc2_geometry_msgs::SceneState::ConstPtr& m) {
+    const auto bytes = xgc_scene_wire::encode_state(*m);
+    write_bytes(kSceneState, bytes.data(), bytes.size());
   }
 
   void on_hover_thrust(const hover_thrust_estimator_msgs::HoverThrustEstimate::ConstPtr& m) {
@@ -683,6 +700,10 @@ struct RosIo {
     if (enabled(kHoverThrust))
       subs.push_back(nh->subscribe(topics[kHoverThrust], queue_size, &RosIo::on_hover_thrust, this));
     if (enabled(kRefReset)) subs.push_back(nh->subscribe(topics[kRefReset], queue_size, &RosIo::on_ref_reset, this));
+    if (enabled(kSceneSnapshot))
+      subs.push_back(nh->subscribe(topics[kSceneSnapshot], queue_size, &RosIo::on_scene_snapshot, this));
+    if (enabled(kSceneState))
+      subs.push_back(nh->subscribe(topics[kSceneState], queue_size, &RosIo::on_scene_state, this));
     namespace rmsg = multirotor_reference_trajectory_msgs;
     if (enabled(kRefStatus)) pubs[kRefStatus] = nh->advertise<rmsg::ReferenceStatus>(topics[kRefStatus], queue_size, true);
     if (enabled(kRefActiveAnalytic))
@@ -823,6 +844,8 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"hover_thrust", XGC_PORT_OUT_OPTIONAL, "xgc.hover_thrust/1", XGC_QOS_STATE},
     {"controller_state", XGC_PORT_OUT_OPTIONAL, "xgc.controller_status/1", XGC_QOS_STATE},
     {"formation_tick", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.formation_tick/1", XGC_QOS_CONTROL},
+    {"scene_snapshot", XGC_PORT_OUT_OPTIONAL, "xgc.scene.snapshot/1", XGC_QOS_EVENT},
+    {"scene_state", XGC_PORT_OUT_OPTIONAL, "xgc.scene.state/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

@@ -169,6 +169,38 @@ typedef struct xgc_dmpc_formation_tick_v1 {
   uint32_t reserved;
 } xgc_dmpc_formation_tick_v1;
 
+/* The shared scene (xgc2_geometry_msgs/SceneSnapshot and SceneState, as the
+ * harness scene runtime publishes them), field for field except
+ * ScenePart.color. Variable length, little-endian: a head below, then
+ * records. A string is a uint32 byte count and its UTF-8 bytes (no NUL); a
+ * pose is 7 doubles (position x y z, orientation x y z w); a twist is 6
+ * doubles (linear, angular). A payload has no trailing bytes.
+ *
+ * "xgc.scene.snapshot/1": the scene definition (epoch, revision, obstacles).
+ * This head, then frame_id, scene_id, epoch, then obstacle_count obstacles:
+ *   id, name, pose, uint32 dynamic, motion_type, uint32 part_count, then
+ *   part_count parts: id, pose, geometry type ("box" | "sphere" | "cylinder" |
+ *   "capsule" | "convex"), size (3 doubles), double radius, double height,
+ *   uint32 vertex_count, vertex_count vertices (3 doubles each), uint32
+ *   index_count, index_count uint32 triangle indices. */
+typedef struct xgc_scene_snapshot_v1 {
+  double stamp;           /* header.stamp */
+  uint64_t revision;
+  uint32_t obstacle_count;
+  uint32_t reserved;
+} xgc_scene_snapshot_v1;
+
+/* "xgc.scene.state/1": every obstacle's current pose and twist for one
+ * (epoch, revision). This head, then frame_id, epoch, then obstacle_count
+ * records: id, pose, twist. */
+typedef struct xgc_scene_state_v1 {
+  double stamp;           /* header.stamp */
+  double scene_time;
+  uint64_t revision;
+  uint32_t playing;
+  uint32_t obstacle_count;
+} xgc_scene_state_v1;
+
 /* --- PX4 flight-controller interface (ctl-px4 <-> ros_io) ----------------
  * Field for field the MAVROS messages the PX4 controller reads or writes.
  * On every input, the sample's envelope t_produce is its receive time. */
@@ -390,6 +422,8 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_assumed_trajectory_v1) == 32, "xgc_dmpc_assume
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_sync_trigger_v1) == 32, "xgc_dmpc_sync_trigger_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_mission_state_v1) == 80, "xgc_dmpc_mission_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_formation_tick_v1) == 16, "xgc_dmpc_formation_tick_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_scene_snapshot_v1) == 24, "xgc_scene_snapshot_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_scene_state_v1) == 32, "xgc_scene_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_state_v1) == 48, "xgc_fcu_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_twist_v1) == 56, "xgc_twist_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_battery_v1) == 24, "xgc_battery_v1");

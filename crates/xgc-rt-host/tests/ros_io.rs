@@ -138,11 +138,58 @@ fn vendored_ros_messages_equal_their_originals() {
         ("rigid_state_estimator_msgs/RigidStateEstimate.msg", products.join("ros1/common/ros1-msgs/rigid_state_estimator_msgs/msg/RigidStateEstimate.msg")),
         ("formation_generator/AssumedTrajectory.msg", repos.join("academic/ros1_ws/src/planner/formation_generator/msg/AssumedTrajectory.msg")),
         ("periodic_sync/SyncTrigger.msg", repos.join("academic/ros1_ws/src/communication/periodic_sync/msg/SyncTrigger.msg")),
-    ] {
+    ]
+    .into_iter()
+    .chain(["SceneSnapshot", "SceneObstacle", "ScenePart", "SceneGeometry", "SceneState", "SceneObstacleState"].map(|m| {
+        (
+            Box::leak(format!("xgc2_geometry_msgs/{m}.msg").into_boxed_str()) as &str,
+            products.join(format!("ros1/simulator/convex_geometry/xgc2_geometry_msgs/msg/{m}.msg")),
+        )
+    }))
+    {
         let Ok(want) = std::fs::read(&original) else {
             eprintln!("skipped {copy}: {} is not checked out", original.display());
             continue;
         };
         assert_eq!(std::fs::read(root.join("plugins/ros-io/msg").join(copy)).unwrap(), want, "{copy} drifted from {}", original.display());
     }
+}
+
+/// ros_io's shared-scene payloads decode with the planner's codec (the one
+/// plan-dmpc uses) to exactly the message fields. Needs ROS_PREFIX and
+/// FORMATION_GENERATOR_ROOT (the academic formation_generator package).
+#[test]
+fn scene_payloads_decode_with_the_planner_codec() {
+    let (Some(prefix), Some(fg)) = (
+        common::ros_prefix(),
+        std::env::var_os("FORMATION_GENERATOR_ROOT").map(std::path::PathBuf::from).filter(|p| p.is_dir()),
+    ) else {
+        eprintln!("skipped: set ROS_PREFIX and FORMATION_GENERATOR_ROOT");
+        return;
+    };
+    let gen = common::ros_io_lib(&prefix).parent().unwrap().join("ros-io-gen");
+    let out = common::workspace_root().join("target/plugin-tests/ros");
+    let tool = out.join("scene_wire_check");
+    let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
+    let cxx = if conda_cxx.is_file() { conda_cxx } else { std::path::PathBuf::from("c++") };
+    let eigen = std::env::var_os("EIGEN_INCLUDE").map(std::path::PathBuf::from).unwrap_or_else(|| prefix.join("include/eigen3"));
+    let status = std::process::Command::new(cxx)
+        .args(["-std=c++17", "-O2"])
+        .arg("-I").arg(common::workspace_root().join("abi/include"))
+        .arg("-I").arg(common::workspace_root().join("plugins/ros-io"))
+        .arg("-I").arg(&gen)
+        .arg("-I").arg(fg.join("include"))
+        .arg("-I").arg(fg.join("../../common/convex_geometry/include"))
+        .arg("-isystem").arg(&eigen)
+        .arg("-isystem").arg(prefix.join("include"))
+        .arg(common::workspace_root().join("crates/xgc-rt-host/tests/ros/scene_wire_check.cpp"))
+        .arg("-o").arg(&tool)
+        .arg("-L").arg(prefix.join("lib")).arg(format!("-Wl,-rpath,{}", prefix.join("lib").display()))
+        .args(["-lrostime", "-lcpp_common"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "building scene_wire_check failed");
+    let run = std::process::Command::new(&tool).output().unwrap();
+    println!("{}", String::from_utf8_lossy(&run.stdout));
+    assert!(run.status.success(), "ros_io scene payloads differ from the planner codec");
 }

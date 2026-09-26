@@ -11,21 +11,31 @@
 //   out plan_out        xgc.dmpc.assumed_trajectory/1   (this robot's plan, every round)
 //   in  own_state       xgc.rigid_state/1               (measured state; seeds the plan)
 //   out setpoint        xgc.position_target/1           (the node's setpoint_raw/local)
+//   in  scene_snapshot  xgc.scene.snapshot/1            (optional; the shared scene's definition)
+//   in  scene_state     xgc.scene.state/1               (optional; its obstacles' current state)
 //
 // Rounds: a formation tick of round k runs the agent once, and its plan and
 // setpoint are published for round k. Before the tick, the module gives the
 // agent every measured state of rounds <= k and every neighbor plan of
 // rounds <= k - 1 (the sample's round, never its arrival time), in round
 // order: a neighbor's round-k plan is used at round k + 1 even when it
-// arrives before the tick of round k. The agent's clock is the tick's
-// trigger time, so a run is a function of its inputs.
+// arrives before the tick of round k. Scene samples of rounds <= k go to the
+// agent after the measured states and before the plans, by round and, within
+// a round, definitions before states; a state's receive time is its stamp.
+// The agent's clock is the tick's trigger time, so a run is a function of
+// its inputs.
+//
+// A configuration with static or moving obstacle constraints needs the scene
+// ports bound: the agent does not seed before the scene arrived, and it
+// holds position (the node's scene hold) while the scene is invalid, its
+// state is older than scene_state_timeout, or a new scene's first round fails.
 //
 // Config: param_manifest (required): the robot's param manifest, the
 // scenario YAML files its launch block loads (rosparam_yaml.h,
 // ParamManifest); relative paths resolve against the manifest's directory.
 //
-// Domain state: the agent's phase (wait_self_state, wait_neighbors, hold,
-// rolling), or "unconfigured".
+// Domain state: the agent's phase (wait_obstacle_info, wait_self_state,
+// wait_neighbors, hold, rolling, fault), or "unconfigured".
 
 #include <algorithm>
 #include <cstdint>
@@ -43,6 +53,7 @@
 #include "formation_generator/core/core_log.h"
 #include "formation_generator/core/plan_wire.h"
 #include "formation_generator/core/position_target_output.h"
+#include "formation_generator/core/scene_wire.h"
 #include "formation_generator/dmpc_scheduler/dmpc_agent.h"
 #include "formation_generator/params/rosparam_yaml.h"
 #include "xgc_rt.h"
@@ -52,7 +63,9 @@ namespace {
 
 namespace fg = formation_generator_dmpc;
 
-enum Port : uint32_t { kFormationTick, kPlanIn, kPlanOut, kOwnState, kSetpoint, kPortCount };
+enum Port : uint32_t {
+  kFormationTick, kPlanIn, kPlanOut, kOwnState, kSetpoint, kSceneSnapshot, kSceneState, kPortCount
+};
 
 static_assert(sizeof(fg::PositionTargetPayload) == sizeof(xgc_position_target_v1),
               "PositionTargetPayload is xgc_position_target_v1");
@@ -90,12 +103,21 @@ bool readTick(const xgc_sample_view& s, fg::DmpcTick& tick) {
   return true;
 }
 
+// One scene sample: a definition or a state, with its round.
+struct SceneInput {
+  uint64_t round;
+  bool definition;
+  fg::SceneSnapshotData snapshot;
+  fg::SceneStateData state;
+};
+
 struct PlanDmpc {
   const xgc_host_api* host{nullptr};
   std::unique_ptr<fg::DmpcAgent> agent;
   // Inputs not yet given to the agent, in arrival order.
   std::vector<std::pair<uint64_t, xgc_rigid_state_v1>> states;
   std::vector<std::pair<uint64_t, fg::PlanMessage>> plans;
+  std::vector<SceneInput> scene;
   std::map<uint64_t, fg::DmpcTick> ticks;
   bool ticked{false};
   uint64_t last_tick{0};
@@ -123,6 +145,22 @@ struct PlanDmpc {
       }
       plans.emplace_back(s.round, std::move(plan));
     }
+    while (host->next(host->host, kSceneSnapshot, &s) == XGC_OK) {
+      SceneInput in{s.round, true, {}, {}};
+      if (!fg::decodeSceneSnapshot(s.data, s.len, in.snapshot)) {
+        log(XGC_LOG_WARN, "plan-dmpc: malformed scene snapshot dropped");
+        continue;
+      }
+      scene.push_back(std::move(in));
+    }
+    while (host->next(host->host, kSceneState, &s) == XGC_OK) {
+      SceneInput in{s.round, false, {}, {}};
+      if (!fg::decodeSceneState(s.data, s.len, in.state)) {
+        log(XGC_LOG_WARN, "plan-dmpc: malformed scene state dropped");
+        continue;
+      }
+      scene.push_back(std::move(in));
+    }
     while (host->next(host->host, kFormationTick, &s) == XGC_OK) {
       fg::DmpcTick tick;
       if (!readTick(s, tick)) {
@@ -149,6 +187,16 @@ struct PlanDmpc {
                           st.stamp);
     }
     states = std::move(later_states);
+    std::vector<SceneInput> usable_scene, later_scene;
+    for (auto& in : scene) (in.round <= k ? usable_scene : later_scene).push_back(std::move(in));
+    std::stable_sort(usable_scene.begin(), usable_scene.end(), [](const SceneInput& a, const SceneInput& b) {
+      return a.round != b.round ? a.round < b.round : a.definition && !b.definition;
+    });
+    for (const auto& in : usable_scene) {
+      if (in.definition) agent->receiveSceneSnapshot(in.snapshot);
+      else agent->receiveSceneState(in.state, in.state.stamp);
+    }
+    scene = std::move(later_scene);
     std::vector<std::pair<uint64_t, fg::PlanMessage>> usable, later_plans;
     for (auto& entry : plans) (entry.first + 1 <= k ? usable : later_plans).push_back(std::move(entry));
     std::stable_sort(usable.begin(), usable.end(),
@@ -220,6 +268,11 @@ xgc_status configure(void* p, const char* config) {
       return XGC_ERR;
     }
     self->agent = std::make_unique<fg::DmpcAgent>(fg::privateParamsFromManifest(fg::loadParamManifest(manifest)));
+    if (self->agent->configuration().planar_reference_output) {
+      self->agent.reset();
+      self->log(XGC_LOG_ERROR, "plan-dmpc: planar_reference_output has no output port yet (xgc.position_target/1 only)");
+      return XGC_ERR;
+    }
     return XGC_OK;
   });
 }
@@ -249,11 +302,13 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"plan_out", XGC_PORT_OUT, "xgc.dmpc.assumed_trajectory/1", XGC_QOS_CONTROL},
     {"own_state", XGC_PORT_IN, "xgc.rigid_state/1", XGC_QOS_STATE},
     {"setpoint", XGC_PORT_OUT, "xgc.position_target/1", XGC_QOS_CONTROL},
+    {"scene_snapshot", XGC_PORT_IN_OPTIONAL, "xgc.scene.snapshot/1", XGC_QOS_EVENT},
+    {"scene_state", XGC_PORT_IN_OPTIONAL, "xgc.scene.state/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
 
-const xgc_plugin_descriptor kDescriptor = {XGC_RT_ABI_VERSION, kPortCount, "plan-dmpc", "0.1.0", kPorts, &kVtbl};
+const xgc_plugin_descriptor kDescriptor = {XGC_RT_ABI_VERSION, kPortCount, "plan-dmpc", "0.2.0", kPorts, &kVtbl};
 
 }  // namespace
 
