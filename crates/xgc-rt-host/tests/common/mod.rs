@@ -159,6 +159,26 @@ pub fn ros_io_lib(prefix: &std::path::Path) -> &'static PathBuf {
     })
 }
 
+/// ctl-px4 built against the ROS-free PX4 controller core
+/// (PX4_CORE_LIB_DIR and the other build-ctl-px4.sh variables), with the
+/// toolchain that built the core (RoboStack's, when present).
+pub fn ctl_px4_lib(prefix: &std::path::Path) -> &'static PathBuf {
+    static LIB: OnceLock<PathBuf> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let out = workspace_root().join("target/plugin-tests/cpp");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("libctl_px4.so");
+        let mut c = Command::new(workspace_root().join("scripts/build-ctl-px4.sh"));
+        c.arg(&lib);
+        let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
+        if std::env::var_os("CXX").is_none() && conda_cxx.is_file() {
+            c.env("CXX", conda_cxx);
+        }
+        assert!(c.status().unwrap().success(), "building ctl-px4 failed");
+        lib
+    })
+}
+
 /// A command run with the ROS environment (`source $ROS_PREFIX/setup.sh`).
 pub fn ros_command(prefix: &std::path::Path, program: &str) -> std::process::Command {
     let mut c = std::process::Command::new("bash");

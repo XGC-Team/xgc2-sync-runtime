@@ -51,21 +51,6 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).filter(|p| p.exists())
 }
 
-fn build_ctl_px4(prefix: &std::path::Path) -> PathBuf {
-    let out = common::workspace_root().join("target/plugin-tests/cpp");
-    std::fs::create_dir_all(&out).unwrap();
-    let lib = out.join("libctl_px4.so");
-    let mut c = Command::new(common::workspace_root().join("scripts/build-ctl-px4.sh"));
-    c.arg(&lib);
-    // Build with the toolchain that built the core (RoboStack's, when present).
-    let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
-    if std::env::var_os("CXX").is_none() && conda_cxx.is_file() {
-        c.env("CXX", conda_cxx);
-    }
-    assert!(c.status().unwrap().success(), "building ctl-px4 failed");
-    lib
-}
-
 fn convert_stream(prefix: &std::path::Path, stream: &std::path::Path) -> Vec<(u64, u32, Vec<u8>)> {
     // The converter reuses ros_io's generated message headers (verbatim .msg).
     let ros_io = common::ros_io_lib(prefix);
@@ -113,7 +98,7 @@ fn ctl_px4_module_reproduces_the_controller_replay_byte_for_byte() {
         eprintln!("skipped: set ROS_PREFIX, PX4_CORE_LIB_DIR, PX4_REPLAY_STREAM and PX4_REPLAY_REF");
         return;
     };
-    let lib = build_ctl_px4(&prefix);
+    let lib = common::ctl_px4_lib(&prefix);
     let records = convert_stream(&prefix, &stream);
     let expected = std::fs::read(&reference).unwrap();
 
