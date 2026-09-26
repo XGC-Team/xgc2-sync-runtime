@@ -15,7 +15,11 @@
 //! - the unmodified mixed_circle scenario (five UAVs, four Scout UGVs) with
 //!   its scene.yaml (static obstacles and one constant-velocity mover), from
 //!   the spawn poses of its swarm_pose.yaml, recorded for robot 1 (a UAV:
-//!   position targets) and robot 6 (a Scout UGV: planar setpoints).
+//!   position targets) and robot 6 (a Scout UGV: planar setpoints);
+//! - act1_mega with output_mode pass_through (legacy backend, 164 static
+//!   rocks under the 8 m local sensing crop, uniform-velocity leader started
+//!   2 m ahead so the formation travels), an ideal plant, and the node's
+//!   50 Hz zero-order-hold timer driven by clock samples.
 //!
 //! Needs:
 //!   DMPC_LIB_DIR              libformation_generator_dmpc_{core,params,config}.so
@@ -44,7 +48,7 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
 // Channel ids = plan-dmpc port indices (the replay files use those).
-const CHANNELS: [(&str, Qos); 8] = [
+const CHANNELS: [(&str, Qos); 9] = [
     ("formation_tick", Qos::Control),
     ("plan_in", Qos::Control),
     ("plan_out", Qos::Control),
@@ -53,8 +57,9 @@ const CHANNELS: [(&str, Qos); 8] = [
     ("scene_snapshot", Qos::Event),
     ("scene_state", Qos::State),
     ("planar_setpoint", Qos::Control),
+    ("clock", Qos::Event),
 ];
-const INPUTS: [u32; 5] = [0, 1, 3, 5, 6];
+const INPUTS: [u32; 6] = [0, 1, 3, 5, 6, 8];
 const TICK: u32 = 0;
 const PLAN_OUT: u32 = 2;
 const SETPOINT: u32 = 4;
@@ -105,7 +110,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
 fn plan_dmpc_module_reproduces_the_fleet_replay_without_the_scene() {
-    replay("plan-dmpc-replay", "knot_fs150_uav", 5, 1, &[], 60, 0);
+    replay("plan-dmpc-replay", "knot_fs150_uav", 5, 1, &[], "", 60, 0);
 }
 
 #[test]
@@ -116,6 +121,7 @@ fn plan_dmpc_module_reproduces_the_fleet_replay_with_the_knot_fs150_scene() {
         5,
         1,
         &["--scene", "config/scenarios/knot_fs150/scene.yaml", "--scene-gap", "30:40"],
+        "",
         80,
         5,
     );
@@ -129,6 +135,28 @@ fn plan_dmpc_module_reproduces_the_fleet_replay_with_the_mixed_circle_mover() {
         9,
         1,
         &["--scene", "config/scenarios/mixed_circle/scene.yaml", "--spawn", "config/scenarios/mixed_circle/swarm_pose.yaml"],
+        "",
+        80,
+        0,
+    );
+}
+
+#[test]
+fn plan_dmpc_module_reproduces_the_fleet_replay_in_act1_pass_through() {
+    replay(
+        "plan-dmpc-replay-pass-through",
+        "act1_mega_pass_through_moved_uav",
+        8,
+        1,
+        &[
+            "--scene",
+            "config/scenarios/act1_mega/scene/scene.yaml",
+            "--spawn",
+            "config/scenarios/act1_mega/scene/mission.yaml",
+            "--plant",
+            "ideal",
+        ],
+        ", pass_through_clock = \"input\"",
         80,
         0,
     );
@@ -142,6 +170,7 @@ fn plan_dmpc_module_reproduces_the_fleet_replay_for_a_mixed_circle_scout() {
         9,
         6,
         &["--scene", "config/scenarios/mixed_circle/scene.yaml", "--spawn", "config/scenarios/mixed_circle/swarm_pose.yaml"],
+        "",
         80,
         0,
     );
@@ -151,7 +180,7 @@ fn plan_dmpc_module_reproduces_the_fleet_replay_for_a_mixed_circle_scout() {
 /// over `rounds`; `options` are dmpc_fleet_replay's (a path argument is
 /// relative to the package). The reference must hold position in exactly
 /// `holds` rounds.
-fn replay(name: &str, manifest: &str, robots: u32, record: u32, options: &[&str], rounds: u64, holds: usize) {
+fn replay(name: &str, manifest: &str, robots: u32, record: u32, options: &[&str], config: &str, rounds: u64, holds: usize) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (Some(lib_dir), Some(fg_root)) = (env_path("DMPC_LIB_DIR"), env_path("FORMATION_GENERATOR_ROOT")) else {
         eprintln!("skipped: set DMPC_LIB_DIR and FORMATION_GENERATOR_ROOT");
@@ -218,8 +247,8 @@ name = "plan-dmpc"
 path = "{lib}"
 trigger = "on_dirty"
 step_budget_ms = 1000.0
-config = {{ param_manifest = "{param_manifest}" }}
-bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, plan_in = {{ channel = "plan_in", from = ["feeder"] }}, own_state = {{ channel = "own_state", from = ["feeder"] }}, scene_snapshot = {{ channel = "scene_snapshot", from = ["feeder"] }}, scene_state = {{ channel = "scene_state", from = ["feeder"] }}, plan_out = {{ channel = "plan_out" }}, setpoint = {{ channel = "setpoint" }}, planar_setpoint = {{ channel = "planar_setpoint" }} }}
+config = {{ param_manifest = "{param_manifest}"{config} }}
+bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, plan_in = {{ channel = "plan_in", from = ["feeder"] }}, own_state = {{ channel = "own_state", from = ["feeder"] }}, scene_snapshot = {{ channel = "scene_snapshot", from = ["feeder"] }}, scene_state = {{ channel = "scene_state", from = ["feeder"] }}, clock = {{ channel = "clock", from = ["feeder"] }}, plan_out = {{ channel = "plan_out" }}, setpoint = {{ channel = "setpoint" }}, planar_setpoint = {{ channel = "planar_setpoint" }} }}
 "#,
         lib = lib.display(),
         param_manifest = manifests[record as usize - 1].display(),
@@ -261,24 +290,24 @@ bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, 
     };
     std::thread::sleep(Duration::from_millis(300));
 
-    // Round by round: after tick k, wait for the module's round-k outputs
-    // the reference has, so no input queue ever holds more than one round.
+    // Round by round: before tick k, wait for every output of the rounds
+    // before it (the tick's outputs and, with pass-through, the holds the
+    // clock samples after it run), so no input queue holds more than a round.
     let mut want: BTreeMap<u64, usize> = BTreeMap::new();
     for (round, _, _) in &expected {
         *want.entry(*round).or_default() += 1;
     }
     let mut got: Vec<(u64, u32, Vec<u8>)> = Vec::new();
     for (i, (round, port, payload)) in inputs.iter().enumerate() {
+        if *port == TICK {
+            let need: usize = want.range(..*round).map(|(_, n)| n).sum();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while got.iter().filter(|(r, _, _)| r < round).count() < need && Instant::now() < deadline {
+                feeder.wait(Duration::from_millis(50));
+                got.extend(feeder.drain().into_iter().map(|f| (f.header.round, f.header.channel, f.payload)));
+            }
+        }
         feeder.publish(*port, *round, i as i64, payload).unwrap();
-        if *port != TICK {
-            continue;
-        }
-        let need = want.get(round).copied().unwrap_or(0);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while got.iter().filter(|(r, _, _)| r == round).count() < need && Instant::now() < deadline {
-            feeder.wait(Duration::from_millis(50));
-            got.extend(feeder.drain().into_iter().map(|f| (f.header.round, f.header.channel, f.payload)));
-        }
     }
     let mut idle = 0;
     while idle < 10 {

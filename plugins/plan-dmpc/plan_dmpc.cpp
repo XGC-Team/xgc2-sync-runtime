@@ -13,6 +13,7 @@
 //   out setpoint        xgc.position_target/1           (optional; the node's setpoint_raw/local)
 //   out planar_setpoint xgc.planar_pva/1                (optional; with planar_reference_output,
 //                                                        the node's alg/reference/pva)
+//   in  clock           xgc.clock/1                     (optional; pass_through_clock = "input")
 //   in  scene_snapshot  xgc.scene.snapshot/1            (optional; the shared scene's definition)
 //   in  scene_state     xgc.scene.state/1               (optional; its obstacles' current state)
 //
@@ -36,6 +37,19 @@
 // and its position hold, on planar_setpoint instead of setpoint, as the node
 // publishes PlanarPvaReference instead of PositionTarget.
 //
+// output_mode pass_through (the basic-DMPC ablation, legacy backend): each
+// rolling tick publishes the stage-1 sample, and the node's zero-order-hold
+// timer republishes it every 1 / pass_through_hold_rate_hz until the next
+// one (one position hold after 2T without a sample). pass_through_clock
+// selects what drives that timer:
+//   "session" (default)  the hold times n / rate of Session time, run at each
+//                        step up to ctx->now: run the module with trigger
+//                        "both" and wake_ms <= 1000 / pass_through_hold_rate_hz;
+//   "input"              replay: a clock sample (seconds) of round k runs the
+//                        timer once at that time, after tick k and before
+//                        tick k + 1.
+// Hold outputs go out on setpoint for the round of the last tick.
+//
 // Config: param_manifest (required): the robot's param manifest, the
 // scenario YAML files its launch block loads (rosparam_yaml.h,
 // ParamManifest); relative paths resolve against the manifest's directory.
@@ -46,6 +60,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -72,7 +87,7 @@ namespace fg = formation_generator_dmpc;
 
 enum Port : uint32_t {
   kFormationTick, kPlanIn, kPlanOut, kOwnState, kSetpoint, kSceneSnapshot, kSceneState, kPlanarSetpoint,
-  kPortCount
+  kClock, kPortCount
 };
 
 static_assert(sizeof(fg::PositionTargetPayload) == sizeof(xgc_position_target_v1),
@@ -132,6 +147,11 @@ struct PlanDmpc {
   std::map<uint64_t, fg::DmpcTick> ticks;
   bool ticked{false};
   uint64_t last_tick{0};
+  // Pass-through hold timer: clock samples (round, seconds) not yet run, or
+  // the next Session hold time.
+  bool input_clock{false};
+  std::vector<std::pair<uint64_t, double>> clocks;
+  int64_t next_hold_ns{0};
 
   void log(xgc_log_level level, const std::string& message) const {
     host->log(host->host, level, message.c_str());
@@ -171,6 +191,15 @@ struct PlanDmpc {
         continue;
       }
       scene.push_back(std::move(in));
+    }
+    while (host->next(host->host, kClock, &s) == XGC_OK) {
+      double t = 0.0;
+      if (s.len != sizeof t) {
+        log(XGC_LOG_WARN, "plan-dmpc: malformed clock sample dropped");
+        continue;
+      }
+      std::memcpy(&t, s.data, sizeof t);
+      clocks.emplace_back(s.round, t);
     }
     while (host->next(host->host, kFormationTick, &s) == XGC_OK) {
       fg::DmpcTick tick;
@@ -216,36 +245,56 @@ struct PlanDmpc {
     plans = std::move(later_plans);
   }
 
-  xgc_status step(const xgc_step_ctx*) {
+  xgc_status publishOutputs(uint64_t round, const fg::DmpcTickOutput& out) {
+    if (out.has_plan) {
+      const std::vector<uint8_t> payload = fg::encodePlanPayload(out.plan);
+      if (host->publish(host->host, kPlanOut, round, payload.data(), static_cast<uint32_t>(payload.size())) != XGC_OK) {
+        log(XGC_LOG_ERROR, "plan-dmpc: publish plan failed");
+        return XGC_ERR;
+      }
+    }
+    if (out.has_planar &&
+        host->publish(host->host, kPlanarSetpoint, round, reinterpret_cast<const uint8_t*>(&out.planar),
+                      static_cast<uint32_t>(sizeof out.planar)) != XGC_OK) {
+      log(XGC_LOG_ERROR, "plan-dmpc: publish planar setpoint failed");
+      return XGC_ERR;
+    }
+    if (out.has_setpoint &&
+        host->publish(host->host, kSetpoint, round, reinterpret_cast<const uint8_t*>(&out.setpoint),
+                      static_cast<uint32_t>(sizeof out.setpoint)) != XGC_OK) {
+      log(XGC_LOG_ERROR, "plan-dmpc: publish setpoint failed");
+      return XGC_ERR;
+    }
+    return XGC_OK;
+  }
+
+  xgc_status step(const xgc_step_ctx* ctx) {
     drain();
-    while (!ticks.empty()) {
+    std::stable_sort(clocks.begin(), clocks.end());
+    for (;;) {
+      // A clock sample of a round already ticked runs before the next tick.
+      if (!clocks.empty() && ticked && clocks.front().first <= last_tick &&
+          (ticks.empty() || clocks.front().first < ticks.begin()->first)) {
+        const double t = clocks.front().second;
+        clocks.erase(clocks.begin());
+        if (publishOutputs(last_tick, agent->passThroughHold(t)) != XGC_OK) return XGC_ERR;
+        continue;
+      }
+      if (ticks.empty()) break;
       const fg::DmpcTick tick = ticks.begin()->second;
       ticks.erase(ticks.begin());
       feed(tick.round);
       const fg::DmpcTickOutput out = agent->tick(tick);
       ticked = true;
       last_tick = tick.round;
-      if (out.has_plan) {
-        const std::vector<uint8_t> payload = fg::encodePlanPayload(out.plan);
-        if (host->publish(host->host, kPlanOut, tick.round, payload.data(),
-                          static_cast<uint32_t>(payload.size())) != XGC_OK) {
-          log(XGC_LOG_ERROR, "plan-dmpc: publish plan failed");
-          return XGC_ERR;
-        }
-      }
-      if (out.has_planar) {
-        if (host->publish(host->host, kPlanarSetpoint, tick.round,
-                          reinterpret_cast<const uint8_t*>(&out.planar),
-                          static_cast<uint32_t>(sizeof out.planar)) != XGC_OK) {
-          log(XGC_LOG_ERROR, "plan-dmpc: publish planar setpoint failed");
-          return XGC_ERR;
-        }
-      }
-      if (out.has_setpoint) {
-        if (host->publish(host->host, kSetpoint, tick.round,
-                          reinterpret_cast<const uint8_t*>(&out.setpoint),
-                          static_cast<uint32_t>(sizeof out.setpoint)) != XGC_OK) {
-          log(XGC_LOG_ERROR, "plan-dmpc: publish setpoint failed");
+      if (publishOutputs(tick.round, out) != XGC_OK) return XGC_ERR;
+    }
+    const fg::DmpcConfiguration& c = agent->configuration();
+    if (!input_clock && ticked && c.passThrough() && c.pass_through_hold_rate_hz > 0.0) {
+      const int64_t period = std::llround(1e9 / c.pass_through_hold_rate_hz);
+      if (next_hold_ns == 0) next_hold_ns = (ctx->now / period + 1) * period;
+      for (; next_hold_ns <= ctx->now; next_hold_ns += period) {
+        if (publishOutputs(last_tick, agent->passThroughHold(static_cast<double>(next_hold_ns) * 1e-9)) != XGC_OK) {
           return XGC_ERR;
         }
       }
@@ -281,7 +330,14 @@ void* create(const xgc_host_api* host) {
 xgc_status configure(void* p, const char* config) {
   auto* self = static_cast<PlanDmpc*>(p);
   return guarded(self->host, "configure", [&] {
-    const std::string manifest = xgc_rt_config::text_or(config ? config : "", "param_manifest", "");
+    const std::string text = config ? config : "";
+    const std::string manifest = xgc_rt_config::text_or(text, "param_manifest", "");
+    const std::string clock = xgc_rt_config::text_or(text, "pass_through_clock", "session");
+    if (clock != "session" && clock != "input") {
+      self->log(XGC_LOG_ERROR, "plan-dmpc: pass_through_clock must be \"session\" or \"input\"");
+      return XGC_ERR;
+    }
+    self->input_clock = clock == "input";
     if (manifest.empty()) {
       self->log(XGC_LOG_ERROR, "plan-dmpc: param_manifest is required");
       return XGC_ERR;
@@ -319,6 +375,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"scene_snapshot", XGC_PORT_IN_OPTIONAL, "xgc.scene.snapshot/1", XGC_QOS_EVENT},
     {"scene_state", XGC_PORT_IN_OPTIONAL, "xgc.scene.state/1", XGC_QOS_STATE},
     {"planar_setpoint", XGC_PORT_OUT_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
+    {"clock", XGC_PORT_IN_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
