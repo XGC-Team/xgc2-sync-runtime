@@ -7,7 +7,7 @@
 //! ```ignore
 //! let mut nx = NeighborExchange::new(&host, PLAN_IN, PLAN_OUT, 1);
 //! // in step():
-//! nx.absorb(&mut host);                          // non-blocking: drain new plans
+//! nx.absorb(&mut host, ctx.round);               // non-blocking: drain new plans
 //! if ctx.round_advanced != 0 {
 //!     let snap = nx.snapshot(ctx.round, ctx.now);   // one entry per roster neighbor
 //!     /* solve with snap.neighbors[i].status / .data */
@@ -15,11 +15,15 @@
 //! }
 //! ```
 //!
-//! Status of neighbor `j` at round `k`, from the latest plan received from
-//! it (highest round, then highest seq):
-//! - `Fresh`: produced for round ≥ k − 1;
+//! Status of neighbor `j` at round `k`, from the latest admitted plan
+//! (highest round, then highest seq). A plan is admitted only when its
+//! round is ≤ the planner round passed to `offer`; a future round is
+//! refused before the cache and cannot become newest.
+//! - `Fresh`: produced for round k − 1 ≤ round ≤ k;
 //! - `Stale(n)`: produced for round k − 1 − n, 1 ≤ n ≤ `s_max`;
-//! - `Missing`: nothing received, or older than that.
+//! - `Missing`: nothing admitted, older than the stale window, or a cached
+//!   round still in the future relative to this snapshot. A future round
+//!   is never `Fresh`.
 //!
 //! Nothing blocks: the planner decides at its own deadline with whatever
 //! has arrived, and the snapshot says exactly what that was. Every plan's
@@ -94,21 +98,27 @@ impl NeighborExchange {
         &self.neighbors
     }
 
-    /// Drain every new plan from the in-port, keeping the newest per neighbor.
+    /// Drain every new plan from the in-port, keeping the newest admitted
+    /// plan per neighbor. `planner_k` is the caller's current planner round.
     /// Returns how many samples were read.
-    pub fn absorb(&mut self, host: &mut Host) -> usize {
+    pub fn absorb(&mut self, host: &mut Host, planner_k: u64) -> usize {
         let mut n = 0;
         while let Some(s) = host.next(self.plan_in) {
             n += 1;
-            self.offer(s.origin, s.round, s.seq, s.t_produce, s.data);
+            let _ = self.offer(planner_k, s.origin, s.round, s.seq, s.t_produce, s.data);
         }
         n
     }
 
-    /// Record one received plan (what `absorb` does per sample).
-    pub fn offer(&mut self, origin: u16, round: u64, seq: u64, t_produce: i64, data: &[u8]) {
-        if !self.neighbors.contains(&origin) {
-            return;
+    /// Admit one received plan at planner round `planner_k`.
+    ///
+    /// Returns false when `origin` is not a neighbor or `round` is in the
+    /// future (`round > planner_k`). A refused plan is not cached. Among
+    /// admitted plans, a strictly newer `(round, seq)` replaces the cached
+    /// plan; an older or duplicate plan does not.
+    pub fn offer(&mut self, planner_k: u64, origin: u16, round: u64, seq: u64, t_produce: i64, data: &[u8]) -> bool {
+        if !self.neighbors.contains(&origin) || round > planner_k {
+            return false;
         }
         let newer = match self.latest.get(&origin) {
             None => true,
@@ -117,6 +127,7 @@ impl NeighborExchange {
         if newer {
             self.latest.insert(origin, Latest { round, seq, t_produce, data: data.to_vec() });
         }
+        true
     }
 
     pub fn snapshot(&self, k: u64, now: i64) -> Snapshot<'_> {
@@ -127,7 +138,9 @@ impl NeighborExchange {
             .map(|&origin| match self.latest.get(&origin) {
                 None => NeighborView { origin, status: NeighborStatus::Missing, round: None, age_ns: None, data: &[] },
                 Some(l) => {
-                    let status = if l.round >= expected {
+                    let status = if l.round > k {
+                        NeighborStatus::Missing
+                    } else if l.round >= expected {
                         NeighborStatus::Fresh
                     } else if expected - l.round <= self.s_max {
                         NeighborStatus::Stale(expected - l.round)
@@ -154,10 +167,10 @@ mod tests {
     #[test]
     fn statuses_follow_the_round_rule() {
         let mut nx = NeighborExchange::with_neighbors(vec![1, 2, 3, 4], 0, 1, 2);
-        nx.offer(1, 9, 5, 100, b"a"); // fresh for k = 10
-        nx.offer(2, 8, 4, 100, b"b"); // stale by 1
-        nx.offer(3, 6, 3, 100, b"c"); // 3 behind: beyond s_max = 2 -> missing
-        nx.offer(9, 9, 1, 100, b"x"); // not a neighbor: ignored
+        assert!(nx.offer(10, 1, 9, 5, 100, b"a")); // fresh for k = 10
+        assert!(nx.offer(10, 2, 8, 4, 100, b"b")); // stale by 1
+        assert!(nx.offer(10, 3, 6, 3, 100, b"c")); // 3 behind: beyond s_max = 2 -> missing
+        assert!(!nx.offer(10, 9, 9, 1, 100, b"x")); // not a neighbor: ignored
         let s = nx.snapshot(10, 1_100);
         let st: Vec<_> = s.neighbors.iter().map(|n| n.status).collect();
         assert_eq!(st, vec![NeighborStatus::Fresh, NeighborStatus::Stale(1), NeighborStatus::Missing, NeighborStatus::Missing]);
@@ -170,9 +183,39 @@ mod tests {
     #[test]
     fn keeps_the_newest_plan_even_when_an_older_one_arrives_late() {
         let mut nx = NeighborExchange::with_neighbors(vec![1], 0, 1, 1);
-        nx.offer(1, 10, 7, 0, b"new");
-        nx.offer(1, 9, 6, 0, b"old");
+        assert!(nx.offer(11, 1, 10, 7, 0, b"new"));
+        assert!(nx.offer(11, 1, 9, 6, 0, b"old"));
+        assert!(nx.offer(11, 1, 10, 7, 0, b"dup"));
         assert_eq!(nx.snapshot(11, 0).neighbors[0].data, b"new");
+        assert!(nx.offer(11, 1, 10, 8, 0, b"newer-seq"));
+        assert_eq!(nx.snapshot(11, 0).neighbors[0].data, b"newer-seq");
         assert_eq!(nx.snapshot(11, 0).neighbors[0].status, NeighborStatus::Fresh);
+    }
+
+    #[test]
+    fn a_far_future_round_is_refused_and_cannot_block_the_current_plan() {
+        let mut nx = NeighborExchange::with_neighbors(vec![2], 0, 1, 2);
+        assert!(!nx.offer(2, 2, 1_000_000, 1, 0, b"future"));
+        let blocked = &nx.snapshot(2, 1).neighbors[0];
+        assert_ne!(blocked.status, NeighborStatus::Fresh);
+        assert!(blocked.data.is_empty());
+        assert_eq!(blocked.round, None);
+        assert!(nx.offer(2, 2, 2, 2, 1, b"current"));
+        let current = &nx.snapshot(3, 2).neighbors[0];
+        assert_eq!(current.data, b"current");
+        assert_eq!(current.status, NeighborStatus::Fresh);
+        assert_eq!(current.round, Some(2));
+    }
+
+    #[test]
+    fn snapshot_never_marks_a_future_round_fresh() {
+        let mut nx = NeighborExchange::with_neighbors(vec![2], 0, 1, 2);
+        assert!(nx.offer(1_000_000, 2, 1_000_000, 1, 0, b"future"));
+        let view = &nx.snapshot(2, 1).neighbors[0];
+        assert_ne!(view.status, NeighborStatus::Fresh);
+        assert!(view.data.is_empty());
+        assert_eq!(view.round, Some(1_000_000));
+        assert_eq!(nx.snapshot(1_000_000, 1).neighbors[0].status, NeighborStatus::Fresh);
+        assert_eq!(nx.snapshot(1_000_000, 1).neighbors[0].data, b"future");
     }
 }

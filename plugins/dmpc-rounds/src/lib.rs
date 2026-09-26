@@ -295,12 +295,22 @@ impl Plugin for DmpcRounds {
         }
         // Neighbor plans: keep the newest, and pass each newer one to ROS once.
         let nx = self.nx.as_mut().ok_or("not active")?;
-        let mut fresh = Vec::new();
+        let mut incoming = Vec::new();
         while let Some(s) = self.host.next(PLAN_IN) {
-            nx.offer(s.origin, s.round, s.seq, s.t_produce, s.data);
-            if self.forwarded.get(&s.origin).map_or(true, |&f| (s.round, s.seq) > f) {
-                self.forwarded.insert(s.origin, (s.round, s.seq));
-                fresh.push(s.data.to_vec());
+            incoming.push((s.origin, s.round, s.seq, s.t_produce, s.data.to_vec()));
+        }
+        let mut fresh = Vec::new();
+        for (origin, round, seq, t_produce, data) in incoming {
+            if !nx.offer(ctx.round, origin, round, seq, t_produce, &data) {
+                self.host.log(
+                    XGC_LOG_WARN,
+                    &format!("dmpc-rounds: dropped neighbor plan origin {origin} round {round} at planner round {}", ctx.round),
+                );
+                continue;
+            }
+            if self.forwarded.get(&origin).map_or(true, |&f| (round, seq) > f) {
+                self.forwarded.insert(origin, (round, seq));
+                fresh.push(data);
             }
         }
         for plan in fresh {

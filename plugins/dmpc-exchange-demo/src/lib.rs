@@ -33,7 +33,7 @@ impl Plugin for Demo {
 
     fn step(&mut self, ctx: &XgcStepCtx) -> Result<(), String> {
         let nx = self.nx.as_mut().ok_or("not active")?;
-        nx.absorb(&mut self.host);
+        nx.absorb(&mut self.host, ctx.round);
         if ctx.round_advanced == 0 {
             return Ok(());
         }
