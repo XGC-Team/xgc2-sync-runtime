@@ -23,7 +23,7 @@ pub fn plugin_dir() -> &'static Path {
         let target = root.join("target/plugin-tests");
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
-            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "-p", "dmpc-rounds", "--target-dir"])
+            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "-p", "dmpc-rounds", "-p", "transport-loopback", "-p", "transport-zenoh", "--target-dir"])
             .arg(&target)
             .status()
             .expect("run cargo");
@@ -244,3 +244,44 @@ impl Drop for Roscore {
     }
 }
 
+
+// --- transport plugins (xgc_rt_transport_v1) ---
+
+/// A transport plugin built by `plugin_dir`: "loopback" or "zenoh".
+pub fn transport_plugin(kind: &str) -> PathBuf {
+    plugin_dir().join(format!("libtransport_{kind}.so"))
+}
+
+/// The transport plugin `kind`, loaded the way a manifest's [transport]
+/// path loads it, with `options` (TOML) as its table.
+pub fn so_transport(kind: &str, options: &str) -> Box<dyn xgc_rt_core::transport::Transport> {
+    let options: toml::Table = options.parse().unwrap();
+    Box::new(xgc_rt_host::transport_so::SoTransport::load(&transport_plugin(kind), None, kind, &options).unwrap())
+}
+
+/// The loopback plugin's ground truth for `bus` (its xgc_rt_loopback_truth_json).
+pub fn loopback_plugin_truth(bus: &str) -> std::collections::BTreeMap<(u32, u16, u16), xgc_rt_transport_loopback::Truth> {
+    let lib = unsafe { libloading::Library::new(transport_plugin("loopback")) }.unwrap();
+    let truth: libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_char, *mut u8, usize) -> isize> =
+        unsafe { lib.get(b"xgc_rt_loopback_truth_json\0") }.unwrap();
+    let name = std::ffi::CString::new(bus).unwrap();
+    let len = unsafe { truth(name.as_ptr(), std::ptr::null_mut(), 0) };
+    assert!(len >= 0, "no loopback bus {bus}");
+    let mut buf = vec![0u8; len as usize];
+    unsafe { truth(name.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    let rows: Vec<[u64; 7]> = serde_json::from_slice(&buf).unwrap();
+    rows.into_iter()
+        .map(|r| {
+            let t = xgc_rt_transport_loopback::Truth { offered: r[3], dropped: r[4], duplicated: r[5], reordered: r[6] };
+            ((r[0] as u32, r[1] as u16, r[2] as u16), t)
+        })
+        .collect()
+}
+
+/// Release the samples the loopback plugin's `bus` holds (xgc_rt_loopback_flush).
+pub fn loopback_plugin_flush(bus: &str) {
+    let lib = unsafe { libloading::Library::new(transport_plugin("loopback")) }.unwrap();
+    let flush: libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_char) -> i32> = unsafe { lib.get(b"xgc_rt_loopback_flush\0") }.unwrap();
+    let name = std::ffi::CString::new(bus).unwrap();
+    assert_eq!(unsafe { flush(name.as_ptr()) }, 0, "no loopback bus {bus}");
+}

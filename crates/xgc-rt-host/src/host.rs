@@ -979,7 +979,7 @@ pub struct Host {
     resolved: Resolved,
     rt: Arc<Runtime>,
     audit: Arc<FileAudit>,
-    transport_kind: &'static str,
+    transport_kind: String,
     timings: StartupTimings,
     started: Instant,
     run_dir: PathBuf,
@@ -1158,7 +1158,7 @@ impl Host {
             roster: s.roster.clone(),
             channels: resolved.channels.clone(),
         };
-        let transport_kind = transport.kind();
+        let transport_kind = transport.kind().to_owned();
         let audit_sink: Arc<dyn AuditSink> = audit.clone();
         let endpoint = Endpoint::open(transport, &ctx, clock.clone(), audit_sink, opts.rx_queue)
             .map_err(|e| HostError(format!("transport {transport_kind}: {e}")))?;

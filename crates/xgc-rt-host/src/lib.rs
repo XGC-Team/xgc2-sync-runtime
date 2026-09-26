@@ -8,5 +8,6 @@ pub mod deployment;
 pub mod endpoint;
 pub mod host;
 pub mod plugin;
+pub mod transport_so;
 
 pub use host::{Host, HostError, HostOptions, RunSummary};

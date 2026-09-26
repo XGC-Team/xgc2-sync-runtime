@@ -2509,6 +2509,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "transport-loopback"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "toml 0.8.23",
+ "xgc-rt-core",
+ "xgc-rt-transport-loopback",
+]
+
+[[package]]
+name = "transport-zenoh"
+version = "0.1.0"
+dependencies = [
+ "toml 0.8.23",
+ "xgc-rt-core",
+ "xgc-rt-transport-zenoh",
+]
+
+[[package]]
 name = "twox-hash"
 version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

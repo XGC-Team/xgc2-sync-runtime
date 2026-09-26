@@ -1,25 +1,45 @@
 //! Z1 exit: on loopback with a seeded injector, the merged audit equals
 //! the injector's ground truth *exactly* for loss, duplication and
 //! reordering: 100 000 samples, 1 sender, 3 receivers, 5 % drop, 2 %
-//! duplicate, 3 % reorder.
+//! duplicate, 3 % reorder. Twice: with the built-in loopback transport, and
+//! with the loopback transport loaded from its transport plugin
+//! (xgc_rt_transport_v1), which must change nothing.
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use xgc_rt_audit::{merge_run, FileAudit, MergeOptions, NodeMeta};
 use xgc_rt_core::clock::{Clock, WallClock};
-use xgc_rt_core::transport::{ChannelSpec, Qos, TransportContext};
+use xgc_rt_core::transport::{ChannelSpec, Qos, Transport, TransportContext};
 use xgc_rt_host::endpoint::Endpoint;
-use xgc_rt_transport_loopback::{Impairment, LoopbackBus, LoopbackTransport};
+use xgc_rt_transport_loopback::{Impairment, LoopbackBus, LoopbackTransport, Truth};
 
 const SAMPLES: u64 = 100_000;
 const ROSTER: [&str; 4] = ["uav1", "uav2", "uav3", "uav4"];
 
 #[test]
 fn merged_audit_equals_injected_ground_truth() {
-    let run = common::scratch("audit-exact");
     let bus = LoopbackBus::with_impairment(Impairment { drop: 0.05, duplicate: 0.02, reorder: 0.03, seed: 0x5eed });
+    exact("audit-exact", &|| Box::new(LoopbackTransport::new(bus.clone())), &|| bus.flush(), &|| bus.truth());
+}
+
+#[test]
+fn merged_audit_equals_injected_ground_truth_through_the_transport_plugin() {
+    let options = "bus = \"audit-exact-plugin\"\ndrop = 0.05\nduplicate = 0.02\nreorder = 0.03\nseed = 24301\n";
+    exact(
+        "audit-exact-plugin",
+        &|| common::so_transport("loopback", options),
+        &|| common::loopback_plugin_flush("audit-exact-plugin"),
+        &|| common::loopback_plugin_truth("audit-exact-plugin"),
+    );
+}
+
+type TruthMap = BTreeMap<(u32, u16, u16), Truth>;
+
+fn exact(name: &str, transport: &dyn Fn() -> Box<dyn Transport>, flush: &dyn Fn(), truth: &dyn Fn() -> TruthMap) {
+    let run = common::scratch(name);
     let clock = Arc::new(WallClock::new(0));
     let channels = vec![ChannelSpec { id: 0, name: "dmpc/plan".into(), qos: Qos::Control }];
 
@@ -46,7 +66,7 @@ fn merged_audit_equals_injected_ground_truth() {
             roster: ROSTER.iter().map(|s| s.to_string()).collect(),
             channels: channels.clone(),
         };
-        let ep = Endpoint::open(Box::new(LoopbackTransport::new(bus.clone())), &ctx, clock.clone(), audit.clone(), 1 << 20).unwrap();
+        let ep = Endpoint::open(transport(), &ctx, clock.clone(), audit.clone(), 1 << 20).unwrap();
         audits.push(audit);
         endpoints.push(ep);
     }
@@ -64,7 +84,7 @@ fn merged_audit_equals_injected_ground_truth() {
             }
         }
     }
-    bus.flush();
+    flush();
     for ep in &endpoints {
         ep.drain();
         ep.close();
@@ -75,7 +95,7 @@ fn merged_audit_equals_injected_ground_truth() {
 
     let report = merge_run(&run, MergeOptions::default()).unwrap();
     assert!(report.valid, "invalid: {:?}", report.invalid_reasons);
-    let truth = bus.truth();
+    let truth = truth();
     assert_eq!(report.streams.len(), 3);
     for stream in &report.streams {
         let receiver = ROSTER.iter().position(|n| *n == stream.receiver).unwrap() as u16;

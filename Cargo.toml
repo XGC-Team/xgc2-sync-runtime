@@ -17,6 +17,8 @@ members = [
   "plugins/dmpc-rounds",
   "plugins/station-io",
   "plugins/numeric-vehicle",
+  "plugins/transport-loopback",
+  "plugins/transport-zenoh",
 ]
 
 [workspace.package]

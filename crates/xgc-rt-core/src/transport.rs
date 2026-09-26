@@ -70,7 +70,7 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 pub trait Transport: Send {
-    fn kind(&self) -> &'static str;
+    fn kind(&self) -> &str;
     fn open(&mut self, ctx: &TransportContext, sink: RxSink) -> Result<(), TransportError>;
     /// This node will publish `channel`.
     fn declare_out(&mut self, channel: ChannelId) -> Result<(), TransportError>;
