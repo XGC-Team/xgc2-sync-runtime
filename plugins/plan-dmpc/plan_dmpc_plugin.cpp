@@ -244,7 +244,14 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
     self->have_planner_round = true;
     self->planner_k = planner_k;
     const auto trace = self->plan->step(trigger_time, trigger_time, wall);
-    self->domain = trace.status.lifecycle[0] ? trace.status.lifecycle : "step";
+    const char* domain = trace.status.lifecycle[0] ? trace.status.lifecycle : "step";
+    if (self->domain != domain) {
+      self->domain = domain;
+      if (self->host->log) {
+        const std::string message = "planner lifecycle: " + self->domain;
+        self->host->log(self->host->host, XGC_LOG_INFO, message.c_str());
+      }
+    }
     if (self->host->publish(self->host->host, kTimelineStatus, planner_k,
                             reinterpret_cast<const uint8_t*>(&trace.timeline), sizeof trace.timeline) != XGC_OK ||
         self->host->publish(self->host->host, kPlannerStatus, planner_k,
