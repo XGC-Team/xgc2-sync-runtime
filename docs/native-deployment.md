@@ -204,17 +204,21 @@ accept the control profile's calibration, takeoff, or sensor-topic fields:
     "timeline_ack_topic": "/uav2/dmpc/timeline_ack",
     "timeline_status_topic": "/uav2/dmpc/timeline_status"
   },
-  "planner": {"algorithm": "legacy", "scene_id": "dmpc-uav8_comprehensive", "chain_n": 3, "state_dim": 9, "horizon": 40, "sampling_time": 0.1},
+  "planner": {"manifest": "scenarios/dmpc_comprehensive/uav2.yaml", "algorithm": "legacy", "scene_id": "dmpc-uav8_comprehensive", "chain_n": 3, "state_dim": 9, "horizon": 40, "sampling_time": 0.1},
   "initial_position": [1.2, -3.4, 0.0],
   "initial_velocity": [0.1, 0.2, 0.0]
 }
 ```
 
-This two-member example shows the renderer's membership contract. A release's
-actual planner may admit a narrower fleet/scene than the renderer; the current
-Comprehensive planner requires all eight slots and rejects other fleet counts
-at configure. Use the real scene slots, explicit initial state, and one shared
-Run epoch for a runnable deployment. A ROS simulation additionally supplies
+This two-member example shows the renderer's membership contract. The rendered
+`plan_dmpc` configure text always has `manifest`, `self_id`, `timeline_authority`,
+and `scene_id`. `manifest` is the ParamManifest yaml path (`namespace`,
+`node_namespace`, `args`, `loads`, `params`). `scene_id` is that object's scene
+document id, `dmpc-uav8_comprehensive` for the Comprehensive document. Optional
+`algorithm`, `chain_n`, `state_dim`, `horizon`, and `sampling_time` are copied
+when the object sets them. `fleet_count` is not written; `num_uavs` in the
+manifest params or args is the fleet, and Comprehensive is 8. Use the real scene
+slots, explicit initial state, and one shared Run epoch for a runnable deployment. A ROS simulation additionally supplies
 `simulation` as described above, with its `epoch_ns` equal to the planner epoch.
 Wall time forbids that block. The 1 ms host base period is unchanged; rounds use
 100 ms planner time and the shared epoch.

@@ -1,5 +1,6 @@
 #include "plan_dmpc.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -7,12 +8,13 @@
 #include <stdexcept>
 #include <utility>
 
+#include "formation_generator/config/leader_reference_config.h"
 #include "formation_generator/core/dmpc_round.h"
 #include "formation_generator/core/position_target_output.h"
+#include "formation_generator/dmpc_scheduler/configuration_loader.h"
+#include "formation_generator/dmpc_scheduler/dmpc_factory.h"
 #include "formation_generator/lifecycle/goal_apply.h"
-#include "formation_generator/mpc/core/mpc_problem.h"
-#include "formation_generator/mpc/dmpc/dmpc_algorithm_config.h"
-#include "formation_generator/mpc/dmpc/dmpc_constraint_assembler.h"
+#include "formation_generator/params/rosparam_yaml.h"
 
 namespace xgc_plan_dmpc {
 namespace {
@@ -51,21 +53,86 @@ std::string stamp_error(double stamp, double now, const char* what) {
 }
 }  // namespace
 
-PlanDmpc::PlanDmpc(const xgc_dmpc_planner_config_v1& config) : config_(config) {
-  if (std::strcmp(config.algorithm, "legacy") != 0) {
-    configure_error_ = "unsupported algorithm; Comprehensive admits legacy only";
-  } else if (config.chain_n != 3 || config.state_dim != 9 || config.horizon != 40 ||
-             config.sampling_time != 0.1 || config.fleet_count != 8 || config.self_id < 1 ||
-             config.self_id > 8 || std::strcmp(config.scene_id, "dmpc-uav8_comprehensive") != 0) {
-    configure_error_ = "unsupported dimensions; Comprehensive legacy is n3 state 9 N40 T.1 fleet 8";
+namespace {
+std::string mismatch(const char* name) {
+  return std::string("plugin config does not match the loaded manifest: ") + name;
+}
+}  // namespace
+
+std::unique_ptr<PlanDmpc> PlanDmpc::open(const PlanDmpcOpen& request, std::string* error) {
+  auto fail = [&](const std::string& text) {
+    if (error != nullptr) *error = text;
+    return std::unique_ptr<PlanDmpc>();
+  };
+  try {
+    if (request.manifest_path.empty()) return fail("manifest path is required");
+    if (request.scene_id.empty()) return fail("scene_id is required");
+    if (request.self_id < 1) return fail("self_id is required");
+    using formation_generator_dmpc::ConfigurationLoader;
+    using formation_generator_dmpc::DmpcConfiguration;
+    const auto params = formation_generator_dmpc::privateParamsFromManifest(
+        formation_generator_dmpc::loadParamManifest(request.manifest_path));
+    DmpcConfiguration loaded;
+    loaded.params = params;
+    ConfigurationLoader::loadFromParameters(params, loaded);
+    if (!loaded.params.hasParam("num_uavs")) return fail("manifest is missing num_uavs");
+    if (!loaded.params.hasParam("uav_id")) return fail("manifest is missing uav_id");
+    if (static_cast<int>(loaded.uav_id) != request.self_id) {
+      return fail("self_id does not match the manifest uav_id");
+    }
+    if (loaded.algorithm != "legacy") return fail("unsupported algorithm");
+    // Same assignment createLegacyOptimizer writes before building the QP.
+    loaded.chain_n = 3;
+    loaded.chain_q = 3;
+    loaded.assumed_state_dim = 9;
+    if (request.algorithm && *request.algorithm != loaded.algorithm) return fail(mismatch("algorithm"));
+    if (request.chain_n && *request.chain_n != loaded.chain_n) return fail(mismatch("chain_n"));
+    if (request.state_dim && *request.state_dim != loaded.assumed_state_dim) return fail(mismatch("state_dim"));
+    if (request.horizon && *request.horizon != loaded.mpc_params.horizon) return fail(mismatch("horizon"));
+    if (request.fleet_count && *request.fleet_count != loaded.num_uavs) return fail(mismatch("fleet_count"));
+    if (request.sampling_time && *request.sampling_time != loaded.mpc_params.sampling_time) {
+      return fail(mismatch("sampling_time"));
+    }
+    if (loaded.mpc_params.horizon <= 0 || !std::isfinite(loaded.mpc_params.sampling_time) ||
+        loaded.mpc_params.sampling_time <= 0.0 || loaded.num_uavs < 1 || loaded.uav_id < 1 ||
+        loaded.uav_id > loaded.num_uavs) {
+      return fail("loaded roster or horizon is not usable");
+    }
+    xgc_dmpc_planner_config_v1 fields{};
+    std::snprintf(fields.algorithm, sizeof fields.algorithm, "%s", loaded.algorithm.c_str());
+    if (request.scene_id.size() >= sizeof fields.scene_id) return fail("scene_id does not fit");
+    std::snprintf(fields.scene_id, sizeof fields.scene_id, "%s", request.scene_id.c_str());
+    fields.chain_n = loaded.chain_n;
+    fields.state_dim = loaded.assumed_state_dim;
+    fields.horizon = loaded.mpc_params.horizon;
+    fields.sampling_time = loaded.mpc_params.sampling_time;
+    fields.self_id = static_cast<int32_t>(loaded.uav_id);
+    fields.fleet_count = loaded.num_uavs;
+    fields.timeline_authority = request.timeline_authority;
+    auto plan = std::unique_ptr<PlanDmpc>(new PlanDmpc(fields, std::move(loaded)));
+    if (!plan->configure_error_.empty()) return fail(plan->configure_error_);
+    return plan;
+  } catch (const std::exception& ex) {
+    return fail(ex.what());
   }
+}
+
+PlanDmpc::PlanDmpc(const xgc_dmpc_planner_config_v1& config,
+                   formation_generator_dmpc::DmpcConfiguration loaded)
+    : config_(config), loaded_(std::move(loaded)) {
   lifecycle_.setHooks({}, {}, [this](std::string& fault) { return initialize_optimizer(fault); });
   lifecycle_.start();
-  if (configure_error_.empty()) {
-    formation_generator_dmpc::LeaderReferenceSpec spec;
-    spec.leader_speed = 0.5;
+  try {
+    const auto spec = formation_generator_dmpc::loadLeaderReferenceSpec(loaded_.params);
     leader_ = formation_generator_dmpc::makeLeaderReference(spec, config_.sampling_time, config_.horizon + 1);
-    leader_->initialize(Eigen::Vector3d(-15.0, -15.0, 2.0));
+    const double origin_z =
+        loaded_.params.param("leader_initial_position_z", loaded_.takeoff_altitude);
+    leader_->initialize(Eigen::Vector3d(loaded_.params.param("leader_initial_position_x", 0.0),
+                                        loaded_.params.param("leader_initial_position_y", 0.0), origin_z));
+    patterns_ = std::make_unique<formation_generator_dmpc::PatternManager>(loaded_);
+    patterns_->initialize(config_.fleet_count);
+  } catch (const std::exception& error) {
+    configure_error_ = error.what();
   }
 }
 
@@ -142,18 +209,17 @@ std::string PlanDmpc::push_scene_definition(const formation_generator_dmpc::Plai
   scene_epoch_.clear();
   try {
     const formation_generator_dmpc::AdaptedScene adapted = scene_adapter_.convert(snapshot, state);
-    formation_generator_dmpc::acceptScenePolicy(adapted, true, false, false);
-    if (adapted.statics.size() != 77 || !adapted.movers.empty()) {
-      return "comprehensive scene did not yield 77 held obstacles";
-    }
+    formation_generator_dmpc::acceptScenePolicy(
+        adapted, loaded_.mpc_params.enable_static_obstacle_collision_constraints, false, false);
+    const int count = static_cast<int>(adapted.statics.size());
     scene_.setGeometryTemplates(adapted.templates);
-    scene_.updateStaticObstacles(adapted.statics, config_.self_id, 77);
+    scene_.updateStaticObstacles(adapted.statics, config_.self_id, count);
     templates_ = adapted.templates;
     statics_ = adapted.statics;
   } catch (const std::exception& error) {
     return error.what();
   }
-  if (scene_.staticObstacles().size() != 77) return "planner scene did not keep 77 obstacles";
+  if (scene_.staticObstacles().size() != statics_.size()) return "planner scene did not keep the loaded obstacles";
   geometry_ready_ = true;
   scene_ids_match_ = true;
   scene_epoch_ = snapshot.epoch;
@@ -187,8 +253,9 @@ std::string PlanDmpc::decode_records(const xgc_dmpc_scene_header_v1& header,
   std::string epoch;
   std::string frame;
   if (header.schema != 1 || !take_text(header.frame, sizeof header.frame, &frame) || frame != "world" ||
-      !take_text(header.epoch, sizeof header.epoch, &epoch) || header.part_count == 0 ||
-      obstacles == nullptr || parts == nullptr || (header.vertex_count > 0 && vertices == nullptr)) {
+      !take_text(header.epoch, sizeof header.epoch, &epoch) ||
+      (header.obstacle_count > 0 && obstacles == nullptr) || (header.part_count > 0 && parts == nullptr) ||
+      (header.vertex_count > 0 && vertices == nullptr)) {
     return "scene snapshot frame or epoch is not usable";
   }
   view->epoch = epoch;
@@ -269,12 +336,14 @@ std::string PlanDmpc::push_scene_wire(const xgc_dmpc_scene_header_v1& header,
                                       const xgc_dmpc_scene_obstacle_v1* obstacles,
                                       const xgc_dmpc_scene_part_v1* parts,
                                       const xgc_dmpc_scene_vertex_v1* vertices) {
-  if (header.schema != 1 || std::strcmp(header.frame, "world") != 0 || header.scene_id[0] == '\0' ||
-      header.obstacle_count != 77 || header.part_count == 0 || obstacles == nullptr || parts == nullptr ||
+  std::string scene_id;
+  if (header.schema != 1 || std::strcmp(header.frame, "world") != 0 ||
+      !take_text(header.scene_id, sizeof header.scene_id, &scene_id) || scene_id != config_.scene_id ||
+      (header.obstacle_count > 0 && obstacles == nullptr) || (header.part_count > 0 && parts == nullptr) ||
       (header.vertex_count > 0 && vertices == nullptr)) {
     geometry_ready_ = false;
     scene_epoch_.clear();
-    return "comprehensive scene is not the 77-obstacle world document";
+    return "scene snapshot identity or frame is not usable";
   }
   formation_generator_dmpc::PlainSceneDefinitionView view;
   formation_generator_dmpc::PlainSceneDynamicState state;
@@ -317,10 +386,6 @@ std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, cons
   }
   if (request.kind == 5 && !finite3(request.goal_xyz)) return "goal is nonfinite";
   if (request.kind != 6 && request.pattern_id != 0) return "unused pattern id is not canonical zero";
-  if (request.kind == 6 && request.pattern_id != 0 && request.pattern_id != 4 &&
-      request.pattern_id != 5 && request.pattern_id != 6) {
-    return "unsupported formation pattern";
-  }
   if (commit_ok_ && request.revision == commit_.request.revision &&
       std::memcmp(digest, commit_digest_, 32) == 0) {
     return {};
@@ -341,7 +406,7 @@ std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, cons
     return "timeline predecessor digest mismatch";
   }
   if (request.rolling > 1) return "timeline rolling flag is not 0 or 1";
-  const int64_t period = 100000000;
+  const int64_t period = std::llround(config_.sampling_time * 1e9);
   xgc_dmpc_mission_timeline_v1 previous{};
   if (commit_ok_) previous = commit_.request;
   auto phase_at = [&](uint64_t round, int64_t* out) -> const char* {
@@ -391,11 +456,14 @@ std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, cons
 
 std::string PlanDmpc::push_neighbor(uint32_t uav_id) {
   if (!configure_error_.empty()) return configure_error_;
-  if (uav_id == static_cast<uint32_t>(config_.self_id) || uav_id < 1 || uav_id > 8) {
-    return "neighbor identity is not another Comprehensive agent";
+  if (uav_id == static_cast<uint32_t>(config_.self_id) || uav_id < 1 ||
+      uav_id > static_cast<uint32_t>(config_.fleet_count)) {
+    return "neighbor identity is outside the loaded roster";
   }
   if (neighbors_.count(uav_id) != 0) return "duplicate neighbor plan";
-  if (neighbors_.size() >= 7) return "neighbor cache is full";
+  if (neighbors_.size() >= static_cast<size_t>(std::max(0, config_.fleet_count - 1))) {
+    return "neighbor cache is full";
+  }
   neighbors_.emplace(uav_id, true);
   return {};
 }
@@ -414,7 +482,7 @@ void PlanDmpc::refresh(double now_sec, double now_wall_sec) {
   facts.vehicle_stamp_valid = controller_ok_;
   facts.vehicle_state_age_sec =
       controller_ok_ && std::isfinite(now_sec) ? now_sec - controller_stamp_sec_ : 1.0e9;
-  facts.neighbors_ready = neighbors_.size() == 7;
+  facts.neighbors_ready = neighbors_.size() == static_cast<size_t>(std::max(0, config_.fleet_count - 1));
   facts.last_published_position_valid = false;
   facts.swarm_mission_clock = false;
   lifecycle_.setFacts(facts);
@@ -455,14 +523,13 @@ StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec
                      applied_revision_ != commit_.request.revision;
     if (due && commit_.request.kind == 6) {
       try {
-        pattern_ = formation_generator_dmpc::makeComprehensivePattern(
-            static_cast<int>(commit_.request.pattern_id), config_.fleet_count);
-        pattern_offset_ = pattern_->computeOffset(static_cast<double>(commit_.mission_ns) * 1e-9, config_.self_id).position;
-        formation_patterns::FormationPatternBase::initialize(config_.fleet_count);
-        formation_patterns::FormationPatternBase::registerPattern(
-            static_cast<int>(commit_.request.pattern_id), pattern_);
-        formation_patterns::FormationPatternBase::switchPattern(
-            static_cast<int>(commit_.request.pattern_id), {});
+        if (patterns_ == nullptr ||
+            !patterns_->switchPattern(static_cast<uint8_t>(commit_.request.pattern_id))) {
+          throw std::invalid_argument("pattern id is not in the loaded formation_patterns");
+        }
+        pattern_ = formation_patterns::FormationPatternBase::getCurrentPattern();
+        pattern_offset_ =
+            pattern_->computeOffset(static_cast<double>(commit_.mission_ns) * 1e-9, config_.self_id).position;
         applied_revision_ = commit_.request.revision;
         applied_mission_ns_ = commit_.mission_ns;
         out.timeline.applied_revision = applied_revision_;
@@ -564,52 +631,18 @@ std::string PlanDmpc::push_neighbor_plan(const uint8_t* bytes, size_t size) {
 }
 
 bool PlanDmpc::initialize_optimizer(std::string& fault) {
-  if (!geometry_ready_ || statics_.size() != 77) {
+  if (!geometry_ready_) {
     fault = "scene geometry is not loaded";
     return false;
   }
   try {
-    constexpr int kNeighbors = 7;
-    const int intermediate = kBoundaryConstraintCount + static_cast<int>(statics_.size()) + kNeighbors;
-    DmpcAlgorithmConfig algorithm;
-    algorithm.num_static_obstacles = static_cast<int>(statics_.size());
-    algorithm.num_constraint_neighbors = kNeighbors;
-    algorithm.distributed_reference_weight = 0.4;
-    algorithm.boundary_x_min = -20.0;
-    algorithm.boundary_x_max = 20.0;
-    algorithm.boundary_y_min = -20.0;
-    algorithm.boundary_y_max = 20.0;
-    algorithm.boundary_z_min = 0.0;
-    algorithm.boundary_z_max = 6.0;
-    algorithm.vo_horizon = 10.0;
-    algorithm.gjk_min_distance = 0.0001;
-    algorithm.constraint_min_distance = 0.02;
-    algorithm.gjk_tolerance = 0.01;
-    algorithm.gjk_max_iterations = 30;
-    algorithm.qp_solver_iter_max = 50;
-    algorithm.control_period_ms = 100.0;
-    algorithm.separation_query_mode = SeparationQueryMode::kGuidedAxisGjk;
-    MPCProblem problem;
-    problem.setHorizon(config_.horizon)
-        .setSamplingTime(config_.sampling_time)
-        .setBoxConstraintsEnabled(true)
-        .setGeneralConstraintDimensions(intermediate, 2 * intermediate)
-        .setWeights(4.0, 1.0, 3.0, 3.0, 2.0, 5.0, 1.0, 2.0, 1.0, 3.0, 3.0, 100.0)
-        .setPositionConstraints(-20.0, 20.0, -0.5, 10.0, 10.0, 0.0)
-        .setVelocityConstraints(2.0, 5.0, 0.0)
-        .setAccelerationConstraints(4.0, 3.0, 2.0, 0.0)
-        .initialize();
-    optimizer_ = std::make_unique<AcadosDmpcOptimizer>(std::move(problem), algorithm, config_.self_id);
+    loaded_.num_static_obstacles = static_cast<int>(statics_.size());
+    optimizer_ = formation_generator_dmpc::createDmpcOptimizer(loaded_.params, loaded_);
+    config_.chain_n = loaded_.chain_n;
+    config_.state_dim = loaded_.assumed_state_dim;
     optimizer_->configureConvexFeasibleRegionSnapshots(false, {});
     optimizer_->setGeometryTemplates(templates_);
-    convex_geometry::BodyInstance self_body;
-    self_body.id = 0;
-    self_body.name = "default_uav_geometry";
-    self_body.geometry_type = "sphere";
-    self_body.pose.orientation.w = 1.0;
-    self_body.scale.x = self_body.scale.y = self_body.scale.z = 0.15;
-    self_body.is_static = true;
-    optimizer_->setUavGeometries(self_body, {});
+    optimizer_->setUavGeometries(loaded_.default_uav_geometry, loaded_.uav_geometries);
     optimizer_->updateStaticObstacles(statics_);
   } catch (const std::exception& error) {
     optimizer_.reset();
@@ -648,8 +681,10 @@ void PlanDmpc::run_round(double trigger_sec, double mission_sec, StepTrace& out)
     leader_->advanceTo(mission_sec);
     GoalApplyRequest request;
     request.measured_state = measured_;
-    request.takeoff_altitude = 2.0;
-    request.local_takeoff_altitude = 1.0;
+    request.takeoff_altitude = loaded_.takeoff_altitude;
+    // Loader value. The previous plugin literal was 1.0 even when the
+    // scenario takeoff_altitude was 2.0.
+    request.local_takeoff_altitude = loaded_.local_takeoff_altitude;
     request.optimizing = lifecycle_.isRolling();
     request.goal_x = pending.x;
     request.goal_y = pending.y;
@@ -663,22 +698,18 @@ void PlanDmpc::run_round(double trigger_sec, double mission_sec, StepTrace& out)
     seed.num_uavs = config_.fleet_count;
     seed.now_sec = mission_sec;
     seed.acceleration = acceleration_;
-    seed.mpc_params.horizon = config_.horizon;
-    seed.mpc_params.sampling_time = config_.sampling_time;
-    seed.mpc_params.separation_query_mode = "guided_axis_gjk";
-    seed.mpc_params.gjk_min_distance = 0.0001;
-    seed.mpc_params.constraint_min_distance = 0.02;
-    seed.mpc_params.gjk_tolerance = 0.01;
-    seed.mpc_params.gjk_max_iterations = 30;
+    seed.mpc_params.horizon = loaded_.mpc_params.horizon;
+    seed.mpc_params.sampling_time = loaded_.mpc_params.sampling_time;
+    seed.mpc_params.separation_query_mode = loaded_.mpc_params.separation_query_mode;
+    seed.mpc_params.gjk_min_distance = loaded_.mpc_params.gjk_min_distance;
+    seed.mpc_params.constraint_min_distance = loaded_.mpc_params.constraint_min_distance;
+    seed.mpc_params.gjk_tolerance = loaded_.mpc_params.gjk_tolerance;
+    seed.mpc_params.gjk_max_iterations = loaded_.mpc_params.gjk_max_iterations;
     seed.geometry_templates = templates_;
     seed.static_bodies_available = true;
     seed.static_obstacles = statics_;
     seed.num_static_obstacles = static_cast<int>(statics_.size());
-    convex_geometry::BodyInstance self_body;
-    self_body.geometry_type = "sphere";
-    self_body.scale.x = self_body.scale.y = self_body.scale.z = 0.15;
-    self_body.pose.orientation.w = 1.0;
-    seed.default_uav_geometry = self_body;
+    seed.default_uav_geometry = loaded_.default_uav_geometry;
     const auto bootstrap = GoalBootstrapInitializer().build(seed, preview.relative_state, preview.leader_position);
     const auto committed = formation_generator_dmpc::commitGoalSeed(*optimizer_, bootstrap);
     goals_.pop();

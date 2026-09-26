@@ -2,7 +2,9 @@
 
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,19 +15,36 @@
 #include "xgc_rt.h"
 
 namespace {
-xgc_dmpc_planner_config_v1 comprehensive() {
-  xgc_dmpc_planner_config_v1 config{};
-  std::strcpy(config.algorithm, "legacy");
-  config.chain_n = 3;
-  config.state_dim = 9;
-  config.horizon = 40;
-  config.sampling_time = 0.1;
-  config.self_id = 1;
-  config.fleet_count = 8;
-  std::strcpy(config.scene_id, "dmpc-uav8_comprehensive");
-  config.timeline_authority = 4;
-  return config;
+std::string formation_root;
+std::string testdata(const std::string& name) { return std::string(PLAN_DMPC_TESTDATA) + "/" + name; }
+std::string scenario_path(const std::string& relative) { return formation_root + "/" + relative; }
+
+std::string comprehensive_manifest() {
+  const std::string path = "/tmp/plan-dmpc-comprehensive-manifest.yaml";
+  std::ofstream out(path);
+  out << "namespace: /uav1/mpc\n"
+      << "node_namespace: /uav1\n"
+      << "loads:\n"
+      << "  - {file: " << scenario_path("config/scenarios/dmpc_comprehensive/scene/scenario.yaml") << "}\n"
+      << "  - {file: " << scenario_path("config/scenarios/dmpc_comprehensive/scene/formation_patterns.yaml")
+      << ", param: formation_patterns}\n"
+      << "params:\n  uav_id: 1\n  num_uavs: 8\n";
+  out.close();
+  return path;
 }
+
+xgc_plan_dmpc::PlanDmpcOpen comprehensive_request() {
+  xgc_plan_dmpc::PlanDmpcOpen request;
+  request.manifest_path = comprehensive_manifest();
+  request.self_id = 1;
+  request.timeline_authority = 4;
+  request.scene_id = "dmpc-uav8_comprehensive";
+  return request;
+}
+
+bool near(double got, double expect) { return std::isfinite(got) && std::fabs(got - expect) <= 1e-9; }
+
+bool put_text(char* dest, size_t cap, const std::string& src);
 
 int fail(const char* what) {
   std::cerr << "FAIL " << what << '\n';
@@ -75,20 +94,128 @@ std::vector<uint8_t> pack_scene(const xgc_dmpc_scene_header_v1& header,
 }
 }  // namespace
 
-int main() {
-  xgc_dmpc_planner_config_v1 bad = comprehensive();
-  std::strcpy(bad.algorithm, "exploration");
-  if (xgc_plan_dmpc::PlanDmpc(bad).configure_error().find("unsupported algorithm") == std::string::npos) {
+int compare_comprehensive(const xgc_plan_dmpc::PlanDmpc& planner) {
+  const YAML::Node scenario = YAML::LoadFile(
+      scenario_path("config/scenarios/dmpc_comprehensive/scene/scenario.yaml"));
+  const auto& loaded = planner.loaded();
+  const auto& mpc = loaded.mpc_params;
+  struct Item {
+    const char* name;
+    double previous;
+    double after;
+    double yaml;
+  };
+  const Item items[] = {
+      {"horizon", 40, static_cast<double>(mpc.horizon), scenario["horizon"].as<double>()},
+      {"sampling_time", 0.1, mpc.sampling_time, scenario["sampling_time"].as<double>()},
+      {"fleet_count", 8, static_cast<double>(planner.config().fleet_count), 8},
+      {"chain_n", 3, static_cast<double>(planner.config().chain_n), 3},
+      {"state_dim", 9, static_cast<double>(planner.config().state_dim), 9},
+      {"q_pos", 4, mpc.q_pos, scenario["q_pos"].as<double>()},
+      {"q_vel", 1, mpc.q_vel, scenario["q_vel"].as<double>()},
+      {"r_acc_xy", 3, mpc.r_acc_xy, scenario["r_acc_xy"].as<double>()},
+      {"r_acc_z", 3, mpc.r_acc_z, scenario["r_acc_z"].as<double>()},
+      {"w_jerk_xy", 2, mpc.w_jerk_xy, scenario["w_jerk_xy"].as<double>()},
+      {"w_jerk_z", 5, mpc.w_jerk_z, scenario["w_jerk_z"].as<double>()},
+      {"omega_1", 0.4, mpc.omega_1, scenario["omega_1"].as<double>()},
+      {"base_jerk", 100, mpc.base_jerk, scenario["base_jerk"].as<double>()},
+      {"fence_x_min", -20, mpc.boundary_x_min, scenario["fence_x_min"].as<double>()},
+      {"fence_z_max", 6, mpc.boundary_z_max, scenario["fence_z_max"].as<double>()},
+      {"box_pos_z_min", -0.5, mpc.pos_z_min, scenario["box_pos_z_min"].as<double>()},
+      {"vo_horizon", 10, mpc.vo_horizon, scenario["vo_horizon"].as<double>()},
+      {"leader_speed", 0.5, loaded.params.param("leader_speed", 0.0), scenario["leader_speed"].as<double>()},
+      {"takeoff_altitude", 2, loaded.takeoff_altitude, scenario["takeoff_altitude"].as<double>()},
+      {"local_takeoff_altitude", 1, loaded.local_takeoff_altitude, scenario["takeoff_altitude"].as<double>()},
+  };
+  for (const auto& item : items) {
+    std::cout << item.name << " previous=" << item.previous << " loaded=" << item.after
+              << " scenario=" << item.yaml << '\n';
+    if (!near(item.after, item.yaml)) return fail(item.name);
+    if (std::strcmp(item.name, "local_takeoff_altitude") == 0) {
+      if (near(item.after, item.previous)) return fail("local takeoff stayed at the old literal 1.0");
+    } else if (!near(item.after, item.previous)) {
+      return fail(item.name);
+    }
+  }
+  if (loaded.default_uav_geometry.scale.x != 0.15) return fail("default geometry scale drifted");
+  std::cout << "local_takeoff_altitude now follows scenario takeoff_altitude 2.0; the plugin used to set 1.0\n";
+  return 0;
+}
+
+int admit_two_static_scene() {
+  xgc_plan_dmpc::PlanDmpcOpen request;
+  request.manifest_path = testdata("two_static/manifest.yaml");
+  request.self_id = 1;
+  request.timeline_authority = 4;
+  request.scene_id = "two-static";
+  std::string error;
+  auto opened = xgc_plan_dmpc::PlanDmpc::open(request, &error);
+  if (!opened) return fail(error.c_str());
+  if (opened->config().horizon != 20 || opened->config().fleet_count != 3 ||
+      opened->loaded().mpc_params.q_pos != 6.0 || opened->leader_cols() != 21) {
+    return fail("two-static manifest did not supply its own horizon, fleet, or weight");
+  }
+  xgc_dmpc_scene_header_v1 header{};
+  header.schema = 1;
+  header.obstacle_count = 2;
+  header.part_count = 2;
+  header.revision = 1;
+  if (!put_text(header.scene_id, sizeof header.scene_id, "two-static") ||
+      !put_text(header.frame, sizeof header.frame, "world") ||
+      !put_text(header.epoch, sizeof header.epoch, "6db3ae1c-97b9-4019-800b-3b21ca818b99")) {
+    return fail("two-static header does not fit");
+  }
+  std::vector<xgc_dmpc_scene_obstacle_v1> obstacles(2);
+  std::vector<xgc_dmpc_scene_part_v1> parts(2);
+  for (int index = 0; index < 2; ++index) {
+    if (!put_text(obstacles[index].id, sizeof obstacles[index].id, index == 0 ? "a" : "b") ||
+        !put_text(obstacles[index].name, sizeof obstacles[index].name, "post") ||
+        !put_text(obstacles[index].motion_type, sizeof obstacles[index].motion_type, "hold") ||
+        !put_text(parts[index].part_id, sizeof parts[index].part_id, "body")) {
+      return fail("two-static text does not fit");
+    }
+    obstacles[index].position[0] = index;
+    obstacles[index].orientation_xyzw[3] = 1.0;
+    parts[index].obstacle_index = static_cast<uint32_t>(index);
+    parts[index].geometry_type = 0;
+    parts[index].param[0] = 0.2;
+    parts[index].param[1] = 1.0;
+    parts[index].orientation_xyzw[3] = 1.0;
+  }
+  const std::string loaded = opened->push_scene_wire(header, obstacles.data(), parts.data(), nullptr);
+  if (!loaded.empty() || opened->static_obstacle_count() != 2) {
+    std::cerr << loaded << '\n';
+    return fail("two-static scene was not admitted");
+  }
+  std::cout << "two-static obstacles=" << opened->static_obstacle_count()
+            << " horizon=" << opened->config().horizon << " fleet=" << opened->config().fleet_count << '\n';
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc != 2 || argv[1][0] == '\0') {
+    std::cerr << "usage: test_plan_dmpc FORMATION_GENERATOR_ROOT\n";
+    return 2;
+  }
+  formation_root = argv[1];
+  std::string error;
+  auto exploration = comprehensive_request();
+  exploration.manifest_path = testdata("exploration/manifest.yaml");
+  exploration.scene_id = "two-static";
+  if (xgc_plan_dmpc::PlanDmpc::open(exploration, &error) ||
+      error.find("unsupported algorithm") == std::string::npos) {
     return fail("exploration was accepted");
   }
-  bad = comprehensive();
-  bad.horizon = 20;
-  if (xgc_plan_dmpc::PlanDmpc(bad).configure_error().find("unsupported dimensions") == std::string::npos) {
-    return fail("N20 was accepted");
+  auto mismatch = comprehensive_request();
+  mismatch.horizon = 20;
+  if (xgc_plan_dmpc::PlanDmpc::open(mismatch, &error) || error.find("horizon") == std::string::npos) {
+    return fail("a flat horizon that disagrees with the manifest was accepted");
   }
 
-  xgc_plan_dmpc::PlanDmpc planner(comprehensive());
-  if (!planner.configure_error().empty()) return fail(planner.configure_error().c_str());
+  auto opened = xgc_plan_dmpc::PlanDmpc::open(comprehensive_request(), &error);
+  if (!opened) return fail(error.c_str());
+  xgc_plan_dmpc::PlanDmpc& planner = *opened;
+  if (compare_comprehensive(planner) != 0) return 1;
 
   xgc_dmpc_paired_state_v1 state{};
   state.pose_stamp_sec = 12.0;
@@ -217,8 +344,7 @@ int main() {
   }
 
   YAML::Node document = YAML::LoadFile(
-      "/home/lxk/Paper/academic/ros1_ws/src/planner/formation_generator/config/scenarios/"
-      "dmpc_comprehensive/scene/scene.yaml");
+      scenario_path("config/scenarios/dmpc_comprehensive/scene/scene.yaml"));
   std::vector<xgc_dmpc_scene_obstacle_v1> obstacles(77);
   std::vector<xgc_dmpc_scene_part_v1> parts(77);
   std::vector<xgc_dmpc_scene_vertex_v1> vertices;
@@ -378,7 +504,7 @@ int main() {
   }
   if (!saw_solve) return fail("real solve was not called");
   YAML::Node arch_document = YAML::LoadFile(
-      "/home/lxk/Paper/academic/ros1_ws/src/planner/formation_generator/config/scenarios/knot_fs150/scene.yaml");
+      scenario_path("config/scenarios/knot_fs150/scene.yaml"));
   YAML::Node arch;
   const auto arch_obstacles = arch_document["obstacles"];
   for (std::size_t index = 0; index < arch_obstacles.size(); ++index) {
@@ -456,8 +582,12 @@ int main() {
     }
   }
   header.obstacle_count = 0;
-  if (planner.push_scene_wire(header, obstacles.data(), parts.data(), vertices.data()).empty()) {
-    return fail("id-only scene became ready");
+  header.part_count = 0;
+  header.vertex_count = 0;
+  const std::string empty_world = planner.push_scene_wire(header, nullptr, nullptr, nullptr);
+  if (!empty_world.empty() || planner.static_obstacle_count() != 0 || planner.scene_epoch() != epoch) {
+    std::cerr << empty_world << '\n';
+    return fail("empty world was not a loaded scene");
   }
   using Entry = const xgc_plugin_descriptor* (*)();
   auto* entry = reinterpret_cast<Entry>(dlsym(RTLD_DEFAULT, "xgc_rt_plugin_v1"));
@@ -492,6 +622,7 @@ int main() {
   if (stale_ack || !position_target || !own_plan || !sync_trigger || !planner_status) {
     return fail("descriptor is missing the vehicle position target or own plan");
   }
+  if (admit_two_static_scene() != 0) return 1;
   std::cout << "lifecycle=" << held.status.lifecycle << " reject=" << held.status.reject_reason << '\n';
   std::cout << "obstacles=" << planner.static_obstacle_count() << " ports=" << entry()->port_count << '\n';
   return 0;

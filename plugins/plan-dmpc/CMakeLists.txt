@@ -19,10 +19,17 @@ target_include_directories(plan_dmpc PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${PLAN_DMPC_RUNTIME_ROOT}/abi/include"
   "${PLAN_DMPC_RUNTIME_ROOT}/plugins")
-target_link_libraries(plan_dmpc PUBLIC formation_generator::formation_generator_dmpc_core)
-set_target_properties(plan_dmpc PROPERTIES OUTPUT_NAME "plan_dmpc" PREFIX "lib")
+target_link_libraries(plan_dmpc PUBLIC
+  formation_generator::formation_generator_dmpc_core
+  formation_generator::formation_generator_dmpc_config)
+set_target_properties(plan_dmpc PROPERTIES
+  OUTPUT_NAME "plan_dmpc"
+  PREFIX "lib"
+  BUILD_RPATH "${PLAN_DMPC_CORE_PREFIX}/lib;${PLAN_DMPC_ACADOS_PREFIX}/lib")
 
 add_executable(test_plan_dmpc test_plan_dmpc.cpp)
+target_compile_definitions(test_plan_dmpc PRIVATE
+  "PLAN_DMPC_TESTDATA=\"${CMAKE_CURRENT_SOURCE_DIR}/testdata\"")
 target_link_libraries(test_plan_dmpc PRIVATE plan_dmpc yaml-cpp dl)
 target_link_options(test_plan_dmpc PRIVATE
   "-Wl,-rpath,${PLAN_DMPC_ACADOS_PREFIX}/lib"

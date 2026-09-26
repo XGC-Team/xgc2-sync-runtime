@@ -883,7 +883,7 @@ fn hil_case(authority_self: bool) -> Case {
         "station":{"robot_id":"xgc2e-12345678901234567890","zenoh_connect":"tcp/127.0.0.1:17457","command_socket":"/tmp/hil-board-b.sock"},
         "scene":{"snapshot_topic":"/experiment/scene/snapshot","state_topic":"/experiment/scene/state",
             "timeline_ack_topic":"/uav2/dmpc/timeline_ack","timeline_status_topic":"/uav2/dmpc/timeline_status"},
-        "planner":{"algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1},
+        "planner":{"manifest":"scenarios/dmpc_comprehensive/uav2.yaml","algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1},
         "initial_position":[1.2,-3.4,0.0],"initial_velocity":[0.1,0.2,0.0]
     }));
     c
@@ -921,6 +921,20 @@ fn hil_fixed_graph_has_real_port_roles_and_no_actuator_or_fake_sensor() {
         }
         assert_eq!(plugin(&m,"numeric-vehicle")["config"]["initial_position"].as_array().unwrap()[0].as_float(), Some(1.2));
         assert_eq!(plugin(&m,"plan-dmpc")["bind"]["neighbor_plan"]["from"].as_array().unwrap(), &["board-b".into()]);
+        let plan = &plugin(&m, "plan-dmpc")["config"];
+        assert_eq!(plan["manifest"].as_str(), Some("scenarios/dmpc_comprehensive/uav2.yaml"));
+        assert_eq!(plan["self_id"].as_integer(), Some(2));
+        assert_eq!(plan["timeline_authority"].as_integer(), Some(if authority_self { 1 } else { 0 }));
+        assert_eq!(plan["scene_id"].as_str(), Some("dmpc-uav8_comprehensive"));
+        assert_eq!(plan["algorithm"].as_str(), Some("legacy"));
+        assert_eq!(plan["chain_n"].as_integer(), Some(3));
+        assert_eq!(plan["state_dim"].as_integer(), Some(9));
+        assert_eq!(plan["horizon"].as_integer(), Some(40));
+        assert_eq!(plan["sampling_time"].as_float(), Some(0.1));
+        assert!(plan.get("fleet_count").is_none());
+        for extra in ["takeoff_altitude", "local_takeoff_altitude", "leader_speed", "q_pos", "num_uavs", "obstacle_count"] {
+            assert!(plan.get(extra).is_none(), "{extra}");
+        }
     }
     let c = Case::new();
     let p = c.prepare().unwrap();
@@ -944,6 +958,17 @@ fn hil_rejects_mixed_graph_clock_authority_and_robot_ownership() {
     c.config(|v| v["radio"]["listen"] = json!([])); c.rejected("radio");
     let mut c = hil_case(false);
     c.config(|v| v["simulation"] = json!(null)); c.rejected("schema");
+    let mut c = hil_case(false);
+    c.config(|v| { v["planner"].as_object_mut().unwrap().remove("manifest"); }); c.rejected("manifest");
+    let mut c = hil_case(false);
+    c.config(|v| v["planner"]["manifest"] = json!("")); c.rejected("manifest");
+    let mut c = hil_case(false);
+    c.config(|v| v["planner"]["manifest"] = json!("scenarios/dmpc_comprehensive/uav2.txt"));
+    let prepared = c.prepare().unwrap();
+    assert_eq!(
+        plugin(&manifest(&prepared), "plan-dmpc")["config"]["manifest"].as_str(),
+        Some("scenarios/dmpc_comprehensive/uav2.txt")
+    );
     let mut c = hil_case(false);
     c.descriptor(|b| b.plugins.controller = b.plugins.numeric_vehicle.clone()); c.rejected("roles");
     let mut c = Case::new();
@@ -1006,6 +1031,19 @@ fn channel_names(m: &toml::Value) -> Vec<&str> {
     m["channel"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect()
 }
 
+fn assert_plan_configure(plan: &toml::Value, self_id: i64, authority: i64) {
+    assert_eq!(plan["manifest"].as_str(), Some("scenarios/dmpc_comprehensive/uav2.yaml"));
+    assert_eq!(plan["self_id"].as_integer(), Some(self_id));
+    assert_eq!(plan["timeline_authority"].as_integer(), Some(authority));
+    assert_eq!(plan["scene_id"].as_str(), Some("dmpc-uav8_comprehensive"));
+    assert_eq!(plan["algorithm"].as_str(), Some("legacy"));
+    assert_eq!(plan["chain_n"].as_integer(), Some(3));
+    assert_eq!(plan["state_dim"].as_integer(), Some(9));
+    assert_eq!(plan["horizon"].as_integer(), Some(40));
+    assert_eq!(plan["sampling_time"].as_float(), Some(0.1));
+    assert!(plan.get("fleet_count").is_none());
+}
+
 fn dmpc_case(kind: &str) -> Case {
     let mut c = Case::new();
     let plan = copy_pin(&c, "plugins/ctl.so", "plugins/plan.so");
@@ -1054,7 +1092,7 @@ fn dmpc_case(kind: &str) -> Case {
     if kind != "smc" {
         body["scene"] = json!({"snapshot_topic":"/experiment/scene/snapshot","state_topic":"/experiment/scene/state",
             "timeline_ack_topic":"/uav2/dmpc/timeline_ack","timeline_status_topic":"/uav2/dmpc/timeline_status"});
-        body["planner"] = json!({"algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1});
+        body["planner"] = json!({"manifest":"scenarios/dmpc_comprehensive/uav2.yaml","algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1});
     }
     if kind != "planner" {
         body["takeoff_altitude_m"] = json!(1.5);
@@ -1098,6 +1136,7 @@ fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
     assert_eq!(ctl["bind"]["local_pose"]["from"].as_array().unwrap(), &["board-b".into()]);
     assert_eq!(ctl["config"]["tracking_backend"].as_str(), Some("smc"));
     assert_eq!(plugin(&m, "plan-dmpc")["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert_plan_configure(&plugin(&m, "plan-dmpc")["config"], 2, 0);
     let station = plugin(&m, "station-io");
     assert_eq!(station["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
     assert_eq!(station["bind"]["imu"]["channel"].as_str(), Some("fcu_imu"));
@@ -1115,6 +1154,7 @@ fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
     assert_eq!(prepared.receipt.actuator_namespace, None);
     assert!(plugin(&m, "ros_io")["bind"].get("paired_state").is_none());
     assert_eq!(plugin(&m, "plan-dmpc")["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert_plan_configure(&plugin(&m, "plan-dmpc")["config"], 2, 0);
     let station = plugin(&m, "station-io");
     assert_eq!(station["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
     assert!(station["bind"].get("imu").is_none());
@@ -1158,6 +1198,14 @@ fn dmpc_graphs_reject_ekf_hover_and_the_wrong_node() {
     let mut c = dmpc_case("smc");
     c.input.node_id = "gcs-b".into();
     c.rejected("control node");
+    for kind in ["native", "planner"] {
+        let mut c = dmpc_case(kind);
+        c.config(|v| { v["planner"].as_object_mut().unwrap().remove("manifest"); });
+        c.rejected("manifest");
+        let mut c = dmpc_case(kind);
+        c.config(|v| v["planner"]["manifest"] = json!(""));
+        c.rejected("manifest");
+    }
     let mut c = dmpc_case("planner");
     c.input.node_id = "board-b".into();
     c.rejected("planner node");

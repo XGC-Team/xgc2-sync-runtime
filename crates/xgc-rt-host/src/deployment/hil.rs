@@ -40,6 +40,9 @@ pub struct Scene {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Planner {
+    /// ParamManifest path. Every plan_dmpc graph requires a non-empty value.
+    /// The loader reads the file; this layer does not inspect its contents.
+    pub manifest: String,
     pub algorithm: String,
     pub scene_id: String,
     pub chain_n: u32,
@@ -124,11 +127,27 @@ impl HilConfiguration {
         for value in [&self.scene.timeline_ack_topic, &self.scene.timeline_status_topic] {
             require(value.starts_with(&format!("/{}/", deployment.robot_namespace)), "HIL status topic outside robot namespace")?;
         }
-        let p = &self.planner;
-        require(p.algorithm == "legacy" && identifier(&p.scene_id) && p.chain_n > 0 && p.state_dim > 0 && p.horizon > 0
-            && p.sampling_time == 0.1, "invalid 100 ms planner shape")?;
+        self.planner.require_configured()?;
         require(self.initial_position.iter().chain(&self.initial_velocity).all(|v| v.is_finite()), "nonfinite scene slot state")
     }
+}
+impl Planner {
+    pub(super) fn require_configured(&self) -> Result<()> {
+        require(!self.manifest.is_empty(), "plan_dmpc manifest is required")?;
+        require(
+            self.algorithm == "legacy" && identifier(&self.scene_id) && self.chain_n > 0 && self.state_dim > 0
+                && self.horizon > 0 && self.sampling_time == 0.1,
+            "invalid 100 ms planner shape",
+        )
+    }
+}
+
+/// Keys plan_dmpc configure reads. fleet_count stays out: num_uavs is inside the manifest.
+pub(super) fn plan_plugin_config(planner: &Planner, self_id: i64, timeline_authority: i64) -> Result<toml::Table> {
+    let mut cfg = table(planner)?;
+    cfg.insert("self_id".into(), self_id.into());
+    cfg.insert("timeline_authority".into(), timeline_authority.into());
+    Ok(cfg)
 }
 fn val<T: Serialize>(value: T) -> Result<toml::Value> { toml::Value::try_from(value).map_err(|e| e.to_string()) }
 fn table<T: Serialize>(value: T) -> Result<toml::Table> { val(value)?.as_table().cloned().ok_or("internal HIL configuration table".into()) }
@@ -184,11 +203,7 @@ pub(super) fn render(deployment: &Deployment, config: &HilConfiguration, bundle:
                 "node_name":format!("xgc_rt_ros_{}", &sha256(format!("{}:{}",deployment.session_id,deployment.node_id).as_bytes())[..16]),
                 "scene_snapshot_topic":config.scene.snapshot_topic,"scene_state_topic":config.scene.state_topic,
                 "timeline_ack_topic":config.scene.timeline_ack_topic,"timeline_status_topic":config.scene.timeline_status_topic}))?,
-            "plan_dmpc" => {
-                let mut cfg = table(&config.planner)?;
-                cfg.insert("self_id".into(), (member.uav_id as i64).into()); cfg.insert("fleet_count".into(), (config.members.len() as i64).into());
-                cfg.insert("timeline_authority".into(), origin(&config.mission_authority_node).into()); cfg
-            },
+            "plan_dmpc" => plan_plugin_config(&config.planner, member.uav_id as i64, origin(&config.mission_authority_node))?,
             "dmpc_rounds" => table(serde_json::json!({
                 "uav_id":member.uav_id,"participant_ids":config.members.iter().map(|m|m.uav_id).collect::<Vec<_>>(),
                 "origins":config.members.iter().map(|m|origin(&m.planner_node)).collect::<Vec<_>>(),

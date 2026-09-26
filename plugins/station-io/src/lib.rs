@@ -386,7 +386,7 @@ mod tests {
             "radio":{"listen":["tcp/127.0.0.1:17442"],"connect":["tcp/127.0.0.1:17441"]},
             "station": station_block(),
             "scene":{"snapshot_topic":"/experiment/scene/snapshot","state_topic":"/experiment/scene/state","timeline_ack_topic":"/uav2/dmpc/timeline_ack","timeline_status_topic":"/uav2/dmpc/timeline_status"},
-            "planner":{"algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1},
+            "planner":{"manifest":"scenarios/dmpc_comprehensive/uav2.yaml","algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1},
             "initial_position":[1.2,-3.4,0.0],"initial_velocity":[0.0,0.0,0.0]
         }))
     }
@@ -419,7 +419,7 @@ mod tests {
             "scene":{"snapshot_topic":"/experiment/scene/snapshot","state_topic":"/experiment/scene/state",
                 "timeline_ack_topic": format!("/{ns}/dmpc/timeline_ack"),
                 "timeline_status_topic": format!("/{ns}/dmpc/timeline_status")},
-            "planner":{"algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1},
+            "planner":{"manifest":"scenarios/dmpc_comprehensive/uav1.yaml","algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1},
             "takeoff_altitude_m":1.5,
             "topics": topics(ns)
         }))
@@ -438,7 +438,7 @@ mod tests {
             "scene":{"snapshot_topic":"/experiment/scene/snapshot","state_topic":"/experiment/scene/state",
                 "timeline_ack_topic": format!("/{ns}/dmpc/timeline_ack"),
                 "timeline_status_topic": format!("/{ns}/dmpc/timeline_status")},
-            "planner":{"algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1}
+            "planner":{"manifest":"scenarios/dmpc_comprehensive/uav1.yaml","algorithm":"legacy","scene_id":"dmpc-uav8_comprehensive","chain_n":3,"state_dim":9,"horizon":40,"sampling_time":0.1}
         }))
     }
     fn smc_raw() -> String {

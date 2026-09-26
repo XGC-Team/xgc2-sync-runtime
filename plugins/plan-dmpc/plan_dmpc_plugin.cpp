@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -115,37 +116,62 @@ void* create(const xgc_host_api* host) {
   return self;
 }
 
+std::string unquote(std::string text) {
+  if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+    return text.substr(1, text.size() - 2);
+  }
+  return text;
+}
+
+bool optional_integer(const std::string& config, const char* key, std::optional<int>* out) {
+  std::string present;
+  if (!xgc_rt_config::value(config, key, &present)) return true;
+  int value = 0;
+  if (!xgc_rt_config::integer(config, key, &value)) return false;
+  *out = value;
+  return true;
+}
+
 xgc_status configure(void* p, const char* text) {
   auto* self = static_cast<Plugin*>(p);
   return guarded(self->host, "configure", [&] {
     namespace cfg = xgc_rt_config;
     const std::string config = text ? text : "";
     std::string present;
-    if (!cfg::value(config, "self_id", &present) || !cfg::value(config, "timeline_authority", &present)) {
+    if (!cfg::value(config, "self_id", &present) || !cfg::value(config, "timeline_authority", &present) ||
+        !cfg::value(config, "manifest", &present) || !cfg::value(config, "scene_id", &present)) {
       return XGC_ERR;
     }
-    int self_id = 1, authority = 0, chain_n = 3, state_dim = 9, horizon = 40, fleet = 8;
-    double sampling = 0.1;
+    xgc_plan_dmpc::PlanDmpcOpen request;
+    int self_id = 0;
+    int authority = 0;
     if (!cfg::integer(config, "self_id", &self_id) || !cfg::integer(config, "timeline_authority", &authority) ||
-        !cfg::integer(config, "chain_n", &chain_n) || !cfg::integer(config, "state_dim", &state_dim) ||
-        !cfg::integer(config, "horizon", &horizon) || !cfg::integer(config, "fleet_count", &fleet) ||
-        !cfg::number(config, "sampling_time", &sampling) || authority < 0 || authority > 65535) {
+        authority < 0 || authority > 65535) {
       return XGC_ERR;
     }
-    xgc_dmpc_planner_config_v1 fields{};
-    const std::string algorithm = cfg::text_or(config, "algorithm", "legacy");
-    const std::string scene_id = cfg::text_or(config, "scene_id", "dmpc-uav8_comprehensive");
-    std::snprintf(fields.algorithm, sizeof fields.algorithm, "%s", algorithm.c_str());
-    std::snprintf(fields.scene_id, sizeof fields.scene_id, "%s", scene_id.c_str());
-    fields.chain_n = chain_n;
-    fields.state_dim = state_dim;
-    fields.horizon = horizon;
-    fields.sampling_time = sampling;
-    fields.self_id = self_id;
-    fields.fleet_count = fleet;
-    fields.timeline_authority = static_cast<uint16_t>(authority);
-    auto plan = std::make_unique<xgc_plan_dmpc::PlanDmpc>(fields);
-    if (!plan->configure_error().empty()) return XGC_ERR;
+    request.self_id = self_id;
+    request.timeline_authority = static_cast<uint16_t>(authority);
+    request.manifest_path = unquote(cfg::text_or(config, "manifest", ""));
+    request.scene_id = unquote(cfg::text_or(config, "scene_id", ""));
+    std::string algorithm;
+    if (cfg::value(config, "algorithm", &algorithm)) request.algorithm = unquote(algorithm);
+    if (!optional_integer(config, "chain_n", &request.chain_n) ||
+        !optional_integer(config, "state_dim", &request.state_dim) ||
+        !optional_integer(config, "horizon", &request.horizon) ||
+        !optional_integer(config, "fleet_count", &request.fleet_count)) {
+      return XGC_ERR;
+    }
+    if (cfg::value(config, "sampling_time", &present)) {
+      double sampling = 0.0;
+      if (!cfg::number(config, "sampling_time", &sampling)) return XGC_ERR;
+      request.sampling_time = sampling;
+    }
+    std::string error;
+    auto plan = xgc_plan_dmpc::PlanDmpc::open(request, &error);
+    if (!plan) {
+      if (self->host && self->host->log) self->host->log(self->host->host, XGC_LOG_ERROR, error.c_str());
+      return XGC_ERR;
+    }
     self->plan = std::move(plan);
     self->domain = "configured";
     return XGC_OK;

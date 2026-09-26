@@ -168,10 +168,7 @@ fn validate_scene(scene: &Scene, namespace: &str) -> Result<()> {
 }
 
 fn validate_planner(planner: &Planner) -> Result<()> {
-    require(
-        planner.algorithm == "legacy" && identifier(&planner.scene_id) && planner.chain_n > 0 && planner.state_dim > 0 && planner.horizon > 0 && planner.sampling_time == 0.1,
-        "invalid 100 ms planner shape",
-    )
+    planner.require_configured()
 }
 
 fn validate_vehicle(topics: &VehicleTopics, takeoff: f64, namespace: &str) -> Result<()> {
@@ -341,11 +338,7 @@ fn insert_plan(cfg: &mut toml::Table, deployment: &Deployment, members: &[RobotM
     let nodes = roster(members);
     let origin = |node: &str| nodes.iter().position(|n| n == node).expect("validated roster") as i64;
     let member = members.iter().find(|m| m.role(&deployment.node_id).is_some()).ok_or("missing member")?;
-    let mut plan = table(planner)?;
-    plan.insert("self_id".into(), (member.uav_id as i64).into());
-    plan.insert("fleet_count".into(), (members.len() as i64).into());
-    plan.insert("timeline_authority".into(), origin(authority).into());
-    *cfg = plan;
+    *cfg = super::hil::plan_plugin_config(planner, member.uav_id as i64, origin(authority))?;
     Ok(())
 }
 
