@@ -1,6 +1,6 @@
 # Native deployment renderer v1
 
-The release-owned `xgc-rt-render` renders a frozen, single-robot five-module composition. Deployment validation and native control acceptance are separate gates. This profile uses the composition and 1 ms period/10 ms controller watchdog budget validated in b92465f; it does not establish a 1 ms execution deadline.
+The release-owned `xgc-rt-render` renders a frozen, single-robot five-module composition. Deployment validation and native control acceptance are separate gates. This profile uses a 1 ms period and a 10 ms controller watchdog budget; it does not establish a 1 ms execution deadline. Native functional evidence is listed in [the validation record](validation/native-20260926/README.md).
 
 Executable: `xgc-rt-render` (same bundle/bin directory as xgc-rt-host). The existing xgc-rt-host `--manifest` CLI is unchanged.
 
@@ -103,25 +103,11 @@ Packaging writes a separate **DEPLOYMENT-BUNDLE.json** (exact bytes SHA binds it
 
 Host/plugins/libraries are indexed actual regular ELF files. Bundle links are separately indexed, constrained to the same directory, and resolve to an indexed real file; source/target cannot escape the bundle. Every indexed byte is verified before generation/exec. External ROS and system dependencies remain installed OS dependencies, not forged vendored files. The runtime launch sets LD_LIBRARY_PATH to bundle/lib plus /opt/ros/noetic/lib.
 
-`describe` supplies the canonical composition document and SHA. Composition is built into the renderer, keeps 1 ms period and controller 10 ms step budget from b92465f, self-only roster, five actual module roles and source-default algorithm settings except the explicit takeoff/calibration values. No observer, run_for_ms, fixed ROS namespace or automatic extrinsic verification. No Sim clock, distributed synchronization, DMPC or UGV claim.
+`describe` supplies the canonical composition document and SHA. Composition is built into the renderer, sets a 1 ms period and a controller 10 ms step budget, self-only roster, five actual module roles and source-default algorithm settings except the explicit takeoff/calibration values. No observer, run_for_ms, fixed ROS namespace or automatic extrinsic verification. No Sim clock, distributed synchronization, DMPC or UGV claim.
 
 State contract: same Session/node identity with different frozen deployment JSON is refused (including bundle/config/composition changes). Same identity/input creates a fresh audit generation; an active `run` blocks a second writer. Identity and generation writes are atomic under a no-symlink directory descriptor lock. Receipt includes deployment/manifest/bundle/config/composition hashes, generation and exact manifest/audit paths; prepare success is not live-module readiness.
 
-Catalog can use ordinary direct executable `xgc-rt-render run`, the fixed bundle-root argument and `${deploymentJson}` as one argv value. Put normal strict parameter policy on deploymentJson and scalar namespace; require namespace to equal the envelope. The controller claim remains namespace-only, so different Sessions cannot own two actuator producers in one namespace. No Core-only Materializer, custom loader or target-dependent normalized absolute path is necessary. Same definition/policy must be installed on Core and Agent. Fixture source b92465f ELF identities remain explicit; subsequent decoder-source fixes need newly built plugin hashes rather than inferred provenance.
-
-## Root-frozen validation domain (22:57)
-
-Both implementations use this same domain:
-
-- Session and node identifiers: `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`. Current real Session UUIDs fit.
-- Robot namespace: one segment, `^[A-Za-z][A-Za-z0-9_]{0,63}$`.
-- Absolute ROS names: one or more slash-separated segments, each `[A-Za-z][A-Za-z0-9_]*`, total at most 128 characters; no trailing slash. All 16 role values must be distinct. Pose and command may use shared external namespaces explicitly; others stay under selected namespace.
-- Provenance source_id and robot_asset_id: trimmed nonempty strings, at most 256 characters, no ASCII controls or DEL.
-- ros_ip and the IPv4 address of ros_master_uri reject unspecified 0.0.0.0, multicast 224.0.0.0/4, and 255.255.255.255. Loopback remains allowed for centralized execution. Master URI is exactly http://IPv4:port with port 1..65535; no hostname/userinfo/query/fragment/trailing slash.
-- JSON uses exact types: booleans cannot be null, numbers cannot be quoted strings, array elements are numeric. Unknown/duplicate fields and any trailing token/data fail.
-
-Namespace is the sole controller resource-claim identity, matching the existing PX4 controller. Session stays in frozen deployment identity/audit; adding it to the actuator claim would incorrectly allow concurrent controllers for one robot.
-
+Catalog can use ordinary direct executable `xgc-rt-render run`, the fixed bundle-root argument and `${deploymentJson}` as one argv value. Put normal strict parameter policy on deploymentJson and scalar namespace; require namespace to equal the envelope. The controller claim remains namespace-only, so different Sessions cannot own two actuator producers in one namespace. No Core-only Materializer, custom loader or target-dependent normalized absolute path is necessary. Same definition/policy must be installed on Core and Agent. Artifact pins must identify installed binaries; source revisions alone do not establish binary equivalence.
 
 ## Filesystem and process ownership
 
@@ -135,7 +121,7 @@ Only the declared library links may be symlinks; each points directly to an inde
 
 ## Time, readiness and acceptance boundaries
 
-The caller explicitly declares `input_time_domain: wall-unix`. All three state/control estimators and reference generation use the host Session clock. This release does not inspect /use_sim_time or translate Gazebo /clock, and accepting the declaration does not prove a live upstream publisher actually obeys it. Bring-up must check its actual timestamp domain independently before control use.
+The caller explicitly declares `input_time_domain: wall-unix`. The ESKF, hover-thrust estimator, controller and reference generator use the host Session clock. This release does not inspect /use_sim_time or translate Gazebo /clock, and accepting the declaration does not prove a live upstream publisher actually obeys it. Bring-up must check its actual timestamp domain independently before control use.
 
 `prepare` validates schema, files and the real Manifest resolver; its `live_readiness` is always false. A `run` receipt is also not module readiness: host module lifecycle/health (under `<audit_path>/<node_id>/health.jsonl`) and actual output/input evidence must be checked by the managing workflow. The process remains alive until the ordinary managed-process stop signal or an actual host failure; there is no fixture observer or 180-second deadline.
 
