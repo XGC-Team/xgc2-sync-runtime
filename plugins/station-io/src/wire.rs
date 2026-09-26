@@ -107,10 +107,12 @@ pub fn valid_frame(frame: &str) -> bool {
     bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'.' | b'/' | b'-'))
 }
 
-const CONTROLLER_STATES: &[&str] = &["Configured", "Ready", "Custom1", "Hold", "Stopped", "Fault"];
-
+/// Control-region name in `xgc_controller_status_v1.state[48]`.
+/// Non-empty, at most 48 bytes, no control character (`char::is_control`,
+/// which is C0, DEL, and C1).
 pub fn valid_controller_state(text: &str) -> bool {
-    CONTROLLER_STATES.contains(&text)
+    let bytes = text.as_bytes();
+    !bytes.is_empty() && bytes.len() <= 48 && text.chars().all(|c| !c.is_control())
 }
 
 const COMMAND_TOKENS: &[&str] = &[
@@ -504,13 +506,25 @@ mod tests {
     }
 
     #[test]
-    fn controller_status_keeps_only_a_real_state_name() {
+    fn controller_status_passes_through_schema_text() {
         let mut raw = [0u8; 56];
         raw[..8].copy_from_slice(&1.5f64.to_le_bytes());
-        raw[8..13].copy_from_slice(b"Ready");
-        assert_eq!(parse_status(&raw).unwrap().1, "Ready");
-        raw[8..16].copy_from_slice(b"hovering");
+        for name in ["Ready", "SelfCheck", "Hover", "Landing", "Takeoff"] {
+            raw[8..56].fill(0);
+            raw[8..8 + name.len()].copy_from_slice(name.as_bytes());
+            assert_eq!(parse_status(&raw).unwrap().1, name);
+        }
+        raw[8..56].fill(b'A');
+        assert_eq!(parse_status(&raw).unwrap().1.len(), 48);
+        assert!(valid_controller_state(&"A".repeat(48)));
+        raw[8..56].fill(0);
         assert!(parse_status(&raw).is_none());
+        assert!(!valid_controller_state(""));
+        raw[8] = 0xC2;
+        raw[9] = 0x85;
+        assert!(parse_status(&raw).is_none(), "C1 U+0085");
+        assert!(!valid_controller_state("\u{0085}"));
+        assert!(!valid_controller_state(&"A".repeat(49)));
         let flight = flight_json(1, 1.0, true, false, false, false, "POSCTL", 4).unwrap();
         let body: Value = serde_json::from_str(&flight).unwrap();
         assert!(body["landed_state"].is_null());
