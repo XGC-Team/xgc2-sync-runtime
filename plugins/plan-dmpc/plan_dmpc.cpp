@@ -386,8 +386,23 @@ std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, cons
   }
   if (request.kind == 5 && !finite3(request.goal_xyz)) return "goal is nonfinite";
   if (request.kind != 6 && request.pattern_id != 0) return "unused pattern id is not canonical zero";
+  const int64_t period = std::llround(config_.sampling_time * 1e9);
+  int64_t expected = request.anchor_ns;
+  if (request.rolling == 1) {
+    if (commit.round_k < request.effective_round) return "timeline effective round is still in the future";
+    const uint64_t steps = commit.round_k - request.effective_round;
+    if (steps > static_cast<uint64_t>(INT64_MAX / period)) return "timeline mission time overflow";
+    const int64_t delta = static_cast<int64_t>(steps) * period;
+    if (expected > INT64_MAX - delta) return "timeline mission time overflow";
+    expected += delta;
+  } else if (commit.mission_ns != request.anchor_ns) {
+    return "held timeline mission time is not its anchor";
+  }
+  if (commit.mission_ns != expected) return "timeline mission time does not match the common formula";
   if (commit_ok_ && request.revision == commit_.request.revision &&
       std::memcmp(digest, commit_digest_, 32) == 0) {
+    if (commit.round_k < commit_.round_k) return "timeline round went backwards";
+    commit_ = commit;
     return {};
   }
   // Same revision, but the rounds owner has frozen this beat: rolling cleared
@@ -406,7 +421,6 @@ std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, cons
     return "timeline predecessor digest mismatch";
   }
   if (request.rolling > 1) return "timeline rolling flag is not 0 or 1";
-  const int64_t period = std::llround(config_.sampling_time * 1e9);
   xgc_dmpc_mission_timeline_v1 previous{};
   if (commit_ok_) previous = commit_.request;
   auto phase_at = [&](uint64_t round, int64_t* out) -> const char* {
@@ -438,34 +452,21 @@ std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, cons
     if (const char* overflow = phase_at(request.effective_round, &projected)) return overflow;
     if (request.anchor_ns != projected) return "anchor does not continue the timeline";
   }
-  int64_t expected = request.anchor_ns;
-  if (request.rolling == 1) {
-    if (commit.round_k < request.effective_round) return "timeline effective round is still in the future";
-    const uint64_t steps = commit.round_k - request.effective_round;
-    if (steps > static_cast<uint64_t>(INT64_MAX / period)) return "timeline mission time overflow";
-    expected += static_cast<int64_t>(steps) * period;
-  } else if (commit.mission_ns != request.anchor_ns) {
-    return "held timeline mission time is not its anchor";
-  }
-  if (commit.mission_ns != expected) return "timeline mission time does not match the common formula";
   commit_ = commit;
   std::memcpy(commit_digest_, digest, 32);
   commit_ok_ = true;
   return {};
 }
 
-std::string PlanDmpc::push_neighbor(uint32_t uav_id) {
-  if (!configure_error_.empty()) return configure_error_;
-  if (uav_id == static_cast<uint32_t>(config_.self_id) || uav_id < 1 ||
-      uav_id > static_cast<uint32_t>(config_.fleet_count)) {
-    return "neighbor identity is outside the loaded roster";
+bool PlanDmpc::neighbors_ready(double now_sec) const {
+  if (!loaded_.mpc_params.enable_inter_uav_collision_constraints) return true;
+  for (int id = 1; id <= config_.fleet_count; ++id) {
+    if (id == config_.self_id) continue;
+    const auto found = neighbor_plans_.find(id);
+    if (found == neighbor_plans_.end() ||
+        now_sec - found->second.timestamp > loaded_.mpc_params.neighbor_trajectory_freshness_sec) return false;
   }
-  if (neighbors_.count(uav_id) != 0) return "duplicate neighbor plan";
-  if (neighbors_.size() >= static_cast<size_t>(std::max(0, config_.fleet_count - 1))) {
-    return "neighbor cache is full";
-  }
-  neighbors_.emplace(uav_id, true);
-  return {};
+  return true;
 }
 
 void PlanDmpc::refresh(double now_sec, double now_wall_sec) {
@@ -477,14 +478,14 @@ void PlanDmpc::refresh(double now_sec, double now_wall_sec) {
   formation_generator_dmpc::PlannerLifecycleFacts facts;
   facts.obstacle_info_ready = obstacleInfoReady(false, false, true, geometry_ready_, geometry_ready_,
                                                 heartbeat_fresh && scene_ids_match_);
-  facts.first_state_received = state_ok_;
+  facts.first_state_received = state_ok_ && now_sec - state_stamp_sec_ <= kStaleSec;
   facts.vehicle_control_state = controller_ok_ ? controller_state_ : "";
   facts.vehicle_stamp_valid = controller_ok_;
   facts.vehicle_state_age_sec =
       controller_ok_ && std::isfinite(now_sec) ? now_sec - controller_stamp_sec_ : 1.0e9;
-  facts.neighbors_ready = neighbors_.size() == static_cast<size_t>(std::max(0, config_.fleet_count - 1));
+  facts.neighbors_ready = neighbors_ready(now_sec);
   facts.last_published_position_valid = false;
-  facts.swarm_mission_clock = false;
+  facts.swarm_mission_clock = true;
   lifecycle_.setFacts(facts);
   (void)sceneHoldRequired(true, geometry_ready_, heartbeat_fresh, age, kHeartbeatTimeoutSec);
 }
@@ -498,11 +499,22 @@ StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec
     std::strncpy(out.status.reject_reason, configure_error_.c_str(), sizeof(out.status.reject_reason) - 1);
   } else {
     refresh(now_sec, now_wall_sec);
+    lifecycle_.considerReseed(now_sec);
+    const bool rolling = commit_ok_ && commit_.request.rolling == 1;
+    lifecycle_.noteRequestedMode(rolling ? formation_generator_dmpc::OptimizationMode::ROLLING
+                                         : formation_generator_dmpc::OptimizationMode::HOLD);
+    lifecycle_.queue(rolling ? formation_generator_dmpc::LifecycleEvent::ROLLING_REQUESTED
+                             : formation_generator_dmpc::LifecycleEvent::HOLD_REQUESTED, now_sec);
     lifecycle_.tick(now_sec);
+    if (lifecycle_.localInitializationSucceeded() && neighbors_ready(now_sec)) {
+      lifecycle_.noteFormationReady(true);
+    }
+    lifecycle_.advanceOnSyncTrigger(trigger_sec, trigger_sec == 0.0, now_sec);
     const bool receipt_valid = heartbeat_wall_sec_.has_value() && std::isfinite(now_wall_sec);
     const double age = receipt_valid ? now_wall_sec - *heartbeat_wall_sec_ : 1.0e9;
     const bool heartbeat_fresh = receipt_valid && age >= 0.0 && age <= kHeartbeatTimeoutSec;
     const char* reason = optimizer_ ? "" : "legacy optimizer is not initialized";
+    if (!state_ok_ || now_sec - state_stamp_sec_ > kStaleSec) reason = "paired state is not current";
     if (!heartbeat_fresh) reason = "scene heartbeat is not current";
     else if (formation_generator_dmpc::sceneHoldRequired(true, geometry_ready_, heartbeat_fresh, age,
                                                         kHeartbeatTimeoutSec)) {
@@ -555,7 +567,7 @@ StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec
     }
   }
   const double mission_sec = commit_ok_ ? static_cast<double>(commit_.mission_ns) * 1e-9 : 0.0;
-  run_round(trigger_sec, mission_sec, out);
+  run_round(trigger_sec, now_sec, mission_sec, out);
   return out;
 }
 
@@ -618,8 +630,12 @@ std::string PlanDmpc::push_neighbor_plan(const uint8_t* bytes, size_t size) {
   if (!formation_generator_dmpc::decodePlanPayload(bytes, size, message)) {
     return "neighbor plan payload is not an assumed trajectory";
   }
-  const std::string identity = push_neighbor(message.uav_id);
-  if (!identity.empty() && identity != "duplicate neighbor plan") return identity;
+  if (message.uav_id == config_.self_id || message.uav_id < 1 || message.uav_id > config_.fleet_count) {
+    return "neighbor identity is outside the loaded roster";
+  }
+  if (message.num_timesteps < static_cast<uint32_t>(config_.horizon + 1)) {
+    return "neighbor trajectory is shorter than the loaded horizon";
+  }
   StateTrajectory trajectory;
   if (!formation_generator_dmpc::assumedTrajectoryToStateTrajectory(message, config_.state_dim,
                                                                    config_.sampling_time, trajectory)) {
@@ -644,6 +660,8 @@ bool PlanDmpc::initialize_optimizer(std::string& fault) {
     optimizer_->setGeometryTemplates(templates_);
     optimizer_->setUavGeometries(loaded_.default_uav_geometry, loaded_.uav_geometries);
     optimizer_->updateStaticObstacles(statics_);
+    relative_state_ = formation_generator_dmpc::initializeDmpcTrajectory(
+        *optimizer_, *leader_, measured_, loaded_.local_takeoff_altitude);
   } catch (const std::exception& error) {
     optimizer_.reset();
     fault = error.what();
@@ -652,7 +670,18 @@ bool PlanDmpc::initialize_optimizer(std::string& fault) {
   return true;
 }
 
-void PlanDmpc::run_round(double trigger_sec, double mission_sec, StepTrace& out) {
+void PlanDmpc::write_own_plan(double valid_sec, StepTrace& out) const {
+  bool available = false;
+  const auto& predicted = optimizer_->getPredictedStates(available);
+  if (!available) return;
+  formation_generator_dmpc::PlanMessage plan;
+  formation_generator_dmpc::planFromPredictedStates(predicted, config_.horizon, available, plan);
+  plan.stamp = valid_sec;
+  plan.uav_id = static_cast<uint8_t>(config_.self_id);
+  out.own_plan = formation_generator_dmpc::encodePlanPayload(plan);
+}
+
+void PlanDmpc::run_round(double trigger_sec, double now_sec, double mission_sec, StepTrace& out) {
   using formation_generator_dmpc::GoalApplyRequest;
   using formation_generator_dmpc::GoalBootstrapInitializer;
   using formation_generator_dmpc::GoalSeedStatus;
@@ -669,8 +698,14 @@ void PlanDmpc::run_round(double trigger_sec, double mission_sec, StepTrace& out)
     out.have_position_target = true;
     out.status.tracking = 0;
   };
+  if (!state_ok_ || now_sec - state_stamp_sec_ > kStaleSec) return;
   if (!optimizer_ || !leader_ || hold) {
     if (hold) publish_hold();
+    return;
+  }
+  if (!lifecycle_.isOptimizing()) {
+    // Every peer can learn the seeded rest trajectory before anyone solves.
+    write_own_plan(trigger_sec, out);
     return;
   }
   formation_generator_dmpc::QueuedGoal pending;
@@ -728,10 +763,14 @@ void PlanDmpc::run_round(double trigger_sec, double mission_sec, StepTrace& out)
   formation_generator_dmpc::prepareDmpcRound(*optimizer_, round);
   std::vector<StateTrajectory> neighbors;
   neighbors.reserve(neighbor_plans_.size());
-  for (const auto& item : neighbor_plans_) neighbors.push_back(item.second);
+  for (const auto& item : neighbor_plans_) {
+    if (now_sec - item.second.timestamp <= loaded_.mpc_params.neighbor_trajectory_freshness_sec) {
+      neighbors.push_back(item.second);
+    }
+  }
   out.status.solver_called = 1;
   const bool solved = formation_generator_dmpc::solveDmpcRound(
-      *optimizer_, relative_state_, acceleration_, std::move(neighbors), mission_sec);
+      *optimizer_, relative_state_, acceleration_, std::move(neighbors), now_sec);
   const auto diagnostics = optimizer_->getLastSolverDiagnostics();
   out.status.qp_status = diagnostics.qp_status;
   out.status.qp_iterations = diagnostics.qp_iterations;
@@ -756,13 +795,7 @@ void PlanDmpc::run_round(double trigger_sec, double mission_sec, StepTrace& out)
     out.have_position_target = true;
     out.status.tracking = lifecycle_.isRolling() ? 1 : 0;
   }
-  bool predicted_ok = false;
-  const auto& predicted = optimizer_->getPredictedStates(predicted_ok);
-  formation_generator_dmpc::PlanMessage plan;
-  formation_generator_dmpc::planFromPredictedStates(predicted, config_.horizon, predicted_ok, plan);
-  plan.stamp = trigger_sec + config_.sampling_time;
-  plan.uav_id = static_cast<uint8_t>(config_.self_id);
-  if (predicted_ok) out.own_plan = formation_generator_dmpc::encodePlanPayload(plan);
+  write_own_plan(trigger_sec + config_.sampling_time, out);
   if (lifecycle_.isRolling()) {
     formation_generator_dmpc::advanceDmpcRound(*optimizer_, relative_state_, acceleration_);
   }

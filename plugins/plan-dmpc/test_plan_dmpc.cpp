@@ -265,12 +265,6 @@ int main(int argc, char** argv) {
   commit.mission_ns = 0;
   if (!planner.push_commit(commit, digest).empty()) return fail("identical revision was not idempotent");
 
-  if (!planner.push_neighbor(2).empty()) return fail("first neighbor was rejected");
-  if (planner.push_neighbor(2).empty()) return fail("duplicate neighbor was accepted");
-  for (int id = 3; id <= 8; ++id) {
-    if (!planner.push_neighbor(static_cast<uint32_t>(id)).empty()) return fail("roster neighbor rejected");
-  }
-  if (planner.push_neighbor(2).empty()) return fail("eighth copy was accepted");
 
   xgc_dmpc_scene_heartbeat_v1 beat{100.0};
   if (!planner.push_heartbeat(beat).empty()) return fail("heartbeat receipt was rejected");
@@ -290,6 +284,15 @@ int main(int argc, char** argv) {
     return fail("mission time advanced from local steps");
   }
   if (held.timeline.applied_revision != 1) return fail("start revision was not applied from the commit");
+  commit.round_k = 21;
+  commit.mission_ns = 100000001;
+  if (planner.push_commit(commit, digest).empty()) return fail("same command accepted an invalid round time");
+  commit.mission_ns = 100000000;
+  if (!planner.push_commit(commit, digest).empty() ||
+      planner.step(10.2, 10.2, 100.2).timeline.mission_ns != 100000000) {
+    return fail("same command did not advance its per-round mission time");
+  }
+
   commit.request.kind = 6;
   commit.request.revision = 2;
   commit.request.predecessor_revision = 1;
@@ -488,6 +491,35 @@ int main(int argc, char** argv) {
       wrapped_blob.data(), wrapped_blob.size(), &wrapped_view, &wrapped_state, &wrapped_dynamic);
   if (wrapped_error.find("vertices") == std::string::npos) {
     return fail("wrapped convex vertex range was accepted");
+  }
+  std::vector<uint8_t> initial_plan;
+  for (int attempt = 0; attempt < 6; ++attempt) {
+    const auto trace = planner.step(10.2, 10.2, 100.2);
+    if (trace.status.solver_called) return fail("solver ran before any neighbor plan arrived");
+    if (!trace.own_plan.empty()) initial_plan = trace.own_plan;
+  }
+  if (initial_plan.empty()) return fail("startup did not broadcast a seeded trajectory while waiting for neighbors");
+  formation_generator_dmpc::PlanMessage neighbor;
+  if (!formation_generator_dmpc::decodePlanPayload(initial_plan.data(), initial_plan.size(), neighbor)) {
+    return fail("initial seeded trajectory is not a usable wire plan");
+  }
+  auto feed_neighbor = [&](const formation_generator_dmpc::PlanMessage& plan) {
+    const auto wire = formation_generator_dmpc::encodePlanPayload(plan);
+    return planner.push_neighbor_plan(wire.data(), wire.size());
+  };
+  if (feed_neighbor(neighbor).empty()) return fail("own trajectory was accepted as a neighbor");
+  neighbor.uav_id = 9;
+  if (feed_neighbor(neighbor).empty()) return fail("out of roster neighbor was accepted");
+  neighbor.uav_id = 2;
+  neighbor.valid = false;
+  if (feed_neighbor(neighbor).empty()) return fail("invalid trajectory counted as a ready neighbor");
+  neighbor.valid = true;
+  for (int id = 2; id <= 8; ++id) {
+    neighbor.uav_id = id;
+    for (uint32_t k = 0; k < neighbor.num_timesteps; ++k) {
+      neighbor.states[k * neighbor.num_states] += 2.0;
+    }
+    if (!feed_neighbor(neighbor).empty()) return fail("valid neighbor trajectory was rejected");
   }
   bool saw_solve = false;
   for (int attempt = 0; attempt < 6 && !saw_solve; ++attempt) {

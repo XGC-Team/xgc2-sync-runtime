@@ -84,7 +84,6 @@ class PlanDmpc {
   xgc_dmpc_mission_ack_v1 acknowledge(const xgc_dmpc_mission_timeline_v1& request,
                                       const uint8_t digest[32], uint16_t envelope_origin) const;
   std::string push_commit(const xgc_dmpc_mission_commit_v1& commit, const uint8_t digest[32]);
-  std::string push_neighbor(uint32_t uav_id);
   StepTrace step(double trigger_sec, double now_sec, double now_wall_sec);
 
  private:
@@ -100,7 +99,9 @@ class PlanDmpc {
                              formation_generator_dmpc::PlainSceneDynamicState* state,
                              bool* have_state) const;
   void replace_goal(const formation_generator_dmpc::QueuedGoal& goal);
-  void run_round(double trigger_sec, double mission_sec, StepTrace& out);
+  bool neighbors_ready(double now_sec) const;
+  void write_own_plan(double valid_sec, StepTrace& out) const;
+  void run_round(double trigger_sec, double now_sec, double mission_sec, StepTrace& out);
   formation_generator_dmpc::PlannerLifecycle lifecycle_;
   xgc_dmpc_planner_config_v1 config_{};
   formation_generator_dmpc::DmpcConfiguration loaded_{};
@@ -129,7 +130,6 @@ class PlanDmpc {
   Eigen::Vector3d pattern_offset_ = Eigen::Vector3d::Zero();
   bool goal_waiting_ = false;
   std::optional<double> heartbeat_wall_sec_;
-  std::map<uint32_t, bool> neighbors_;
   xgc_dmpc_mission_commit_v1 commit_{};
   uint8_t commit_digest_[32] = {};
   bool commit_ok_ = false;
