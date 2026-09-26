@@ -5,9 +5,9 @@
 // strategies), behind module I/O. Everything the ROS node's input producers
 // and output consumers did becomes ports; ros_io does the MAVROS side.
 //
-//   in  estimate        xgc.rigid_state_estimate/1  (control state)
-//   in  local_pose      xgc.pose/1                  (mavros local position, check only)
-//   in  local_velocity  xgc.twist/1                 (mavros velocity_local, check only)
+//   in  estimate        xgc.rigid_state_estimate/1  (optional; DFBC/NMPC bind it. SMC does not)
+//   in  local_pose      xgc.pose/1                  (mavros local position; PX4_LOCAL and SMC feedback)
+//   in  local_velocity  xgc.twist/1                 (mavros velocity_local; PX4_LOCAL and SMC feedback)
 //   in  imu             xgc.imu/1                   (mavros imu/data, event only)
 //   in  fcu_state       xgc.fcu_state/1             (mavros state)
 //   in  battery         xgc.battery/1               (optional; telemetry)
@@ -51,9 +51,12 @@
 // thread is its only one, and runs are deterministic.
 //
 // Config: time_source, trace, takeoff_altitude, tracking_backend
-// ("px4_local" | "dfbc" | "nmpc"), local_type_mask, skip_takeoff_init_disarm,
-// planning_period, enable_yaw_control, reference_analytic_type. Defaults are
-// config/uav_nmpc.yaml's (the TRO configuration).
+// ("px4_local" | "dfbc" | "nmpc" | "smc"), px4_local_lift
+// ("legacy" | "zero_order_hold"), smc_k1, smc_k2, smc_boundary_layer,
+// local_type_mask, skip_takeoff_init_disarm, planning_period,
+// enable_yaw_control, reference_analytic_type. Defaults are
+// config/uav_nmpc.yaml's (the TRO configuration). Absent keys keep those
+// defaults: legacy lift, and the manuscript SMC gains.
 
 #include <algorithm>
 #include <cinttypes>
@@ -72,6 +75,7 @@
 #include "flat_config.hpp"
 #include "px4_multirotor_controller/common/time.h"
 #include "px4_multirotor_controller/common/types.h"
+#include "px4_multirotor_controller/control/trajectory_lifter.h"
 #include "px4_multirotor_controller/drone_controller.h"
 #include "px4_multirotor_controller/nmpc/nmpc_math_utils.h"
 #include "px4_multirotor_controller/nmpc/uav_nmpc_solver.h"
@@ -289,22 +293,36 @@ struct CtlPx4 {
         break;
       }
       case kAlgSetpoint: {  // TrajectoryInputProducer::algSetpointCallback
-        if (controller.getConfig().tracking_backend != pmc::TrackingBackend::PX4_LOCAL) break;
+        const pmc::ControllerConfig cfg = controller.getConfig();
+        if (cfg.tracking_backend != pmc::TrackingBackend::PX4_LOCAL &&
+            cfg.tracking_backend != pmc::TrackingBackend::SMC) break;
         xgc_position_target_v1 m;
         if (!read(in.data, &m)) break;
-        pmc::MpcTrajectoryState traj;
-        traj.position_k = Eigen::Vector3d(m.position[0], m.position[1], m.position[2]);
-        traj.velocity_k = Eigen::Vector3d(m.velocity[0], m.velocity[1], m.velocity[2]);
-        traj.acceleration_k = Eigen::Vector3d(m.acceleration[0], m.acceleration[1], m.acceleration[2]);
-        // The receipt time is only the origin for between-sample lifting.
-        traj.planning_time = pmc::Time().fromNSec(in.t_ns);
-        const Eigen::Quaterniond q = pmc::yawToQuaternion(m.yaw);
-        traj.qx = q.x(); traj.qy = q.y(); traj.qz = q.z(); traj.qw = q.w();
-        traj.yaw_rate = m.yaw_rate;
-        traj.type_mask = m.type_mask;
-        traj.coordinate_frame = m.coordinate_frame;
-        traj.is_valid = true;
-        traj.new_data_received = false;
+        pmc::PositionTargetIngress ingress;
+        ingress.position = Eigen::Vector3d(m.position[0], m.position[1], m.position[2]);
+        ingress.velocity = Eigen::Vector3d(m.velocity[0], m.velocity[1], m.velocity[2]);
+        ingress.acceleration = Eigen::Vector3d(m.acceleration[0], m.acceleration[1], m.acceleration[2]);
+        ingress.yaw = m.yaw;
+        ingress.yaw_rate = m.yaw_rate;
+        ingress.type_mask = m.type_mask;
+        ingress.coordinate_frame = m.coordinate_frame;
+        if (std::isfinite(m.stamp) && m.stamp > 0.0 && m.stamp < 4294967296.0) {
+          ingress.header_stamp = pmc::Time(m.stamp);
+        }
+        ingress.receipt_time = pmc::Time().fromNSec(in.t_ns);
+        const pmc::MpcTrajectoryState traj =
+            pmc::ingestPositionTarget(ingress, cfg.tracking_backend, cfg.px4_local_lift);
+        if (pmc::usesStageEffectiveTime(cfg.tracking_backend, cfg.px4_local_lift) && !traj.is_valid) {
+          if (cfg.tracking_backend == pmc::TrackingBackend::SMC &&
+              (!pmc::smcCoordinateFrameIsWorld(ingress.coordinate_frame) ||
+               (ingress.type_mask != 0U && !pmc::smcMaskSuppliesWorldPva(ingress.type_mask)))) {
+            log(XGC_LOG_WARN,
+                "ctl-px4: SMC rejected PositionTarget; need world frame 1 and every P/V/A axis, FORCE clear");
+          } else {
+            log(XGC_LOG_WARN, "ctl-px4: effective-time setpoint needs finite PVA and a header stamp");
+          }
+          break;
+        }
         controller.mpcTrajectoryBuffer().cachePending(traj);
         post(pmc::event_type::INPUT_MPC_TRAJECTORY_UPDATED, now, "alg/setpoint_raw/local");
         break;
@@ -620,16 +638,29 @@ xgc_status configure(void* p, const char* config) {
     int mask = c.local_type_mask;
     const std::string source = cfg::text_or(t, "time_source", "session");
     const std::string backend = cfg::text_or(t, "tracking_backend", "px4_local");
+    const std::string lift = cfg::text_or(t, "px4_local_lift", "legacy");
+    double smc_k1 = c.smc.k1;
+    double smc_k2 = c.smc.k2;
+    double smc_rho = c.smc.boundary_layer;
     bool ok = cfg::number(t, "takeoff_altitude", &c.takeoff_altitude) && cfg::integer(t, "local_type_mask", &mask) &&
               cfg::boolean(t, "skip_takeoff_init_disarm", &c.skip_takeoff_init_disarm) &&
               cfg::number(t, "planning_period", &c.planning_period) &&
               cfg::boolean(t, "enable_yaw_control", &c.enable_yaw_control) && cfg::boolean(t, "trace", &self->trace) &&
               cfg::integer(t, "reference_analytic_type", &c.nmpc.reference_analytic_type) &&
+              cfg::number(t, "smc_k1", &smc_k1) && cfg::number(t, "smc_k2", &smc_k2) &&
+              cfg::number(t, "smc_boundary_layer", &smc_rho) &&
               (source == "session" || source == "input") && mask >= 0 && mask <= 0xFFFF;
     if (backend == "px4_local") c.tracking_backend = pmc::TrackingBackend::PX4_LOCAL;
     else if (backend == "dfbc") c.tracking_backend = pmc::TrackingBackend::DFBC;
     else if (backend == "nmpc") c.tracking_backend = pmc::TrackingBackend::NMPC;
+    else if (backend == "smc") c.tracking_backend = pmc::TrackingBackend::SMC;
     else ok = false;
+    if (lift == "legacy") c.px4_local_lift = pmc::Px4LocalLiftMode::Legacy;
+    else if (lift == "zero_order_hold") c.px4_local_lift = pmc::Px4LocalLiftMode::ZeroOrderHold;
+    else ok = false;
+    c.smc.k1 = smc_k1;
+    c.smc.k2 = smc_k2;
+    c.smc.boundary_layer = smc_rho;
     if (!ok) {
       self->log(XGC_LOG_ERROR, "invalid ctl-px4 config");
       return XGC_ERR;
@@ -655,7 +686,7 @@ void destroy(void* p) { delete static_cast<CtlPx4*>(p); }
 const char* domain_state(void* p) { return static_cast<CtlPx4*>(p)->domain.c_str(); }
 
 const xgc_port_decl kPorts[kPortCount] = {
-    {"estimate", XGC_PORT_IN, "xgc.rigid_state_estimate/1", XGC_QOS_STATE},
+    {"estimate", XGC_PORT_IN_OPTIONAL, "xgc.rigid_state_estimate/1", XGC_QOS_STATE},
     {"local_pose", XGC_PORT_IN, "xgc.pose/1", XGC_QOS_STATE},
     {"local_velocity", XGC_PORT_IN, "xgc.twist/1", XGC_QOS_STATE},
     {"imu", XGC_PORT_IN, "xgc.imu/1", XGC_QOS_STATE},

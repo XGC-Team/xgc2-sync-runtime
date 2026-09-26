@@ -9,6 +9,10 @@
 #   PX4_CONTROLLER_ROOT the px4_multirotor_controller package source
 #                      (default: sibling ros1/controller/multirotor-controller)
 #   XGC2_PREFIX        prefix of libxgc2-math / libxgc2-state-machine (default /usr)
+#   XGC2_MATH_INCLUDE_OVERRIDE
+#                      optional include dir that contains
+#                      xgc2_math/control/smc_tracking_controller.hpp.
+#                      Empty uses the headers under XGC2_PREFIX (APT math >= 0.5.9).
 #   ACADOS_ROOT        acados install (default /usr/local)
 #   EIGEN_INCLUDE      Eigen 3 headers (default /usr/include/eigen3)
 #   CXX                C++17 compiler; use the toolchain that built the core
@@ -22,13 +26,22 @@ products="$(cd "$root/../.." && pwd)"
 ctrl="${PX4_CONTROLLER_ROOT:-$products/ros1/controller/multirotor-controller/px4_multirotor_controller}"
 core_lib="${PX4_CORE_LIB_DIR:?set PX4_CORE_LIB_DIR to the dir with libpx4_multirotor_controller_core.so}"
 prefix="${XGC2_PREFIX:-/usr}"
+math_include="${XGC2_MATH_INCLUDE_OVERRIDE:-}"
+math_flag=()
+if [[ -n "$math_include" ]]; then
+  if [[ ! -f "$math_include/xgc2_math/control/smc_tracking_controller.hpp" ]]; then
+    echo "build-ctl-px4: XGC2_MATH_INCLUDE_OVERRIDE has no smc_tracking_controller.hpp" >&2
+    exit 1
+  fi
+  math_flag=(-I "$math_include")
+fi
 acados="${ACADOS_ROOT:-/usr/local}"
 eigen="${EIGEN_INCLUDE:-/usr/include/eigen3}"
 cxx="${CXX:-c++}"
 deps="$(mktemp)"
 trap 'rm -f "$deps"' EXIT
 $cxx -std=c++17 -O2 -fPIC -Wall -Wextra -shared -fvisibility=hidden -MD -MF "$deps" \
-  -I "$root/abi/include" -I "$root/plugins/common" \
+  "${math_flag[@]}" -I "$root/abi/include" -I "$root/plugins/common" \
   -I "$ctrl/include" -I "$ctrl/generated/nmpc/uav_nmpc" \
   -I "$acados" -I "$acados/include" -I "$acados/include/blasfeo/include" -I "$acados/include/hpipm/include" \
   -I "$acados/interfaces" -I "$prefix/include" -isystem "$eigen" \
