@@ -1,0 +1,15 @@
+[package]
+name = "dmpc-rounds"
+description = "TRO DMPC Phase 1: local rounds replace the central sync trigger; plans are exchanged between robots over the link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+xgc-rt-abi.workspace = true
+toml.workspace = true

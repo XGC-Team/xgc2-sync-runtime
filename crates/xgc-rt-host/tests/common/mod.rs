@@ -23,7 +23,7 @@ pub fn plugin_dir() -> &'static Path {
         let target = root.join("target/plugin-tests");
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
-            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "--target-dir"])
+            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "-p", "dmpc-rounds", "--target-dir"])
             .arg(&target)
             .status()
             .expect("run cargo");
@@ -41,6 +41,24 @@ pub fn plugin_dir() -> &'static Path {
         assert!(status.success(), "building the C stub failed");
         out
     })
+}
+
+/// True when every `outputs` file exists and is newer than every file under
+/// `inputs` (directories are walked), so a C++ build can be skipped.
+pub fn up_to_date(outputs: &[&Path], inputs: &[PathBuf]) -> bool {
+    fn newest(p: &Path) -> std::time::SystemTime {
+        let meta = std::fs::metadata(p).unwrap();
+        if meta.is_dir() {
+            std::fs::read_dir(p).unwrap().filter_map(|e| e.ok()).map(|e| newest(&e.path())).max().unwrap_or(std::time::UNIX_EPOCH)
+        } else {
+            meta.modified().unwrap()
+        }
+    }
+    let outs = outputs.iter().map(|o| std::fs::metadata(o).and_then(|m| m.modified()).ok()).collect::<Option<Vec<_>>>();
+    match outs {
+        Some(outs) => inputs.iter().map(|i| newest(i)).max() < outs.into_iter().min(),
+        None => false,
+    }
 }
 
 pub fn scratch(name: &str) -> PathBuf {
@@ -101,6 +119,18 @@ pub fn est_rigid_state() -> &'static (PathBuf, PathBuf) {
         let out = root.join("target/plugin-tests/cpp");
         std::fs::create_dir_all(&out).unwrap();
         let (lib, reference) = (out.join("libest_rigid_state.so"), out.join("eskf_reference"));
+        let products = root.join("../..");
+        let inputs = [
+            root.join("scripts/build-est-rigid-state.sh"),
+            root.join("plugins/est-rigid-state"),
+            root.join("plugins/common"),
+            root.join("abi/include"),
+            products.join("ros1/perception/estimator/rigid-state/estimator_vrpn_px4_rotor_state/src"),
+            products.join("ros1/perception/estimator/rigid-state/estimator_vrpn_px4_rotor_state/include"),
+        ];
+        if up_to_date(&[&lib, &reference], &inputs) {
+            return (lib, reference);
+        }
         let status = Command::new(root.join("scripts/build-est-rigid-state.sh"))
             .arg(&lib)
             .arg(&reference)

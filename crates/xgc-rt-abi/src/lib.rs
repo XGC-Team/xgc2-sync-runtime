@@ -12,7 +12,7 @@ pub mod neighbor;
 
 pub const XGC_RT_ABI_VERSION: u32 = 1;
 pub const XGC_RT_MAX_PORTS: u32 = 64;
-pub const XGC_RT_ABI_MINOR: u32 = 1;
+pub const XGC_RT_ABI_MINOR: u32 = 2;
 
 /// `xgc_status`. It is kept as a plain integer so that an out-of-range value
 /// from a foreign plugin is a checked error, never undefined behaviour.
@@ -25,6 +25,9 @@ pub const XGC_ERR_AGAIN: XgcStatus = 3;
 pub type XgcPortDir = i32;
 pub const XGC_PORT_IN: XgcPortDir = 0;
 pub const XGC_PORT_OUT: XgcPortDir = 1;
+/// May be left unbound (minor 2): no samples arrive, writes are dropped.
+pub const XGC_PORT_IN_OPTIONAL: XgcPortDir = 2;
+pub const XGC_PORT_OUT_OPTIONAL: XgcPortDir = 3;
 
 pub type XgcQos = i32;
 pub const XGC_QOS_CONTROL: XgcQos = 0;
