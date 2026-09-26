@@ -11,9 +11,12 @@
 //!   `uav_id` is not this robot's are neighbor plans echoed back through ROS
 //!   and are ignored. The robot's own plan is sent on `plan_out` (channel
 //!   `dmpc/plan`) for the current round.
-//! - **Neighbor plans back into ROS.** Each newer neighbor plan from `plan_in`
-//!   is written once on `neighbor_plans`, which `ros_io` publishes on the local
-//!   `/formation/assumed_trajectories`, where the node expects them.
+//! - **Neighbor plans back into ROS.** A plan is written on `neighbor_plans`
+//!   only when its source round is strictly before the current planner beat.
+//!   Round `k` is held and written at beat `k + 1`. Each neighbor keeps rounds
+//!   `k ..= k + stale_rounds`; a farther round is dropped and cannot replace a
+//!   closer one. Each retained round keeps its highest seq. `ros_io` publishes
+//!   the written plans on the local `/formation/assumed_trajectories`.
 //!
 //! - **Mission phase, locally (optional).** With `robots` and `robot` set, it
 //!   also derives the formation's mission phase (rolling, mission_time) on
@@ -146,6 +149,43 @@ pub fn formation_tick(rolling: bool, mission_time: f64, trigger: &[u8]) -> Vec<u
     out
 }
 
+struct HeldPlan {
+    seq: u64,
+    t_produce: i64,
+    data: Vec<u8>,
+}
+
+/// Keep one early plan per source round. `round == k` waits for the next beat.
+/// Rounds above `k + stale_rounds` are dropped; the window bounds its own size.
+fn hold_future_plan(
+    pending: &mut BTreeMap<u16, BTreeMap<u64, HeldPlan>>,
+    host: &Host,
+    stale_rounds: u64,
+    k: u64,
+    origin: u16,
+    round: u64,
+    seq: u64,
+    t_produce: i64,
+    data: Vec<u8>,
+) {
+    let max_round = k.saturating_add(stale_rounds);
+    if round > max_round {
+        host.log(
+            XGC_LOG_WARN,
+            &format!("dmpc-rounds: dropped neighbor plan origin {origin} round {round} at planner round {k}: further than stale_rounds {stale_rounds}"),
+        );
+        return;
+    }
+    let slot = pending.entry(origin).or_default();
+    if let Some(old) = slot.get(&round) {
+        if seq <= old.seq {
+            return;
+        }
+    }
+    slot.insert(round, HeldPlan { seq, t_produce, data });
+
+}
+
 pub struct DmpcRounds {
     host: Host,
     uav_id: u32,
@@ -154,6 +194,8 @@ pub struct DmpcRounds {
     nx: Option<NeighborExchange>,
     /// Newest (round, seq) written on `neighbor_plans`, per origin.
     forwarded: BTreeMap<u16, (u64, u64)>,
+    /// Source rounds still at or ahead of the beat that stored them.
+    pending: BTreeMap<u16, BTreeMap<u64, HeldPlan>>,
     sent_own: bool,
     complete: bool,
     phase: Option<mission::MissionPhase>,
@@ -314,6 +356,7 @@ impl Plugin for DmpcRounds {
             stale_rounds: 2,
             nx: None,
             forwarded: BTreeMap::new(),
+            pending: BTreeMap::new(),
             sent_own: false,
             complete: false,
             phase: None,
@@ -472,14 +515,24 @@ impl Plugin for DmpcRounds {
             }
             own = Some(data);
         }
-        // Neighbor plans: keep the newest, and pass each newer one to ROS once.
+        // Forward source rounds strictly before this beat. Keep round >= k until
+        // a later beat; do not let that future plan replace a usable one.
         {
             let nx = self.nx.as_mut().ok_or("not active")?;
+            let neighbors = nx.neighbors().to_vec();
             let mut incoming = Vec::new();
             while let Some(s) = self.host.next(PLAN_IN) {
                 incoming.push((s.origin, s.round, s.seq, s.t_produce, s.data.to_vec()));
             }
-            let mut fresh = Vec::new();
+            let mut due: BTreeMap<(u16, u64), (u64, i64, Vec<u8>)> = BTreeMap::new();
+            self.pending.retain(|origin, slot| {
+                let ready: Vec<u64> = slot.range(..k).map(|(&round, _)| round).collect();
+                for round in ready {
+                    let held = slot.remove(&round).expect("listed pending round");
+                    due.insert((*origin, round), (held.seq, held.t_produce, held.data));
+                }
+                !slot.is_empty()
+            });
             for (origin, round, seq, t_produce, data) in incoming {
                 if let Some(admission) = &self.admission {
                     if let Err(reason) = round::admit_plan(admission, self.uav_id, origin, &data) {
@@ -487,6 +540,23 @@ impl Plugin for DmpcRounds {
                         continue;
                     }
                 }
+                if !neighbors.contains(&origin) {
+                    self.host.log(XGC_LOG_WARN, &format!("dmpc-rounds: dropped neighbor plan origin {origin} round {round} at planner round {k}: origin is not a neighbor"));
+                    continue;
+                }
+                if round < k {
+                    match due.get(&(origin, round)) {
+                        Some((old_seq, _, _)) if *old_seq >= seq => {},
+                        _ => {
+                            due.insert((origin, round), (seq, t_produce, data));
+                        }
+                    }
+                } else {
+                    hold_future_plan(&mut self.pending, &self.host, self.stale_rounds, k, origin, round, seq, t_produce, data);
+                }
+            }
+            let mut fresh = Vec::new();
+            for ((origin, round), (seq, t_produce, data)) in due {
                 if !nx.offer(k, origin, round, seq, t_produce, &data) {
                     self.host.log(XGC_LOG_WARN, &format!("dmpc-rounds: dropped neighbor plan origin {origin} round {round} at planner round {k}"));
                     continue;
@@ -1142,5 +1212,75 @@ mod tests {
         idle.push_at(OWN_STATE, 9, 6, 2, 600_000_000, named_state("Idle"));
         idle.step_at(6, true).unwrap();
         assert_eq!(commit_rolling(&idle.of(TIMELINE_COMMIT).last().unwrap().data), 1, "a foreign non-Custom1 does not revoke");
+    }
+
+    fn tagged(round: u64, seq: u64) -> Vec<u8> {
+        let mut payload = plan(2, 1, 1, 0);
+        payload[0..8].copy_from_slice(&(round as f64).to_le_bytes());
+        payload[PLAN_HEADER] = seq as u8;
+        payload
+    }
+
+    fn tag_of(bytes: &[u8]) -> (u64, u8) {
+        (f64::from_le_bytes(bytes[0..8].try_into().unwrap()) as u64, bytes[PLAN_HEADER])
+    }
+
+    fn causal_config() -> String {
+        "uav_id = 1\nparticipant_ids = [1, 2]\nplanner_period_ms = 100\nstale_rounds = 2\n".into()
+    }
+
+    fn neighbor_tags(rig: &Rig) -> Vec<(u64, u64, u8)> {
+        rig.of(NEIGHBOR_PLANS).into_iter().map(|p| (p.round, tag_of(&p.data).0, tag_of(&p.data).1)).collect()
+    }
+
+    #[test]
+    fn beat_forwards_only_earlier_rounds_and_keeps_the_same_round_for_the_next_beat() {
+        let mut rig = Rig::open(&causal_config(), &[2]);
+        // Arrival order is future, usable, newer future seq, duplicate, then an older usable round.
+        rig.push(PLAN_IN, 2, 5, 1, tagged(5, 1));
+        rig.push(PLAN_IN, 2, 4, 1, tagged(4, 1));
+        rig.push(PLAN_IN, 2, 5, 2, tagged(5, 2));
+        rig.push(PLAN_IN, 2, 5, 1, tagged(5, 1));
+        rig.push(PLAN_IN, 2, 3, 1, tagged(3, 1));
+        rig.step_at(5, true).unwrap();
+        assert_eq!(neighbor_tags(&rig), vec![(5, 3, 1), (5, 4, 1)], "k=5 uses P3 then P4, never P5");
+        rig.step_at(5, false).unwrap();
+        assert_eq!(neighbor_tags(&rig).len(), 2, "a dirty step does not leak the held round");
+        rig.push(PLAN_IN, 2, 3, 9, tagged(3, 9));
+        rig.step_at(6, true).unwrap();
+        assert_eq!(neighbor_tags(&rig).last().copied(), Some((6, 5, 2)), "k=6 consumes the highest seq of round 5");
+        assert_eq!(neighbor_tags(&rig).len(), 3, "the late older round does not publish after round 4");
+    }
+
+    #[test]
+    fn an_early_plan_alone_stays_unforwarded_until_the_next_beat() {
+        let mut rig = Rig::open(&causal_config(), &[2]);
+        rig.push(PLAN_IN, 2, 5, 1, tagged(5, 1));
+        rig.step_at(5, true).unwrap();
+        assert!(neighbor_tags(&rig).is_empty(), "k=5 does not leak P5");
+        rig.step_at(6, true).unwrap();
+        assert_eq!(neighbor_tags(&rig), vec![(6, 5, 1)]);
+    }
+
+    #[test]
+    fn farther_future_duplicates_and_unknown_origins_do_not_evict_a_held_round() {
+        let mut rig = Rig::open(&causal_config(), &[2]);
+        rig.push(PLAN_IN, 2, 8, 1, tagged(8, 1));
+        rig.push(PLAN_IN, 2, 5, 1, tagged(5, 1));
+        rig.push(PLAN_IN, 2, 5, 3, tagged(5, 3));
+        rig.push(PLAN_IN, 2, 5, 2, tagged(5, 2));
+        rig.push(PLAN_IN, 2, 7, 1, tagged(7, 1));
+        rig.push(PLAN_IN, 2, 6, 1, tagged(6, 1));
+        rig.push(PLAN_IN, 9, 4, 1, tagged(4, 1));
+        rig.step_at(5, true).unwrap();
+        assert!(neighbor_tags(&rig).is_empty());
+        rig.step_at(6, true).unwrap();
+        assert_eq!(neighbor_tags(&rig), vec![(6, 5, 3)]);
+        rig.step_at(7, true).unwrap();
+        assert_eq!(neighbor_tags(&rig).last().copied(), Some((7, 6, 1)));
+        rig.step_at(8, true).unwrap();
+        assert_eq!(neighbor_tags(&rig).last().copied(), Some((8, 7, 1)));
+        rig.step_at(9, true).unwrap();
+        assert_eq!(neighbor_tags(&rig).len(), 3, "round 8 and origin 9 never become a neighbor plan");
     }
 }
