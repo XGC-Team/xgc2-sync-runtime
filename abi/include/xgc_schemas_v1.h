@@ -150,6 +150,81 @@ typedef struct xgc_dmpc_sync_trigger_v1 {
   uint32_t reserved;
 } xgc_dmpc_sync_trigger_v1;
 
+/* --- PX4 flight-controller interface (ctl-px4 <-> ros_io) ----------------
+ * Field for field the MAVROS messages the PX4 controller reads or writes.
+ * On every input, the sample's envelope t_produce is its receive time. */
+
+/* "xgc.fcu_state/1": mavros_msgs/State. */
+typedef struct xgc_fcu_state_v1 {
+  double stamp;
+  uint8_t connected;
+  uint8_t armed;
+  uint8_t guided;
+  uint8_t manual_input;
+  uint8_t system_status;
+  uint8_t reserved[3];
+  char mode[32];          /* NUL-terminated, e.g. "OFFBOARD" */
+} xgc_fcu_state_v1;
+
+/* "xgc.twist/1": geometry_msgs/TwistStamped. */
+typedef struct xgc_twist_v1 {
+  double stamp;
+  double linear[3];
+  double angular[3];
+} xgc_twist_v1;
+
+/* "xgc.battery/1": the sensor_msgs/BatteryState fields the controller reads. */
+typedef struct xgc_battery_v1 {
+  double stamp;
+  double voltage;
+  double percentage;      /* 0..1 */
+} xgc_battery_v1;
+
+/* "xgc.command/1": an operator command string (std_msgs/String on /command). */
+typedef struct xgc_command_v1 {
+  char text[64];          /* NUL-terminated */
+} xgc_command_v1;
+
+/* "xgc.clock/1": replay only; advances a replaying module's clock with no input. */
+typedef struct xgc_clock_v1 {
+  double seconds;
+} xgc_clock_v1;
+
+/* "xgc.position_target/1": mavros_msgs/PositionTarget (local frame). */
+typedef struct xgc_position_target_v1 {
+  double stamp;
+  double position[3];
+  double velocity[3];
+  double acceleration[3];
+  double q_xyzw[4];       /* the controller's attitude target; PX4 uses yaw only */
+  double yaw_rate;
+  uint16_t type_mask;     /* PositionTarget IGNORE_* bits */
+  uint8_t coordinate_frame;
+  uint8_t reserved[5];
+} xgc_position_target_v1;
+
+/* "xgc.body_rate_thrust/1": body rates + normalized thrust
+ * (mavros_msgs/AttitudeTarget with the attitude ignored). */
+typedef struct xgc_body_rate_thrust_v1 {
+  double stamp;
+  double body_rate[3];
+  double thrust;
+} xgc_body_rate_thrust_v1;
+
+/* "xgc.fcu_request/1": a MAVROS service request the edge must make. */
+typedef struct xgc_fcu_request_v1 {
+  double stamp;
+  uint32_t kind;          /* 1 arm/disarm (cmd/command 400), 2 set_mode */
+  uint32_t arm;           /* kind 1: 1 arm, 0 disarm */
+  char mode[32];          /* kind 2: custom mode, NUL-terminated */
+} xgc_fcu_request_v1;
+
+/* "xgc.controller_status/1": the controller's control-region state name. */
+typedef struct xgc_controller_status_v1 {
+  double stamp;
+  char state[48];         /* NUL-terminated */
+} xgc_controller_status_v1;
+
 #ifdef __cplusplus
 #define XGC_SCHEMA_ASSERT static_assert
 #else
@@ -165,6 +240,15 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_rate_cmd_v1) == 104, "xgc_attitude_rate_cm
 XGC_SCHEMA_ASSERT(sizeof(xgc_rigid_state_estimate_v1) == 304, "xgc_rigid_state_estimate_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_assumed_trajectory_v1) == 32, "xgc_dmpc_assumed_trajectory_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_sync_trigger_v1) == 32, "xgc_dmpc_sync_trigger_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_state_v1) == 48, "xgc_fcu_state_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_twist_v1) == 56, "xgc_twist_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_battery_v1) == 24, "xgc_battery_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_command_v1) == 64, "xgc_command_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_clock_v1) == 8, "xgc_clock_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_position_target_v1) == 128, "xgc_position_target_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_body_rate_thrust_v1) == 40, "xgc_body_rate_thrust_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_request_v1) == 48, "xgc_fcu_request_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_controller_status_v1) == 56, "xgc_controller_status_v1");
 
 #ifdef __cplusplus
 }
