@@ -91,3 +91,22 @@ pub fn ctl_dfbc() -> &'static (PathBuf, PathBuf) {
         (lib, reference)
     })
 }
+
+/// Build `libest_rigid_state.so` and its replay reference (needs `$CXX` and
+/// Eigen headers in `$EIGEN_INCLUDE`, default /usr/include/eigen3).
+pub fn est_rigid_state() -> &'static (PathBuf, PathBuf) {
+    static OUT: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    OUT.get_or_init(|| {
+        let root = workspace_root();
+        let out = root.join("target/plugin-tests/cpp");
+        std::fs::create_dir_all(&out).unwrap();
+        let (lib, reference) = (out.join("libest_rigid_state.so"), out.join("eskf_reference"));
+        let status = Command::new(root.join("scripts/build-est-rigid-state.sh"))
+            .arg(&lib)
+            .arg(&reference)
+            .status()
+            .expect("run build-est-rigid-state.sh (needs $CXX and Eigen headers in $EIGEN_INCLUDE)");
+        assert!(status.success(), "building est-rigid-state failed");
+        (lib, reference)
+    })
+}
