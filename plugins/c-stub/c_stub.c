@@ -4,14 +4,18 @@
  *
  * Consumes `cmd` (event) and counts commands; domain FSM `waiting` ->
  * `counting`. Config `fail_after = N` returns XGC_ERR from the Nth step, to
- * exercise the host's restart policy.
+ * exercise the restart policy. `step_sleep_ms = N` makes every step take N ms
+ * and `hang_after = N` blocks the Nth step for 60 s, to exercise the
+ * watchdog.
  *
  * Build: cc -std=c11 -Wall -Wextra -Werror -fPIC -shared \
  *          -I ../../abi/include c_stub.c -o libc_stub.so
  */
+#define _POSIX_C_SOURCE 199309L
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "xgc_rt.h"
 
@@ -30,7 +34,24 @@ typedef struct c_stub {
   unsigned long long commands;
   unsigned long long steps;
   long fail_after; /* 0 = never */
+  long step_sleep_ms;
+  long hang_after; /* 0 = never */
 } c_stub;
+
+static void sleep_ms(long ms) {
+  struct timespec t = { ms / 1000, (ms % 1000) * 1000000L };
+  while (nanosleep(&t, &t) != 0) {}
+}
+
+/* Read `key = N` from the TOML config; 0 when absent, -1 when malformed. */
+static long config_int(const char* config, const char* key) {
+  const char* at = config ? strstr(config, key) : NULL;
+  if (!at) return 0;
+  const char* eq = strchr(at, '=');
+  if (!eq) return -1;
+  long value = strtol(eq + 1, NULL, 10);
+  return value < 0 ? -1 : value;
+}
 
 static void* create(const xgc_host_api* host) {
   c_stub* self = calloc(1, sizeof *self);
@@ -40,13 +61,10 @@ static void* create(const xgc_host_api* host) {
 
 static xgc_status configure(void* p, const char* config) {
   c_stub* self = p;
-  const char* key = config ? strstr(config, "fail_after") : NULL;
-  if (key) {
-    const char* eq = strchr(key, '=');
-    if (!eq) return XGC_ERR_INVALID;
-    self->fail_after = strtol(eq + 1, NULL, 10);
-    if (self->fail_after < 0) return XGC_ERR_INVALID;
-  }
+  self->fail_after = config_int(config, "fail_after");
+  self->step_sleep_ms = config_int(config, "step_sleep_ms");
+  self->hang_after = config_int(config, "hang_after");
+  if (self->fail_after < 0 || self->step_sleep_ms < 0 || self->hang_after < 0) return XGC_ERR_INVALID;
   return XGC_OK;
 }
 
@@ -60,6 +78,8 @@ static xgc_status step(void* p, const xgc_step_ctx* ctx) {
     self->host->log(self->host->host, XGC_LOG_WARN, "c-stub: configured failure");
     return XGC_ERR;
   }
+  if (self->hang_after > 0 && self->steps == (unsigned long long)self->hang_after) sleep_ms(60000);
+  if (self->step_sleep_ms > 0) sleep_ms(self->step_sleep_ms);
   xgc_sample_view view;
   while (self->host->next(self->host->host, PORT_CMD, &view) == XGC_OK) {
     if (view.len < 16) return XGC_ERR;

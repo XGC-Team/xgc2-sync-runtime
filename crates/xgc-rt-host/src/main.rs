@@ -2,7 +2,8 @@
 //!
 //! Runs one node's plugins until `session.run_for_ms` elapses or the process
 //! gets SIGINT or SIGTERM, then prints the run summary as JSON. Exit codes:
-//! 0 all plugins stopped cleanly, 1 a plugin ended in Error, 2 startup failed.
+//! 0 all plugins stopped cleanly, 1 a plugin ended in Error or hung modules
+//! made the aggregator stop early, 2 startup failed.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -69,5 +70,5 @@ fn run() -> Result<bool, String> {
     let host = Host::new(manifest, &base, transport, clock, opts).map_err(|e| e.to_string())?;
     let summary = host.run(&STOP).map_err(|e| e.to_string())?;
     println!("{}", serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?);
-    Ok(summary.plugins.iter().all(|p| p.state != "error" && p.last_error.is_none()))
+    Ok(summary.aborted.is_none() && summary.plugins.iter().all(|p| p.state != "error" && p.last_error.is_none()))
 }

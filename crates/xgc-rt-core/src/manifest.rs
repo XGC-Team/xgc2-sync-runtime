@@ -70,10 +70,18 @@ pub struct SessionSpec {
     /// How long startup waits for remote subscribers on every out-channel.
     #[serde(default = "default_peer_timeout_ms")]
     pub peer_timeout_ms: u64,
+    /// The aggregator stops after this many hung modules were abandoned, so
+    /// the Agent restarts the whole process.
+    #[serde(default = "default_max_abandoned")]
+    pub max_abandoned: u32,
 }
 
 fn default_peer_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_max_abandoned() -> u32 {
+    2
 }
 
 fn default_start_delay_ms() -> u64 {
@@ -199,6 +207,9 @@ pub struct PluginDecl {
     pub trigger: Trigger,
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// Longest normal step. Longer marks the module Degraded; 10× longer is
+    /// a hang. Default: one period.
+    pub step_budget_ms: Option<f64>,
     #[serde(default)]
     pub config: toml::Table,
     #[serde(default)]
@@ -210,8 +221,13 @@ pub struct PluginDecl {
 pub struct Binding {
     pub channel: String,
     /// For an in-port: the origins to receive from. Default: every other
-    /// roster node.
+    /// roster node. This node's own name means the module in this process
+    /// that writes the channel; the handoff is then in memory.
     pub from: Option<Vec<String>>,
+    /// For an in-port: keep only the newest unread sample instead of
+    /// queueing every sample.
+    #[serde(default)]
+    pub latest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,6 +333,9 @@ impl Manifest {
         for p in &self.plugins {
             if !valid_name(&p.name) || !plugin_names.insert(&p.name) {
                 return err(format!("plugin {:?} is invalid or repeated", p.name));
+            }
+            if p.step_budget_ms.is_some_and(|ms| !(ms.is_finite() && ms > 0.0)) {
+                return err(format!("plugin {}: step_budget_ms must be positive", p.name));
             }
             let mut ports = BTreeMap::new();
             for (port, b) in &p.bind {

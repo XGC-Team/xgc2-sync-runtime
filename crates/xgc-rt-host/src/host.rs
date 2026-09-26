@@ -1,34 +1,63 @@
-//! The host executor.
+//! The aggregator: one process that loads the manifest's modules and runs
+//! them on Session rounds.
 //!
 //! **Threads.**
-//! - One executor thread runs every plugin vtable call, so a plugin is never
-//!   called concurrently.
+//! - One thread per module (D9) makes every vtable call of that module, from
+//!   create to destroy, so a slow or blocking module stalls only itself.
+//! - The main thread (`run`) routes frames that arrive over the link into
+//!   module inputs, runs the clock probe and the watchdog, and counts rounds.
 //! - Transport IO threads only run the endpoint sink (stamp, verify, audit,
-//!   enqueue).
-//! - One audit writer thread writes records.
+//!   enqueue). One writer thread appends step records.
 //!
-//! No other thread touches a plugin.
+//! **Handoff inside the process is memory only.** A module's output write
+//! puts one shared, immutable sample (`Arc<Sample>`) into each same-process
+//! reader's input, sets the reader's dirty bit and notifies its thread.
+//! Nothing is encoded, stamped or sent for a same-process hop. An input is a
+//! bounded queue (every sample; full drops the oldest) or, with
+//! `latest = true`, holds only the newest sample: the writer swaps it in and
+//! the reader takes it.
 //!
-//! **Wake rule (dirty loop).** The executor sleeps on the receive queue until
-//! the next round boundary or until a frame arrives, and never busy-polls.
-//! - A plugin with trigger `on_round` steps once per round.
-//! - A plugin with trigger `on_dirty` steps only when one of its in-ports
-//!   got a *new* sample since its last step. Dirty bits are edge-set on
-//!   routing and cleared after each step. Unread samples stay queued but do
-//!   not retrigger.
+//! **The link** (transport) is used only when the roster has other nodes:
+//! outputs are then also sent on it, and frames from other nodes land in the
+//! same inputs, so a module cannot tell a local writer from a remote one.
+//! Only link frames are audited as frames; same-process steps are recorded
+//! in `steps.jsonl` (module, round, start, end, and which samples it read).
 //!
-//! **Soundness.** Plugins call back into their `Slot` through the raw
-//! `host` pointer. The executor therefore holds no Rust reference to a
-//! slot across a vtable call: it copies the function pointer and instance
-//! out, calls, then re-borrows.
+//! **Each step sees one consistent snapshot.** At step start the module
+//! thread takes every sample queued at that moment; `next` reads only from
+//! that snapshot. Samples that arrive during the step wait for the next one,
+//! and samples the step did not read go back to the front of their queue.
+//!
+//! **Wake rule.** A module thread sleeps until its next round boundary (for
+//! `on_round`/`both`), a new sample (for `on_dirty`/`both`), a pending
+//! restart or stop. It never busy-polls.
+//!
+//! **Stop.** Each module thread finishes its current step, deactivates and
+//! destroys its instance. A sample written after its reader stopped is not
+//! read (at most one per hop).
+//!
+//! **Watchdog.** A step longer than the module's budget (`step_budget_ms`,
+//! default one period) marks it Degraded; the next step within budget
+//! recovers it. A step longer than 10× the budget is a hang: a thread can't
+//! be killed safely, so the instance is abandoned (never called again, its
+//! memory left alone) and, if the restart policy allows, a new thread and
+//! instance take over after the backoff. After `session.max_abandoned`
+//! abandons the aggregator stops and reports it, so the Agent restarts the
+//! process.
+//!
+//! **Soundness.** Plugins call back through the raw `host` pointer, which
+//! points at that module thread's `Slot`. Only that thread touches the slot;
+//! the rest of the module's state is behind `Mutex`es and atomics.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -36,8 +65,9 @@ use xgc_rt_abi::*;
 use xgc_rt_audit::{FileAudit, NodeMeta};
 use xgc_rt_core::audit::{AuditSink, OverflowSite};
 use xgc_rt_core::clock::{Clock, ClockDomain, RoundSchedule};
+use xgc_rt_core::envelope::Header;
 use xgc_rt_core::lifecycle::{Event, Lifecycle, State};
-use xgc_rt_core::manifest::{Manifest, RestartKind, Resolved, Trigger};
+use xgc_rt_core::manifest::{Manifest, RestartKind, RestartPolicy, Resolved, Trigger};
 use xgc_rt_core::transport::{Transport, TransportContext};
 use xgc_rt_core::{ChannelId, OriginId};
 
@@ -45,6 +75,10 @@ use crate::endpoint::{Endpoint, RxFrame, DEFAULT_RX_QUEUE};
 use crate::plugin::{self, LoadedPlugin};
 
 pub const INBOX_CAPACITY: usize = 1024;
+/// A step this many budgets long is a hang.
+pub const HANG_FACTOR: u32 = 10;
+/// Upper bound on any sleep, so a stop is noticed.
+const MAX_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub struct HostError(pub String);
@@ -61,41 +95,8 @@ fn herr<T>(m: impl Into<String>) -> Result<T, HostError> {
     Err(HostError(m.into()))
 }
 
-enum PortRuntime {
-    In { channel: ChannelId, origins: Vec<OriginId>, inbox: VecDeque<RxFrame> },
-    Out { channel: ChannelId },
-}
-
-/// Per-plugin state. It is boxed, so `api.host` can point at it for the
-/// plugin's lifetime.
-struct Slot {
-    name: String,
-    node_id: OriginId,
-    lib: LoadedPlugin,
-    trigger: Trigger,
-    restart: xgc_rt_core::manifest::RestartPolicy,
-    config: CString,
-    fsm: Lifecycle,
-    api: XgcHostApi,
-    instance: *mut c_void,
-    ports: Vec<PortRuntime>,
-    dirty: u64,
-    current: Option<RxFrame>,
-    round: u64,
-    endpoint: Arc<Endpoint>,
-    health: Arc<HealthLog>,
-    degrade_request: Option<String>,
-    recover_request: bool,
-    restarts: u32,
-    restart_at: Option<Instant>,
-    steps: u64,
-    published: u64,
-    consumed: u64,
-    last_error: Option<String>,
-}
-
 /// Append-only `health.jsonl`: timings, lifecycle transitions, plugin logs
-/// and faults.
+/// and faults. Any thread may write.
 pub struct HealthLog {
     file: Mutex<Option<File>>,
     clock: Arc<dyn Clock>,
@@ -123,7 +124,278 @@ impl HealthLog {
     }
 }
 
-// --- host API callbacks (executor thread only, inside a vtable call) -------
+/// `steps.jsonl`, written by its own thread so module threads never wait on
+/// the disk.
+struct StepLog {
+    tx: Mutex<mpsc::Sender<Option<String>>>,
+    writer: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl StepLog {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let mut out = BufWriter::new(File::create(path)?);
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let writer = std::thread::Builder::new().name("xgc-steps".into()).spawn(move || {
+            while let Ok(Some(line)) = rx.recv() {
+                let _ = writeln!(out, "{line}");
+            }
+            let _ = out.flush();
+        })?;
+        Ok(Self { tx: Mutex::new(tx), writer: Mutex::new(Some(writer)) })
+    }
+
+    fn sender(&self) -> mpsc::Sender<Option<String>> {
+        self.tx.lock().unwrap().clone()
+    }
+
+    /// Flush and stop, even if abandoned threads still hold senders.
+    fn finish(&self) {
+        let _ = self.tx.lock().unwrap().send(None);
+        if let Some(w) = self.writer.lock().unwrap().take() {
+            let _ = w.join();
+        }
+    }
+}
+
+// --- samples and inputs -----------------------------------------------------
+
+/// One sample in memory, shared by every reader without copying.
+struct Sample {
+    origin: OriginId,
+    seq: u64,
+    round: u64,
+    t_produce: i64,
+    t_tx: i64,
+    t_rx: i64,
+    payload: Vec<u8>,
+    /// Set for frames that came over the link; their first read is audited.
+    link_header: Option<Header>,
+}
+
+impl Sample {
+    fn from_frame(frame: RxFrame) -> Self {
+        let h = frame.header;
+        Self {
+            origin: h.origin,
+            seq: h.seq,
+            round: h.round,
+            t_produce: h.t_produce,
+            t_tx: h.t_tx,
+            t_rx: frame.t_rx,
+            payload: frame.payload,
+            link_header: Some(h),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct InputSpec {
+    channel: ChannelId,
+    origins: Vec<OriginId>,
+    latest: bool,
+}
+
+struct Input {
+    spec: InputSpec,
+    queue: VecDeque<Arc<Sample>>,
+}
+
+struct Inner {
+    /// By port index; `None` for out-ports.
+    inputs: Vec<Option<Input>>,
+    dirty: u64,
+    /// Same-process samples dropped from a full queue.
+    dropped: u64,
+    schedule: Option<RoundSchedule>,
+    stop: bool,
+}
+
+/// One running instance of a module: its thread's inputs and wake signal.
+/// A restart after a hang gets a new one; the abandoned one is left alone.
+struct Instance {
+    inner: Mutex<Inner>,
+    wake: Condvar,
+    /// Monotonic ns (since host start) + 1 when the current vtable call
+    /// began; 0 when the thread is not inside plugin code.
+    call_started: AtomicU64,
+    abandoned: AtomicBool,
+    done: AtomicBool,
+}
+
+impl Instance {
+    fn new(inputs: &[Option<InputSpec>], schedule: Option<RoundSchedule>) -> Arc<Self> {
+        let inputs = inputs.iter().map(|s| s.clone().map(|spec| Input { spec, queue: VecDeque::new() })).collect();
+        Arc::new(Self {
+            inner: Mutex::new(Inner { inputs, dirty: 0, dropped: 0, schedule, stop: false }),
+            wake: Condvar::new(),
+            call_started: AtomicU64::new(0),
+            abandoned: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn deliver(&self, port: u32, sample: Arc<Sample>, audit: &dyn AuditSink, now: i64) {
+        self.deliver_all([(port, sample)], audit, now);
+    }
+
+    /// Put a batch into the inputs under one lock with one notify, so the
+    /// module never steps on half of a batch that arrived together.
+    fn deliver_all(&self, batch: impl IntoIterator<Item = (u32, Arc<Sample>)>, audit: &dyn AuditSink, now: i64) {
+        let mut g = self.inner.lock().unwrap();
+        let mut any = false;
+        for (port, sample) in batch {
+            any |= Self::push(&mut g, port, sample, audit, now);
+        }
+        drop(g);
+        if any {
+            self.wake.notify_one();
+        }
+    }
+
+    fn push(g: &mut Inner, port: u32, sample: Arc<Sample>, audit: &dyn AuditSink, now: i64) -> bool {
+        let Some(Some(input)) = g.inputs.get_mut(port as usize) else { return false };
+        let mut lost = false;
+        if input.spec.latest {
+            input.queue.clear();
+        } else if input.queue.len() >= INBOX_CAPACITY {
+            input.queue.pop_front();
+            lost = true;
+        }
+        let (channel, origin, link) = (input.spec.channel, sample.origin, sample.link_header.is_some());
+        input.queue.push_back(sample);
+        g.dirty |= 1u64 << port;
+        if lost {
+            if link {
+                audit.overflow(OverflowSite::Inbox, channel, origin, now);
+            } else {
+                g.dropped += 1;
+            }
+        }
+        true
+    }
+
+    fn set_schedule(&self, schedule: RoundSchedule) {
+        self.inner.lock().unwrap().schedule = Some(schedule);
+        self.wake.notify_one();
+    }
+
+    fn stop(&self) {
+        self.inner.lock().unwrap().stop = true;
+        self.wake.notify_one();
+    }
+}
+
+// --- modules ----------------------------------------------------------------
+
+struct OutRoute {
+    channel: ChannelId,
+    /// Same-process readers: (module index, in-port).
+    readers: Vec<(usize, u32)>,
+}
+
+#[derive(Default)]
+struct Status {
+    fsm: Lifecycle,
+    restarts: u32,
+    abandons: u32,
+    last_error: Option<String>,
+    domain_state: String,
+    restart_at: Option<Instant>,
+    /// Degraded by the watchdog (overrun), not by the module's request.
+    overrun: bool,
+}
+
+struct Module {
+    name: String,
+    lib: Arc<LoadedPlugin>,
+    trigger: Trigger,
+    restart: RestartPolicy,
+    config: CString,
+    budget: Duration,
+    inputs: Vec<Option<InputSpec>>,
+    outputs: Vec<Option<OutRoute>>,
+    current: RwLock<Arc<Instance>>,
+    status: Mutex<Status>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+    steps: AtomicU64,
+    published: AtomicU64,
+    consumed: AtomicU64,
+}
+
+impl Module {
+    fn instance(&self) -> Arc<Instance> {
+        self.current.read().unwrap().clone()
+    }
+
+    fn hang(&self) -> Duration {
+        self.budget * HANG_FACTOR
+    }
+}
+
+/// Shared by the main thread and every module thread.
+struct Runtime {
+    node_id: OriginId,
+    link: bool,
+    clock: Arc<dyn Clock>,
+    endpoint: Arc<Endpoint>,
+    health: Arc<HealthLog>,
+    steps: StepLog,
+    modules: Vec<Module>,
+    started: Instant,
+}
+
+impl Runtime {
+    fn mono_ns(&self) -> u64 {
+        self.started.elapsed().as_nanos() as u64 + 1
+    }
+
+    fn transition(&self, m: usize, event: Event, detail: Option<&str>) {
+        let mut st = self.modules[m].status.lock().unwrap();
+        self.transition_locked(m, &mut st, event, detail);
+    }
+
+    fn transition_locked(&self, m: usize, st: &mut Status, event: Event, detail: Option<&str>) {
+        let from = st.fsm.state();
+        let name = &self.modules[m].name;
+        match st.fsm.apply(event) {
+            Ok(to) => self.health.event(serde_json::json!({
+                "event": "transition", "plugin": name, "from": from.name(), "to": to.name(), "cause": format!("{event:?}"), "detail": detail,
+            })),
+            Err(e) => self.health.event(serde_json::json!({ "event": "invalid_transition", "plugin": name, "error": e.to_string() })),
+        }
+    }
+
+    /// Fault the module and, if the policy allows, schedule a restart.
+    fn fault(&self, m: usize, what: &str) {
+        let module = &self.modules[m];
+        let mut st = module.status.lock().unwrap();
+        st.last_error = Some(what.to_string());
+        self.transition_locked(m, &mut st, Event::Fault, Some(what));
+        if module.restart.policy == RestartKind::OnError && st.restarts < module.restart.max {
+            st.restart_at = Some(Instant::now() + Duration::from_millis(module.restart.backoff_ms));
+        }
+    }
+}
+
+// --- host API callbacks (the module's own thread, inside a vtable call) ------
+
+/// Per module thread. `api.host` points here.
+struct Slot {
+    rt: Arc<Runtime>,
+    module: usize,
+    instance: Arc<Instance>,
+    api: XgcHostApi,
+    current: Option<Arc<Sample>>,
+    /// This step's snapshot of each input, by port.
+    staged: Vec<VecDeque<Arc<Sample>>>,
+    local_seq: Vec<u64>,
+    /// Samples read during the current step: (port, origin, seq).
+    reads: Vec<(u32, OriginId, u64)>,
+    round: u64,
+    degrade_request: Option<String>,
+    recover_request: bool,
+    steps_tx: mpsc::Sender<Option<String>>,
+}
 
 unsafe fn slot<'a>(host: *mut c_void) -> &'a mut Slot {
     &mut *host.cast::<Slot>()
@@ -131,24 +403,45 @@ unsafe fn slot<'a>(host: *mut c_void) -> &'a mut Slot {
 
 unsafe extern "C" fn api_publish(host: *mut c_void, port: u32, round: u64, data: *const u8, len: u32) -> XgcStatus {
     let s = slot(host);
-    let Some(PortRuntime::Out { channel }) = s.ports.get(port as usize) else {
+    let rt = s.rt.clone();
+    let module = &rt.modules[s.module];
+    let Some(Some(route)) = module.outputs.get(port as usize) else {
         return XGC_ERR_INVALID;
     };
     if len > 0 && data.is_null() {
         return XGC_ERR_INVALID;
     }
     let payload = if len == 0 { &[][..] } else { std::slice::from_raw_parts(data, len as usize) };
-    let t_produce = s.endpoint.clock().now();
-    match s.endpoint.publish(*channel, round, t_produce, payload) {
-        Ok(_) => {
-            s.published += 1;
-            XGC_OK
+    let t_produce = rt.clock.now();
+    let seq = if rt.link {
+        match rt.endpoint.publish(route.channel, round, t_produce, payload) {
+            Ok(header) => header.seq,
+            Err(e) => {
+                rt.health.event(serde_json::json!({ "event": "publish_error", "plugin": module.name, "port": port, "error": e.0 }));
+                return XGC_ERR;
+            }
         }
-        Err(e) => {
-            s.health.event(serde_json::json!({ "event": "publish_error", "plugin": s.name, "port": port, "error": e.0 }));
-            XGC_ERR
+    } else {
+        s.local_seq[port as usize] += 1;
+        s.local_seq[port as usize]
+    };
+    if !route.readers.is_empty() {
+        let sample = Arc::new(Sample {
+            origin: rt.node_id,
+            seq,
+            round,
+            t_produce,
+            t_tx: t_produce,
+            t_rx: t_produce,
+            payload: payload.to_vec(),
+            link_header: None,
+        });
+        for &(reader, in_port) in &route.readers {
+            rt.modules[reader].instance().deliver(in_port, sample.clone(), rt.endpoint.audit().as_ref(), t_produce);
         }
     }
+    module.published.fetch_add(1, Ordering::Relaxed);
+    XGC_OK
 }
 
 unsafe extern "C" fn api_next(host: *mut c_void, port: u32, out: *mut XgcSampleView) -> XgcStatus {
@@ -156,23 +449,26 @@ unsafe extern "C" fn api_next(host: *mut c_void, port: u32, out: *mut XgcSampleV
     if out.is_null() {
         return XGC_ERR_INVALID;
     }
-    let Some(PortRuntime::In { inbox, .. }) = s.ports.get_mut(port as usize) else {
+    if !matches!(s.rt.modules[s.module].inputs.get(port as usize), Some(Some(_))) {
         return XGC_ERR_INVALID;
-    };
-    let Some(frame) = inbox.pop_front() else {
+    }
+    let Some(sample) = s.staged[port as usize].pop_front() else {
         return XGC_ERR_AGAIN;
     };
-    s.endpoint.audit().consumed(&frame.header, s.endpoint.clock().now());
-    s.consumed += 1;
-    let current = s.current.insert(frame);
+    if let Some(header) = &sample.link_header {
+        s.rt.endpoint.audit().consumed(header, s.rt.clock.now());
+    }
+    s.rt.modules[s.module].consumed.fetch_add(1, Ordering::Relaxed);
+    s.reads.push((port, sample.origin, sample.seq));
+    let current = s.current.insert(sample);
     *out = XgcSampleView {
-        origin: current.header.origin,
+        origin: current.origin,
         reserved: 0,
         len: current.payload.len() as u32,
-        seq: current.header.seq,
-        round: current.header.round,
-        t_produce: current.header.t_produce,
-        t_tx: current.header.t_tx,
+        seq: current.seq,
+        round: current.round,
+        t_produce: current.t_produce,
+        t_tx: current.t_tx,
         t_rx: current.t_rx,
         data: current.payload.as_ptr(),
     };
@@ -180,7 +476,7 @@ unsafe extern "C" fn api_next(host: *mut c_void, port: u32, out: *mut XgcSampleV
 }
 
 unsafe extern "C" fn api_now(host: *mut c_void) -> i64 {
-    slot(host).endpoint.clock().now()
+    slot(host).rt.clock.now()
 }
 
 unsafe fn c_text(ptr: *const c_char) -> String {
@@ -199,7 +495,8 @@ unsafe extern "C" fn api_log(host: *mut c_void, level: XgcLogLevel, message: *co
         XGC_LOG_WARN => "warn",
         _ => "error",
     };
-    s.health.event(serde_json::json!({ "event": "log", "plugin": s.name, "level": level, "message": c_text(message) }));
+    let name = &s.rt.modules[s.module].name;
+    s.rt.health.event(serde_json::json!({ "event": "log", "plugin": name, "level": level, "message": c_text(message) }));
 }
 
 unsafe extern "C" fn api_request_degrade(host: *mut c_void, reason: *const c_char) {
@@ -208,30 +505,366 @@ unsafe extern "C" fn api_request_degrade(host: *mut c_void, reason: *const c_cha
     s.recover_request = false;
 }
 
-unsafe extern "C" fn api_port_origins(host: *mut c_void, port: u32, out: *mut u16, cap: u32) -> u32 {
-    let s = slot(host);
-    let Some(PortRuntime::In { origins, .. }) = s.ports.get(port as usize) else {
-        return 0;
-    };
-    if !out.is_null() {
-        for (i, o) in origins.iter().take(cap as usize).enumerate() {
-            *out.add(i) = *o;
-        }
-    }
-    origins.len() as u32
-}
-
-unsafe extern "C" fn api_node_id(host: *mut c_void) -> u16 {
-    slot(host).node_id
-}
-
 unsafe extern "C" fn api_request_recover(host: *mut c_void) {
     let s = slot(host);
     s.recover_request = true;
     s.degrade_request = None;
 }
 
-// --- host -----------------------------------------------------------------
+unsafe extern "C" fn api_port_origins(host: *mut c_void, port: u32, out: *mut u16, cap: u32) -> u32 {
+    let s = slot(host);
+    let Some(Some(spec)) = s.rt.modules[s.module].inputs.get(port as usize) else {
+        return 0;
+    };
+    if !out.is_null() {
+        for (i, o) in spec.origins.iter().take(cap as usize).enumerate() {
+            *out.add(i) = *o;
+        }
+    }
+    spec.origins.len() as u32
+}
+
+unsafe extern "C" fn api_node_id(host: *mut c_void) -> u16 {
+    slot(host).rt.node_id
+}
+
+// --- the module thread ------------------------------------------------------
+
+struct SendPtr(*mut Slot);
+// SAFETY: the slot is created for, and only used by, one module thread.
+unsafe impl Send for SendPtr {}
+
+fn spawn_module(rt: &Arc<Runtime>, m: usize, instance: Arc<Instance>, ready: Option<mpsc::Sender<usize>>) -> Result<(), HostError> {
+    let module = &rt.modules[m];
+    let slot = Box::new(Slot {
+        rt: rt.clone(),
+        module: m,
+        instance,
+        api: XgcHostApi {
+            abi_version: XGC_RT_ABI_VERSION,
+            abi_minor: XGC_RT_ABI_MINOR,
+            host: std::ptr::null_mut(),
+            publish: api_publish,
+            next: api_next,
+            now: api_now,
+            log: api_log,
+            request_degrade: api_request_degrade,
+            request_recover: api_request_recover,
+            port_origins: api_port_origins,
+            node_id: api_node_id,
+        },
+        current: None,
+        staged: vec![VecDeque::new(); module.inputs.len()],
+        local_seq: vec![0; module.outputs.len()],
+        reads: Vec::new(),
+        round: 0,
+        degrade_request: None,
+        recover_request: false,
+        steps_tx: rt.steps.sender(),
+    });
+    let ptr = Box::into_raw(slot);
+    unsafe { (*ptr).api.host = ptr.cast() };
+    let ptr = SendPtr(ptr);
+    let handle = std::thread::Builder::new()
+        .name(format!("xgc-{}", module.name))
+        .spawn(move || {
+            let ptr = ptr;
+            let abandoned = ModuleThread { slot: ptr.0, instance: std::ptr::null_mut() }.run(ready);
+            if !abandoned {
+                // SAFETY: allocated above; no plugin instance refers to it any more.
+                drop(unsafe { Box::from_raw(ptr.0) });
+            }
+            // An abandoned slot is left alone: the stuck instance may still
+            // call back through it.
+        })
+        .map_err(|e| HostError(format!("spawn module thread: {e}")))?;
+    *module.thread.lock().unwrap() = Some(handle);
+    Ok(())
+}
+
+struct ModuleThread {
+    slot: *mut Slot,
+    instance: *mut c_void,
+}
+
+impl ModuleThread {
+    fn s(&self) -> &mut Slot {
+        // SAFETY: only this thread uses the slot, and no reference is held
+        // across a vtable call.
+        unsafe { &mut *self.slot }
+    }
+
+    fn rt(&self) -> Arc<Runtime> {
+        self.s().rt.clone()
+    }
+
+    fn inst(&self) -> Arc<Instance> {
+        self.s().instance.clone()
+    }
+
+    /// Mark the start and end of plugin code, for the watchdog. Returns
+    /// false when the instance was abandoned meanwhile: the caller must then
+    /// never call the plugin again.
+    fn call<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let (rt, inst) = (self.rt(), self.inst());
+        inst.call_started.store(rt.mono_ns(), Ordering::Release);
+        let out = f();
+        inst.call_started.store(0, Ordering::Release);
+        (!inst.abandoned.load(Ordering::Acquire)).then_some(out)
+    }
+
+    /// Run until stop. Returns true when the instance was abandoned.
+    fn run(mut self, ready: Option<mpsc::Sender<usize>>) -> bool {
+        let (rt, inst) = (self.rt(), self.inst());
+        let m = self.s().module;
+        let module = &rt.modules[m];
+        if !self.bring_up() {
+            return true;
+        }
+        if let Some(ready) = ready {
+            let _ = ready.send(m);
+        }
+        let mut last_round = None;
+        let mut activated = false;
+        loop {
+            let schedule = {
+                let g = inst.inner.lock().unwrap();
+                if g.stop {
+                    break;
+                }
+                g.schedule
+            };
+            let now = rt.clock.now();
+            if let Some(k) = schedule.and_then(|s| s.round_at(now)) {
+                let schedule = schedule.unwrap();
+                if !activated {
+                    activated = true;
+                    if !self.activate() {
+                        return true;
+                    }
+                }
+                let restart_due = {
+                    let st = module.status.lock().unwrap();
+                    st.fsm.state() == State::Error && st.restart_at.is_some_and(|t| Instant::now() >= t)
+                };
+                if restart_due && !self.restart_in_place() {
+                    return true;
+                }
+                let advanced = last_round != Some(k);
+                if let Some(p) = last_round.filter(|p| k > p + 1 && module.trigger != Trigger::OnDirty) {
+                    // Woke late (load or a long step): one step for the
+                    // current round; the skipped rounds are recorded.
+                    rt.health.event(serde_json::json!({ "event": "rounds_skipped", "plugin": module.name, "from": p + 1, "to": k - 1 }));
+                }
+                last_round = Some(k);
+                if !self.step(&schedule, k, advanced) {
+                    return true;
+                }
+            }
+            // Sleep until the next boundary, a new sample, a restart or stop.
+            let now = rt.clock.now();
+            let mut timeout = MAX_WAIT;
+            if let Some(s) = schedule {
+                if s.round_at(now).is_none() || module.trigger != Trigger::OnDirty {
+                    timeout = timeout.min(Duration::from_nanos((s.next_boundary_after(now) - now).max(0) as u64));
+                }
+            }
+            if let Some(at) = module.status.lock().unwrap().restart_at {
+                timeout = timeout.min(at.saturating_duration_since(Instant::now()));
+            }
+            let wakes_on_input = module.trigger != Trigger::OnRound;
+            let g = inst.inner.lock().unwrap();
+            let _ = inst
+                .wake
+                .wait_timeout_while(g, timeout, |g| !g.stop && !(wakes_on_input && g.dirty != 0) && g.schedule == schedule)
+                .unwrap();
+        }
+        self.finish()
+    }
+
+    /// create + configure: Unconfigured → Inactive. False when abandoned.
+    fn bring_up(&mut self) -> bool {
+        let rt = self.rt();
+        let m = self.s().module;
+        let (lib, api, config) = {
+            let s = self.s();
+            let module = &s.rt.modules[m];
+            (module.lib.clone(), &s.api as *const XgcHostApi, module.config.as_ptr())
+        };
+        let Some(instance) = self.call(|| unsafe { (lib.vtbl.create)(api) }) else { return false };
+        if instance.is_null() {
+            rt.fault(m, "create returned NULL");
+            return true;
+        }
+        self.instance = instance;
+        let Some(status) = self.call(|| unsafe { (lib.vtbl.configure)(instance, config) }) else { return false };
+        if status == XGC_OK {
+            rt.transition(m, Event::Configure, None);
+        } else {
+            rt.fault(m, &format!("configure returned {status}"));
+        }
+        true
+    }
+
+    fn activate(&mut self) -> bool {
+        let rt = self.rt();
+        let m = self.s().module;
+        if rt.modules[m].status.lock().unwrap().fsm.state() != State::Inactive {
+            return true;
+        }
+        let (f, instance) = (rt.modules[m].lib.vtbl.activate, self.instance);
+        let Some(status) = self.call(|| unsafe { f(instance) }) else { return false };
+        if status == XGC_OK {
+            rt.transition(m, Event::Activate, None);
+        } else {
+            rt.fault(m, &format!("activate returned {status}"));
+        }
+        true
+    }
+
+    fn destroy(&mut self) -> bool {
+        let rt = self.rt();
+        let m = self.s().module;
+        if self.instance.is_null() {
+            return true;
+        }
+        let (f, instance) = (rt.modules[m].lib.vtbl.destroy, self.instance);
+        let alive = self.call(|| unsafe { f(instance) }).is_some();
+        self.instance = std::ptr::null_mut();
+        self.s().current = None;
+        alive
+    }
+
+    fn restart_in_place(&mut self) -> bool {
+        let rt = self.rt();
+        let m = self.s().module;
+        if !self.destroy() {
+            return false;
+        }
+        rt.transition(m, Event::Reset, Some("restart policy"));
+        {
+            let mut st = rt.modules[m].status.lock().unwrap();
+            st.restarts += 1;
+            st.restart_at = None;
+        }
+        self.inst().inner.lock().unwrap().dirty = 0;
+        self.bring_up() && self.activate()
+    }
+
+    fn step(&mut self, schedule: &RoundSchedule, k: u64, advanced: bool) -> bool {
+        let rt = self.rt();
+        let m = self.s().module;
+        let module = &rt.modules[m];
+        if !module.status.lock().unwrap().fsm.state().runs() {
+            return true;
+        }
+        let inst = self.inst();
+        let dirty = {
+            let mut g = inst.inner.lock().unwrap();
+            let run = match module.trigger {
+                Trigger::OnRound => advanced,
+                Trigger::OnDirty => g.dirty != 0,
+                Trigger::Both => advanced || g.dirty != 0,
+            };
+            if !run {
+                return true;
+            }
+            let staged = &mut self.s().staged;
+            for (input, snapshot) in g.inputs.iter_mut().zip(staged.iter_mut()) {
+                if let Some(input) = input {
+                    std::mem::swap(&mut input.queue, snapshot);
+                }
+            }
+            std::mem::take(&mut g.dirty)
+        };
+        let ctx = XgcStepCtx {
+            round: k,
+            now: rt.clock.now(),
+            round_start: schedule.start(k),
+            deadline: schedule.deadline(k),
+            dirty_ports: dirty,
+            round_advanced: u32::from(advanced),
+            reserved: 0,
+        };
+        self.s().round = k;
+        self.s().reads.clear();
+        module.steps.fetch_add(1, Ordering::Relaxed);
+        let (f, instance) = (module.lib.vtbl.step, self.instance);
+        let t0 = rt.clock.now();
+        let began = Instant::now();
+        let Some(status) = self.call(|| unsafe { f(instance, &ctx) }) else { return false };
+        let took = began.elapsed();
+        let t1 = rt.clock.now();
+        {
+            // Unread samples go back in front of anything newer.
+            let mut g = inst.inner.lock().unwrap();
+            for (input, snapshot) in g.inputs.iter_mut().zip(self.s().staged.iter_mut()) {
+                if let (Some(input), false) = (input, snapshot.is_empty()) {
+                    while let Some(sample) = snapshot.pop_back() {
+                        input.queue.push_front(sample);
+                    }
+                }
+            }
+        }
+        let reads: Vec<_> = self.s().reads.iter().map(|&(p, o, q)| [p as u64, o as u64, q]).collect();
+        let _ = self.s().steps_tx.send(Some(serde_json::json!({ "m": module.name, "k": k, "t0": t0, "t1": t1, "in": reads }).to_string()));
+        if status != XGC_OK {
+            rt.fault(m, &format!("step returned {status} in round {k}"));
+            return true;
+        }
+        let (degrade, recover) = {
+            let s = self.s();
+            (s.degrade_request.take(), std::mem::take(&mut s.recover_request))
+        };
+        let mut st = module.status.lock().unwrap();
+        let state = st.fsm.state();
+        if let Some(reason) = degrade {
+            if state == State::Active {
+                st.overrun = false;
+                rt.transition_locked(m, &mut st, Event::Degrade, Some(&reason));
+            }
+        } else if took > module.budget {
+            rt.health.event(serde_json::json!({ "event": "overrun", "plugin": module.name, "round": k, "step_ms": took.as_secs_f64() * 1e3, "budget_ms": module.budget.as_secs_f64() * 1e3 }));
+            if state == State::Active {
+                st.overrun = true;
+                rt.transition_locked(m, &mut st, Event::Degrade, Some("step over budget"));
+            }
+        } else if state == State::Degraded && (recover || st.overrun) {
+            st.overrun = false;
+            rt.transition_locked(m, &mut st, Event::Recover, None);
+        }
+        true
+    }
+
+    /// Orderly stop: running → Inactive, read the domain state, destroy,
+    /// Finalized. Returns true when abandoned.
+    fn finish(mut self) -> bool {
+        let rt = self.rt();
+        let m = self.s().module;
+        let module = &rt.modules[m];
+        if module.status.lock().unwrap().fsm.state().runs() {
+            let (f, instance) = (module.lib.vtbl.deactivate, self.instance);
+            let Some(status) = self.call(|| unsafe { f(instance) }) else { return true };
+            if status == XGC_OK {
+                rt.transition(m, Event::Deactivate, None);
+            } else {
+                rt.fault(m, &format!("deactivate returned {status}"));
+            }
+        }
+        if !self.instance.is_null() {
+            let (f, instance) = (module.lib.vtbl.domain_state, self.instance);
+            let Some(text) = self.call(|| unsafe { c_text(f(instance)) }) else { return true };
+            module.status.lock().unwrap().domain_state = text;
+        }
+        if !self.destroy() {
+            return true;
+        }
+        self.inst().done.store(true, Ordering::Release);
+        false
+    }
+}
+
+// --- host -------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StartupTimings {
@@ -239,7 +872,7 @@ pub struct StartupTimings {
     pub manifest_ms: f64,
     pub plugins_loaded_ms: f64,
     pub ports_ready_ms: f64,
-    /// Every plugin created and configured (on the executor thread).
+    /// Every plugin created and configured (each on its own thread).
     pub configured_ms: f64,
     pub clock_ok_ms: f64,
     pub peers_ready_ms: f64,
@@ -257,7 +890,11 @@ pub struct PluginSummary {
     pub steps: u64,
     pub published: u64,
     pub consumed: u64,
+    /// Same-process samples dropped from this module's full input queues.
+    pub dropped: u64,
     pub restarts: u32,
+    /// Hung instances abandoned by the watchdog.
+    pub abandons: u32,
     pub last_error: Option<String>,
 }
 
@@ -269,31 +906,28 @@ pub struct RunSummary {
     pub e0_ns: i64,
     pub period_ns: i64,
     pub rounds: u64,
-    /// Executor wake-ups: one per round boundary plus one per receive
-    /// burst. It is the idle-cost evidence for the dirty-loop rule.
+    /// Main-thread wake-ups: one per round boundary plus one per receive
+    /// burst. It is the idle-cost evidence for the wake rule.
     pub wakeups: u64,
     pub timings: StartupTimings,
     pub plugins: Vec<PluginSummary>,
+    /// Set when the aggregator stopped early because too many hung modules
+    /// were abandoned.
+    pub aborted: Option<String>,
     pub audit_dir: PathBuf,
 }
 
 pub struct Host {
     manifest: Manifest,
     resolved: Resolved,
-    clock: Arc<dyn Clock>,
-    endpoint: Arc<Endpoint>,
+    rt: Arc<Runtime>,
     audit: Arc<FileAudit>,
-    health: Arc<HealthLog>,
-    slots: Vec<*mut Slot>,
     transport_kind: &'static str,
     timings: StartupTimings,
     started: Instant,
     run_dir: PathBuf,
     clock_service: Option<crate::clock_service::ClockService>,
 }
-
-// SAFETY: slots are only touched by the thread that runs the host.
-unsafe impl Send for Host {}
 
 pub struct HostOptions {
     /// Echo health events to stderr.
@@ -308,9 +942,9 @@ impl Default for HostOptions {
 }
 
 impl Host {
-    /// Load, validate and wire everything up to "ports ready". No plugin
-    /// instance exists yet: `run` creates them on the executor thread. Relative plugin and audit paths resolve against
-    /// `base_dir`, the manifest's directory.
+    /// Load, validate and wire everything. No plugin instance exists yet:
+    /// `run` creates each on its own thread. Relative plugin and audit paths
+    /// resolve against `base_dir`, the manifest's directory.
     pub fn new(
         manifest: Manifest,
         base_dir: &Path,
@@ -323,13 +957,14 @@ impl Host {
         let resolved = manifest.resolve().map_err(|e| HostError(e.0))?;
         timings.manifest_ms = ms_since(started);
         let s = &manifest.session;
+        let node_id = resolved.node_id;
 
         let run_dir = base_dir.join(&manifest.audit.dir);
         let meta = NodeMeta {
             format: String::new(),
             session: s.id.clone(),
             node: s.node.clone(),
-            node_id: resolved.node_id,
+            node_id,
             roster: s.roster.clone(),
             channels: resolved.channels.iter().map(|c| c.name.clone()).collect(),
             clock_domain: match clock.domain() {
@@ -345,6 +980,7 @@ impl Host {
             HealthLog::open(&audit.dir().join("health.jsonl"), clock.clone(), opts.echo_health)
                 .map_err(|e| HostError(format!("health log: {e}")))?,
         );
+        let steps = StepLog::open(&audit.dir().join("steps.jsonl")).map_err(|e| HostError(format!("step log: {e}")))?;
 
         // Load and validate every plugin before opening the transport.
         let mut loaded = Vec::new();
@@ -374,7 +1010,7 @@ impl Host {
             }));
             loaded.push((decl, bindings, lib));
         }
-        // One publisher per channel per node, and one schema per channel.
+        // One writer per channel per node, and one schema per channel.
         let mut writers: BTreeMap<ChannelId, &str> = BTreeMap::new();
         let mut schemas: BTreeMap<ChannelId, (&str, &str)> = BTreeMap::new();
         for (decl, bindings, lib) in &loaded {
@@ -382,7 +1018,7 @@ impl Host {
                 let channel = bindings[&port.name].0;
                 if port.is_out {
                     if let Some(other) = writers.insert(channel, &decl.name) {
-                        return herr(format!("channel {} has two publishers on this node: {other} and {}", resolved.channels[channel as usize].name, decl.name));
+                        return herr(format!("channel {} has two writers on this node: {other} and {}", resolved.channels[channel as usize].name, decl.name));
                     }
                 }
                 if let Some((schema, owner)) = schemas.insert(channel, (&port.schema_id, &decl.name)) {
@@ -397,10 +1033,41 @@ impl Host {
         }
         timings.plugins_loaded_ms = ms_since(started);
 
+        // Same-process wiring: every in-port that lists this node reads the
+        // local writer of its channel from memory.
+        let link = s.roster.len() > 1;
+        let inputs: Vec<Vec<Option<InputSpec>>> = loaded
+            .iter()
+            .map(|(decl, bindings, lib)| {
+                lib.ports
+                    .iter()
+                    .map(|p| {
+                        (!p.is_out).then(|| {
+                            let (channel, origins) = bindings[&p.name].clone();
+                            InputSpec { channel, origins, latest: decl.bind[&p.name].latest }
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let local_readers = |channel: ChannelId| -> Vec<(usize, u32)> {
+            let mut readers = Vec::new();
+            for (j, ports) in inputs.iter().enumerate() {
+                for (q, spec) in ports.iter().enumerate() {
+                    if let Some(spec) = spec {
+                        if spec.channel == channel && spec.origins.contains(&node_id) {
+                            readers.push((j, q as u32));
+                        }
+                    }
+                }
+            }
+            readers
+        };
+
         let ctx = TransportContext {
             session: s.id.clone(),
             node: s.node.clone(),
-            node_id: resolved.node_id,
+            node_id,
             roster: s.roster.clone(),
             channels: resolved.channels.clone(),
         };
@@ -409,83 +1076,62 @@ impl Host {
         let endpoint = Endpoint::open(transport, &ctx, clock.clone(), audit_sink, opts.rx_queue)
             .map_err(|e| HostError(format!("transport {transport_kind}: {e}")))?;
 
+        let mut modules = Vec::new();
         let mut out_channels = BTreeMap::new();
         let mut in_streams: BTreeMap<ChannelId, Vec<OriginId>> = BTreeMap::new();
-        let mut slots = Vec::new();
-        for (decl, bindings, lib) in loaded {
-            let ports = lib
+        for ((decl, bindings, lib), inputs) in loaded.into_iter().zip(inputs.iter().cloned()) {
+            let outputs = lib
                 .ports
                 .iter()
                 .map(|p| {
-                    let (channel, origins) = bindings[&p.name].clone();
-                    if p.is_out {
+                    p.is_out.then(|| {
+                        let channel = bindings[&p.name].0;
                         out_channels.insert(channel, ());
-                        PortRuntime::Out { channel }
-                    } else {
-                        let set = in_streams.entry(channel).or_default();
-                        for o in &origins {
-                            if !set.contains(o) {
-                                set.push(*o);
-                            }
-                        }
-                        PortRuntime::In { channel, origins, inbox: VecDeque::new() }
-                    }
+                        OutRoute { channel, readers: local_readers(channel) }
+                    })
                 })
                 .collect();
+            for spec in inputs.iter().flatten() {
+                let set = in_streams.entry(spec.channel).or_default();
+                for o in spec.origins.iter().filter(|o| **o != node_id) {
+                    if !set.contains(o) {
+                        set.push(*o);
+                    }
+                }
+            }
             let config = toml::to_string(&decl.config).map_err(|e| HostError(format!("plugin {} config: {e}", decl.name)))?;
-            let slot = Box::new(Slot {
+            let budget = decl.step_budget_ms.map_or(Duration::from_nanos(resolved.period_ns as u64), |ms| Duration::from_secs_f64(ms / 1e3));
+            modules.push(Module {
                 name: decl.name.clone(),
-                lib,
+                lib: Arc::new(lib),
                 trigger: decl.trigger,
                 restart: decl.restart,
                 config: CString::new(config).map_err(|_| HostError(format!("plugin {} config has NUL", decl.name)))?,
-                fsm: Lifecycle::default(),
-                api: XgcHostApi {
-                    abi_version: XGC_RT_ABI_VERSION,
-                    abi_minor: XGC_RT_ABI_MINOR,
-                    host: std::ptr::null_mut(),
-                    publish: api_publish,
-                    next: api_next,
-                    now: api_now,
-                    log: api_log,
-                    request_degrade: api_request_degrade,
-                    request_recover: api_request_recover,
-                    port_origins: api_port_origins,
-                    node_id: api_node_id,
-                },
-                node_id: resolved.node_id,
-                instance: std::ptr::null_mut(),
-                ports,
-                dirty: 0,
-                current: None,
-                round: 0,
-                endpoint: endpoint.clone(),
-                health: health.clone(),
-                degrade_request: None,
-                recover_request: false,
-                restarts: 0,
-                restart_at: None,
-                steps: 0,
-                published: 0,
-                consumed: 0,
-                last_error: None,
+                budget,
+                current: RwLock::new(Instance::new(&inputs, None)),
+                inputs,
+                outputs,
+                status: Mutex::new(Status::default()),
+                thread: Mutex::new(None),
+                steps: AtomicU64::new(0),
+                published: AtomicU64::new(0),
+                consumed: AtomicU64::new(0),
             });
-            let ptr = Box::into_raw(slot);
-            unsafe { (*ptr).api.host = ptr.cast() };
-            slots.push(ptr);
         }
-        for channel in out_channels.keys() {
-            endpoint.declare_out(*channel).map_err(|e| HostError(e.0))?;
-        }
-        for (channel, origins) in &in_streams {
-            endpoint.declare_in(*channel, origins).map_err(|e| HostError(e.0))?;
+        if link {
+            for channel in out_channels.keys() {
+                endpoint.declare_out(*channel).map_err(|e| HostError(e.0))?;
+            }
+            for (channel, origins) in in_streams.iter().filter(|(_, o)| !o.is_empty()) {
+                endpoint.declare_in(*channel, origins).map_err(|e| HostError(e.0))?;
+            }
         }
         let clock_service = match resolved.clock.clone() {
             None => None,
             Some(spec) => Some(
                 crate::clock_service::ClockService::new(
                     spec,
-                    resolved.node_id,
+                    node_id,
                     manifest.session.roster.len(),
                     endpoint.clone(),
                     &audit.dir().join("clock.jsonl"),
@@ -495,326 +1141,270 @@ impl Host {
         };
         timings.ports_ready_ms = ms_since(started);
 
-        let host = Self {
-            manifest,
-            resolved,
-            clock,
-            endpoint,
-            audit,
-            health,
-            slots,
-            transport_kind,
-            timings,
-            started,
-            run_dir,
-            clock_service,
-        };
-        // Plugins are created and configured in `run`, on the executor
-        // thread: the ABI promises every vtable call happens there, and
-        // wrapped code (e.g. libxgc2-state-machine) enforces thread ownership.
-        Ok(host)
+        let rt = Arc::new(Runtime { node_id, link, clock, endpoint, health, steps, modules, started });
+        Ok(Self { manifest, resolved, rt, audit, transport_kind, timings, started, run_dir, clock_service })
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn slot(&self, i: usize) -> &mut Slot {
-        let ptr = self.slots[i];
-        // SAFETY: executor thread only, and never held across a vtable call.
-        unsafe { &mut *ptr }
-    }
-
-    fn transition(&self, i: usize, event: Event, detail: Option<&str>) {
-        let s = self.slot(i);
-        let from = s.fsm.state();
-        match s.fsm.apply(event) {
-            Ok(to) => self.health.event(serde_json::json!({
-                "event": "transition", "plugin": s.name, "from": from.name(), "to": to.name(), "cause": format!("{event:?}"), "detail": detail,
-            })),
-            Err(e) => self.health.event(serde_json::json!({ "event": "invalid_transition", "plugin": s.name, "error": e.to_string() })),
-        }
-    }
-
-    fn fault(&self, i: usize, what: &str) {
-        let s = self.slot(i);
-        s.last_error = Some(what.to_string());
-        self.transition(i, Event::Fault, Some(what));
-        let s = self.slot(i);
-        if s.restart.policy == RestartKind::OnError && s.restarts < s.restart.max {
-            s.restart_at = Some(Instant::now() + Duration::from_millis(s.restart.backoff_ms));
-        }
-    }
-
-    /// create + configure: Unconfigured → Inactive.
-    fn bring_up(&self, i: usize) -> Result<(), HostError> {
-        let (create, configure, api, config) = {
-            let s = self.slot(i);
-            (s.lib.vtbl.create, s.lib.vtbl.configure, &s.api as *const XgcHostApi, s.config.as_ptr())
-        };
-        let instance = unsafe { create(api) };
-        if instance.is_null() {
-            self.fault(i, "create returned NULL");
-            return Ok(());
-        }
-        self.slot(i).instance = instance;
-        let status = unsafe { configure(instance, config) };
-        if status == XGC_OK {
-            self.transition(i, Event::Configure, None);
-        } else {
-            self.fault(i, &format!("configure returned {status}"));
-        }
-        Ok(())
-    }
-
-    fn activate(&self, i: usize) {
-        if self.slot(i).fsm.state() != State::Inactive {
-            return;
-        }
-        let (f, instance) = (self.slot(i).lib.vtbl.activate, self.slot(i).instance);
-        let status = unsafe { f(instance) };
-        if status == XGC_OK {
-            self.transition(i, Event::Activate, None);
-        } else {
-            self.fault(i, &format!("activate returned {status}"));
-        }
-    }
-
-    fn destroy_instance(&self, i: usize) {
-        let (f, instance) = (self.slot(i).lib.vtbl.destroy, self.slot(i).instance);
-        if !instance.is_null() {
-            unsafe { f(instance) };
-            let s = self.slot(i);
-            s.instance = std::ptr::null_mut();
-            s.current = None;
-        }
-    }
-
-    fn restart(&self, i: usize) {
-        self.destroy_instance(i);
-        self.transition(i, Event::Reset, Some("restart policy"));
-        {
-            let s = self.slot(i);
-            s.restarts += 1;
-            s.restart_at = None;
-            s.dirty = 0;
-        }
-        let _ = self.bring_up(i);
-        self.activate(i);
-    }
-
+    /// Deliver link frames to every input that listens for their channel
+    /// and origin.
     fn route(&mut self, frames: Vec<RxFrame>) {
+        let rt = &self.rt;
+        let mut batches: Vec<Vec<(u32, Arc<Sample>)>> = vec![Vec::new(); rt.modules.len()];
         for frame in frames {
             if let Some(cs) = self.clock_service.as_mut() {
                 if cs.on_frame(&frame) {
                     continue;
                 }
             }
-            for i in 0..self.slots.len() {
-                let s = self.slot(i);
-                for (p, port) in s.ports.iter_mut().enumerate() {
-                    if let PortRuntime::In { channel, origins, inbox } = port {
-                        if *channel == frame.header.channel && origins.contains(&frame.header.origin) {
-                            if inbox.len() >= INBOX_CAPACITY {
-                                inbox.pop_front();
-                                self.endpoint.audit().overflow(OverflowSite::Inbox, *channel, frame.header.origin, self.clock.now());
-                            }
-                            inbox.push_back(frame.clone());
-                            s.dirty |= 1u64 << p;
-                        }
+            let (channel, origin) = (frame.header.channel, frame.header.origin);
+            let sample = Arc::new(Sample::from_frame(frame));
+            for (m, module) in rt.modules.iter().enumerate() {
+                for (q, spec) in module.inputs.iter().enumerate() {
+                    if spec.as_ref().is_some_and(|s| s.channel == channel && s.origins.contains(&origin)) {
+                        batches[m].push((q as u32, sample.clone()));
                     }
                 }
             }
         }
+        let now = rt.clock.now();
+        for (module, batch) in rt.modules.iter().zip(batches).filter(|(_, b)| !b.is_empty()) {
+            module.instance().deliver_all(batch, rt.endpoint.audit().as_ref(), now);
+        }
     }
 
-    fn step(&self, i: usize, schedule: &RoundSchedule, k: u64, advanced: bool) {
-        let (f, instance, ctx) = {
-            let s = self.slot(i);
-            let run = match s.trigger {
-                Trigger::OnRound => advanced,
-                Trigger::OnDirty => s.dirty != 0,
-                Trigger::Both => advanced || s.dirty != 0,
-            };
-            if !run || !s.fsm.state().runs() {
-                return;
+    /// Abandon hung instances, start replacements whose backoff passed, and
+    /// return when to look again. Sets `aborted` past the abandon limit.
+    fn watchdog(&self, schedule: Option<RoundSchedule>, abandoned: &mut u32, aborted: &mut Option<String>) -> Option<Instant> {
+        let rt = &self.rt;
+        let now_mono = rt.mono_ns();
+        let mut next: Option<Instant> = None;
+        for (m, module) in rt.modules.iter().enumerate() {
+            let inst = module.instance();
+            let started = inst.call_started.load(Ordering::Acquire);
+            if started != 0 && !inst.abandoned.load(Ordering::Acquire) {
+                let hang = module.hang().as_nanos() as u64;
+                let busy = now_mono.saturating_sub(started);
+                if busy <= hang {
+                    let at = Instant::now() + Duration::from_nanos(hang - busy + 1);
+                    next = Some(next.map_or(at, |n| n.min(at)));
+                    continue;
+                }
+                inst.abandoned.store(true, Ordering::Release);
+                *abandoned += 1;
+                {
+                    let mut st = module.status.lock().unwrap();
+                    st.abandons += 1;
+                }
+                rt.health.event(serde_json::json!({ "event": "abandoned", "plugin": module.name, "busy_ms": busy as f64 / 1e6, "hang_ms": hang as f64 / 1e6 }));
+                rt.fault(m, &format!("hung for more than {} ms; instance abandoned", module.hang().as_millis()));
+                if *abandoned >= self.manifest.session.max_abandoned && aborted.is_none() {
+                    *aborted = Some(format!("{abandoned} hung module instance(s) abandoned"));
+                }
             }
-            s.round = k;
-            let ctx = XgcStepCtx {
-                round: k,
-                now: self.clock.now(),
-                round_start: schedule.start(k),
-                deadline: schedule.deadline(k),
-                dirty_ports: s.dirty,
-                round_advanced: u32::from(advanced),
-                reserved: 0,
-            };
-            s.dirty = 0;
-            s.steps += 1;
-            (s.lib.vtbl.step, s.instance, ctx)
-        };
-        let status = unsafe { f(instance, &ctx) };
-        if status != XGC_OK {
-            self.fault(i, &format!("step returned {status} in round {k}"));
-            return;
+            // A replacement for an abandoned instance, once the backoff passed.
+            if inst.abandoned.load(Ordering::Acquire) && aborted.is_none() {
+                let due = module.status.lock().unwrap().restart_at;
+                match due {
+                    Some(at) if Instant::now() >= at => {
+                        let fresh = Instance::new(&module.inputs, schedule);
+                        *module.current.write().unwrap() = fresh.clone();
+                        {
+                            let mut st = module.status.lock().unwrap();
+                            st.restarts += 1;
+                            st.restart_at = None;
+                        }
+                        rt.transition(m, Event::Reset, Some("replace abandoned instance"));
+                        if let Err(e) = spawn_module(rt, m, fresh, None) {
+                            rt.fault(m, &e.0);
+                        }
+                    }
+                    Some(at) => next = Some(next.map_or(at, |n| n.min(at))),
+                    None => {}
+                }
+            }
         }
-        let (degrade, recover, state) = {
-            let s = self.slot(i);
-            (s.degrade_request.take(), std::mem::take(&mut s.recover_request), s.fsm.state())
-        };
-        match (degrade, recover, state) {
-            (Some(reason), _, State::Active) => self.transition(i, Event::Degrade, Some(&reason)),
-            (None, true, State::Degraded) => self.transition(i, Event::Recover, None),
-            _ => {}
-        }
+        next
     }
 
-    /// Run until `stop` is set or `session.run_for_ms` after E0 elapses.
+    /// Run until `stop` is set, `session.run_for_ms` after E0 elapses, or
+    /// too many hung modules were abandoned.
     pub fn run(mut self, stop: &AtomicBool) -> Result<RunSummary, HostError> {
-        for i in 0..self.slots.len() {
-            self.bring_up(i)?;
+        let rt = self.rt.clone();
+        let mut abandoned = 0u32;
+        let mut aborted = None;
+
+        // Start one thread per module; each creates and configures its own
+        // instance. Wait for all, watching for hangs in create/configure.
+        let (ready_tx, ready_rx) = mpsc::channel();
+        for m in 0..rt.modules.len() {
+            spawn_module(&rt, m, rt.modules[m].instance(), Some(ready_tx.clone()))?;
+        }
+        drop(ready_tx);
+        let mut pending = rt.modules.len();
+        while pending > 0 {
+            match ready_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(_) => pending -= 1,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let before = abandoned;
+                    self.watchdog(None, &mut abandoned, &mut aborted);
+                    pending -= (abandoned - before) as usize;
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
         }
         self.timings.configured_ms = ms_since(self.started);
+
         // Clock gate: a probe client waits until the bound is within the gate
         // (at least 3 samples), probing every 100 ms. On timeout it runs on
         // with frames flagged CLOCK_DEGRADED, and the health log says so.
         if let Some(timeout) = self.clock_service.as_ref().filter(|c| c.is_client()).map(|c| c.gate_timeout()) {
             let deadline = Instant::now() + timeout;
             loop {
-                let frames = self.endpoint.drain();
+                let frames = rt.endpoint.drain();
                 self.route(frames);
                 let cs = self.clock_service.as_mut().unwrap();
                 if cs.within_gate() || Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
                     break;
                 }
                 cs.tick(true);
-                self.endpoint.wait(Duration::from_millis(20));
+                rt.endpoint.wait(Duration::from_millis(20));
             }
             let cs = self.clock_service.as_ref().unwrap();
             let estimate = cs.estimate();
             if cs.within_gate() {
-                self.health.event(serde_json::json!({ "event": "clock_gate_passed", "estimate": format!("{estimate:?}") }));
+                rt.health.event(serde_json::json!({ "event": "clock_gate_passed", "estimate": format!("{estimate:?}") }));
             } else {
-                self.endpoint.set_clock_degraded(true);
-                self.health.event(serde_json::json!({ "event": "clock_gate_timeout", "estimate": format!("{estimate:?}") }));
+                rt.endpoint.set_clock_degraded(true);
+                rt.health.event(serde_json::json!({ "event": "clock_gate_timeout", "estimate": format!("{estimate:?}") }));
             }
         }
         self.timings.clock_ok_ms = ms_since(self.started);
         // Peers: every out-channel has a matching subscriber, or the timeout
-        // passes. The host then runs Degraded-by-evidence: the audit shows
-        // the loss.
-        let ready = self.endpoint.wait_ready(Duration::from_millis(self.manifest.session.peer_timeout_ms));
+        // passes. The aggregator then runs Degraded-by-evidence: the audit
+        // shows the loss.
+        let ready = !rt.link || rt.endpoint.wait_ready(Duration::from_millis(self.manifest.session.peer_timeout_ms));
         self.timings.peers_ready_ms = ms_since(self.started);
         if !ready {
-            self.health.event(serde_json::json!({ "event": "peers_timeout", "after_ms": self.timings.peers_ready_ms }));
+            rt.health.event(serde_json::json!({ "event": "peers_timeout", "after_ms": self.timings.peers_ready_ms }));
         }
-        self.health.event(serde_json::json!({ "event": "startup", "timings": self.timings }));
+        rt.health.event(serde_json::json!({ "event": "startup", "timings": self.timings }));
 
         let s = &self.manifest.session;
-        let e0 = s.epoch_ns.unwrap_or_else(|| self.clock.now() + (s.start_delay_ms as i64) * 1_000_000);
+        let e0 = s.epoch_ns.unwrap_or_else(|| rt.clock.now() + (s.start_delay_ms as i64) * 1_000_000);
         let schedule = RoundSchedule::new(e0, self.resolved.period_ns, self.resolved.publish_deadline_ns);
         let stop_at = s.run_for_ms.map(|ms| e0 + (ms as i64) * 1_000_000);
-        self.health.event(serde_json::json!({ "event": "epoch", "e0": e0, "period_ns": schedule.period }));
+        rt.health.event(serde_json::json!({ "event": "epoch", "e0": e0, "period_ns": schedule.period }));
+        for module in &rt.modules {
+            module.instance().set_schedule(schedule);
+        }
 
         let mut last_round: Option<u64> = None;
         let mut rounds = 0u64;
         let mut wakeups = 0u64;
-        let mut activated = false;
         loop {
-            let now = self.clock.now();
-            if stop.load(Ordering::Relaxed) || stop_at.is_some_and(|t| now >= t) {
+            let now = rt.clock.now();
+            if stop.load(Ordering::Relaxed) || stop_at.is_some_and(|t| now >= t) || aborted.is_some() {
                 break;
             }
-            let frames = self.endpoint.drain();
+            let frames = rt.endpoint.drain();
             self.route(frames);
             if let Some(cs) = self.clock_service.as_mut() {
                 cs.tick(false);
             }
             if let Some(k) = schedule.round_at(now) {
-                if !activated {
-                    for i in 0..self.slots.len() {
-                        self.activate(i);
-                    }
-                    activated = true;
+                if last_round.is_none() {
                     self.timings.first_round_ms = ms_since(self.started);
-                    self.health.event(serde_json::json!({ "event": "first_round", "first_round_ms": self.timings.first_round_ms }));
+                    rt.health.event(serde_json::json!({ "event": "first_round", "first_round_ms": self.timings.first_round_ms }));
                 }
-                let advanced = last_round != Some(k);
-                if advanced {
+                if last_round != Some(k) {
                     rounds += 1;
                     last_round = Some(k);
                 }
-                for i in 0..self.slots.len() {
-                    self.step(i, &schedule, k, advanced);
-                }
-                for i in 0..self.slots.len() {
-                    let due = self.slot(i).fsm.state() == State::Error && self.slot(i).restart_at.is_some_and(|t| Instant::now() >= t);
-                    if due {
-                        self.restart(i);
-                    }
-                }
             }
-            // Sleep until the next boundary, a pending restart, the stop
-            // time, or a received frame.
-            let now = self.clock.now();
+            let watch = self.watchdog(Some(schedule), &mut abandoned, &mut aborted);
+            // Sleep until the next boundary, the stop time, a watchdog or
+            // probe deadline, or a received frame.
+            let now = rt.clock.now();
             let mut wake = schedule.next_boundary_after(now);
             if let Some(t) = stop_at {
                 wake = wake.min(t);
             }
             let mut timeout = Duration::from_nanos((wake - now).max(0) as u64);
-            for i in 0..self.slots.len() {
-                if let Some(at) = self.slot(i).restart_at {
-                    timeout = timeout.min(at.saturating_duration_since(Instant::now()));
-                }
-            }
-            if let Some(at) = self.clock_service.as_ref().and_then(|c| c.next_due()) {
+            for at in watch.into_iter().chain(self.clock_service.as_ref().and_then(|c| c.next_due())) {
                 timeout = timeout.min(at.saturating_duration_since(Instant::now()));
             }
-            // Wake at least every 100 ms so a stop signal is noticed.
-            self.endpoint.wait(timeout.min(Duration::from_millis(100)));
+            rt.endpoint.wait(timeout.min(MAX_WAIT));
             wakeups += 1;
         }
+        if let Some(reason) = &aborted {
+            rt.health.event(serde_json::json!({ "event": "aborted", "reason": reason }));
+        }
 
-        // Orderly stop: running → Inactive → Finalized, then destroy.
-        for i in 0..self.slots.len() {
-            if self.slot(i).fsm.state().runs() {
-                let (f, instance) = (self.slot(i).lib.vtbl.deactivate, self.slot(i).instance);
-                let status = unsafe { f(instance) };
-                if status == XGC_OK {
-                    self.transition(i, Event::Deactivate, None);
-                } else {
-                    self.fault(i, &format!("deactivate returned {status}"));
+        // Orderly stop: every module thread deactivates, reads its domain
+        // state and destroys its instance. A module still inside plugin code
+        // after its hang time is abandoned.
+        for module in &rt.modules {
+            module.instance().stop();
+        }
+        loop {
+            let mut waiting = false;
+            let now_mono = rt.mono_ns();
+            for (m, module) in rt.modules.iter().enumerate() {
+                let inst = module.instance();
+                if inst.done.load(Ordering::Acquire) || inst.abandoned.load(Ordering::Acquire) {
+                    continue;
                 }
+                let started = inst.call_started.load(Ordering::Acquire);
+                if started != 0 && now_mono.saturating_sub(started) > module.hang().as_nanos() as u64 {
+                    inst.abandoned.store(true, Ordering::Release);
+                    module.status.lock().unwrap().abandons += 1;
+                    rt.fault(m, "hung at stop; instance abandoned");
+                    continue;
+                }
+                let finished = module.thread.lock().unwrap().as_ref().map_or(true, |h| h.is_finished());
+                waiting |= !finished;
+            }
+            if !waiting {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for module in &rt.modules {
+            let handle = module.thread.lock().unwrap().take();
+            if let Some(h) = handle.filter(|h| h.is_finished()) {
+                let _ = h.join();
             }
         }
-        let plugins = (0..self.slots.len())
-            .map(|i| {
-                let domain_state = {
-                    let (f, instance) = (self.slot(i).lib.vtbl.domain_state, self.slot(i).instance);
-                    if instance.is_null() {
-                        String::new()
-                    } else {
-                        unsafe { c_text(f(instance)) }
-                    }
-                };
-                let s = self.slot(i);
+
+        let plugins = rt
+            .modules
+            .iter()
+            .map(|module| {
+                let st = module.status.lock().unwrap();
                 PluginSummary {
-                    name: s.name.clone(),
-                    library: s.lib.name.clone(),
-                    version: s.lib.version.clone(),
-                    sha256: s.lib.sha256.clone(),
-                    state: s.fsm.state().name().into(),
-                    domain_state,
-                    steps: s.steps,
-                    published: s.published,
-                    consumed: s.consumed,
-                    restarts: s.restarts,
-                    last_error: s.last_error.clone(),
+                    name: module.name.clone(),
+                    library: module.lib.name.clone(),
+                    version: module.lib.version.clone(),
+                    sha256: module.lib.sha256.clone(),
+                    state: st.fsm.state().name().into(),
+                    domain_state: st.domain_state.clone(),
+                    steps: module.steps.load(Ordering::Relaxed),
+                    published: module.published.load(Ordering::Relaxed),
+                    consumed: module.consumed.load(Ordering::Relaxed),
+                    dropped: module.instance().inner.lock().unwrap().dropped,
+                    restarts: st.restarts,
+                    abandons: st.abandons,
+                    last_error: st.last_error.clone(),
                 }
             })
             .collect();
-        for i in 0..self.slots.len() {
-            self.destroy_instance(i);
-            let _ = self.slot(i).fsm.apply(Event::Shutdown);
+        for module in rt.modules.iter().filter(|m| m.instance().done.load(Ordering::Acquire)) {
+            let _ = module.status.lock().unwrap().fsm.apply(Event::Shutdown);
         }
-        self.endpoint.close();
+        rt.endpoint.close();
         let summary = RunSummary {
             session: self.manifest.session.id.clone(),
             node: self.manifest.session.node.clone(),
@@ -825,23 +1415,13 @@ impl Host {
             wakeups,
             timings: self.timings.clone(),
             plugins,
+            aborted,
             audit_dir: self.run_dir.clone(),
         };
-        self.health.event(serde_json::json!({ "event": "stopped", "rounds": rounds, "wakeups": wakeups }));
+        rt.health.event(serde_json::json!({ "event": "stopped", "rounds": rounds, "wakeups": wakeups }));
+        rt.steps.finish();
         self.audit.finish().map_err(|e| HostError(format!("audit: {e}")))?;
         Ok(summary)
-    }
-}
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        for i in 0..self.slots.len() {
-            self.destroy_instance(i);
-        }
-        for ptr in self.slots.drain(..) {
-            // SAFETY: allocated by Box::into_raw in `new`, and freed once.
-            drop(unsafe { Box::from_raw(ptr) });
-        }
     }
 }
 
