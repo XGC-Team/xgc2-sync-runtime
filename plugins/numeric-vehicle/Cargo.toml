@@ -1,0 +1,23 @@
+[package]
+name = "numeric-vehicle"
+description = "Actuator-free HIL world-ENU double-integrator vehicle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+xgc-rt-abi.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+xgc-rt-host = { path = "../../crates/xgc-rt-host" }
+xgc-rt-core.workspace = true
+xgc-rt-transport-loopback.workspace = true
+libloading.workspace = true
+serde_json.workspace = true

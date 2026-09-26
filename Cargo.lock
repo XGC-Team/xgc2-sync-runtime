@@ -1148,6 +1148,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "numeric-vehicle"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+ "xgc-rt-abi",
+ "xgc-rt-core",
+ "xgc-rt-host",
+ "xgc-rt-transport-loopback",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
