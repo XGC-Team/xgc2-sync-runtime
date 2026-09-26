@@ -190,13 +190,14 @@ typedef struct xgc_clock_v1 {
   double seconds;
 } xgc_clock_v1;
 
-/* "xgc.position_target/1": mavros_msgs/PositionTarget (local frame). */
+/* "xgc.position_target/1": mavros_msgs/PositionTarget (local frame): the
+ * controller's setpoint out, and a planner's setpoint in. */
 typedef struct xgc_position_target_v1 {
   double stamp;
   double position[3];
   double velocity[3];
   double acceleration[3];
-  double q_xyzw[4];       /* the controller's attitude target; PX4 uses yaw only */
+  double yaw;             /* rad; as PositionTarget.yaw */
   double yaw_rate;
   uint16_t type_mask;     /* PositionTarget IGNORE_* bits */
   uint8_t coordinate_frame;
@@ -245,7 +246,7 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_twist_v1) == 56, "xgc_twist_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_battery_v1) == 24, "xgc_battery_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_command_v1) == 64, "xgc_command_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_clock_v1) == 8, "xgc_clock_v1");
-XGC_SCHEMA_ASSERT(sizeof(xgc_position_target_v1) == 128, "xgc_position_target_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_position_target_v1) == 104, "xgc_position_target_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_body_rate_thrust_v1) == 40, "xgc_body_rate_thrust_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_request_v1) == 48, "xgc_fcu_request_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_controller_status_v1) == 56, "xgc_controller_status_v1");

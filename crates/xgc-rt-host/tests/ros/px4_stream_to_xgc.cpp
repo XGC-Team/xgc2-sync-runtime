@@ -17,6 +17,7 @@
 
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
+#include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/State.h>
 #include <rigid_state_estimator_msgs/RigidStateEstimate.h>
 #include <ros/serialization.h>
@@ -148,6 +149,26 @@ int main(int argc, char** argv) {
         emit(t, 7, &c, sizeof c);
         break;
       }
+      case 9: {  // planner setpoint -> alg_setpoint (port 14)
+        const auto m = decode<mavros_msgs::PositionTarget>(d);
+        xgc_position_target_v1 s{};
+        s.stamp = m.header.stamp.toSec();
+        s.position[0] = m.position.x; s.position[1] = m.position.y; s.position[2] = m.position.z;
+        s.velocity[0] = m.velocity.x; s.velocity[1] = m.velocity.y; s.velocity[2] = m.velocity.z;
+        s.acceleration[0] = m.acceleration_or_force.x; s.acceleration[1] = m.acceleration_or_force.y;
+        s.acceleration[2] = m.acceleration_or_force.z;
+        s.yaw = m.yaw;
+        s.yaw_rate = m.yaw_rate;
+        s.type_mask = m.type_mask;
+        s.coordinate_frame = m.coordinate_frame;
+        emit(t, 14, &s, sizeof s);
+        break;
+      }
+      case 10:
+        // Hover-thrust records come from a hover_thrust_estimator node; no
+        // recorded flight carries them yet (ctl-px4 takes them from the
+        // est-hover-thrust module in process).
+        throw std::runtime_error("record kind 10 (hover thrust) is not converted");
       default:
         throw std::runtime_error("unknown record kind");
     }

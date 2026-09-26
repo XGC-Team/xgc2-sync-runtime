@@ -6,6 +6,9 @@
 //! -> /uav1/mavros/vision_pose/pose -> stand-in PX4 local position ->
 //! controller -> /uav1/mavros/setpoint_raw/local -> stand-in PX4 -> plant.
 //!
+//! The flight: takeoff, Hover, the planner path (Custom1: a 10 Hz planner
+//! setpoint on /uav1/alg/setpoint_raw/local moving +x 1.5 m), Hover, land.
+//!
 //! Needs ROS_PREFIX (ROS Noetic) and XGC2_WS (a catkin workspace where
 //! px4_multirotor_controller is built, e.g. from a copy of the product
 //! package). Without them the test prints why and passes.
@@ -141,6 +144,7 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
                 "/command",
                 "/uav1/custom/statustext",
                 "/uav1/mavros/setpoint_raw/local",
+                "/uav1/alg/setpoint_raw/local",
             ]);
             c.env("ROS_HOME", &ros_home).env("ROS_MASTER_URI", &master).stdout(Stdio::null()).stderr(Stdio::null());
             c
@@ -152,7 +156,7 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
 
     let out = common::ros_command(&prefix, "python3")
         .arg(common::workspace_root().join("crates/xgc-rt-host/tests/ros/px4_standin.py"))
-        .args(["4.0", "60.0"])
+        .args(["4.0", "90.0", "5.0"])
         .env("ROS_HOME", &ros_home)
         .env("ROS_MASTER_URI", &master)
         .output()
@@ -180,4 +184,8 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
     assert!(r["final_z"].as_f64().unwrap() < 0.1 && r["armed_at_end"] == false, "landed and disarmed");
     assert!(r["eskf_err_p50_m"].as_f64().unwrap() < 0.05, "ESKF output tracks truth");
     assert!(r["setpoints"].as_u64().unwrap() > 100);
+    // Planner path (Custom1, px4_local): the plan moves +x 1.5 m at 0.3 m/s.
+    assert!(r["custom1"] == true && states.contains(&"Custom1"), "never entered Custom1: {states:?}");
+    assert!((r["x_after_track"].as_f64().unwrap() - 1.5).abs() < 0.15, "follows the planner setpoints");
+    assert!(r["track_err_max_m"].as_f64().unwrap() < 0.5, "tracking error bounded");
 }

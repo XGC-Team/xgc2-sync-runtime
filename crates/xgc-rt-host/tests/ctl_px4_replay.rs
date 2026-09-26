@@ -30,8 +30,8 @@ use xgc_rt_host::endpoint::Endpoint;
 use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
-// Channel order = ctl-px4 in-port order for the first nine, then outputs.
-const CHANNELS: [(&str, Qos); 11] = [
+// Channel ids = ctl-px4 port indices (the stream converter emits those).
+const CHANNELS: [(&str, Qos); 16] = [
     ("estimate", Qos::State),
     ("local_pose", Qos::State),
     ("local_velocity", Qos::State),
@@ -42,10 +42,16 @@ const CHANNELS: [(&str, Qos); 11] = [
     ("command", Qos::Event),
     ("clock", Qos::Event),
     ("setpoint", Qos::Control),
+    ("attitude_rate", Qos::Control),
+    ("fcu_request", Qos::Event),
+    ("status", Qos::State),
     ("trace", Qos::Bulk),
+    ("alg_setpoint", Qos::Control),
+    ("hover_thrust", Qos::State),
 ];
+const INPUTS: [u32; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15];
 const CLOCK: u32 = 8;
-const TRACE: u32 = 10;
+const TRACE: u32 = 13;
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).filter(|p| p.exists())
@@ -107,9 +113,10 @@ fn ctl_px4_module_reproduces_the_controller_replay_byte_for_byte() {
         .iter()
         .map(|(n, q)| format!("[[channel]]\nname = \"{n}\"\nqos = \"{}\"\n", format!("{q:?}").to_lowercase()))
         .collect();
-    let binds: Vec<String> = CHANNELS[..9]
+    let binds: Vec<String> = INPUTS
         .iter()
-        .map(|(n, _)| format!("{n} = {{ channel = \"{n}\", from = [\"feeder\"] }}"))
+        .map(|&i| CHANNELS[i as usize].0)
+        .map(|n| format!("{n} = {{ channel = \"{n}\", from = [\"feeder\"] }}"))
         .chain(["setpoint = { channel = \"setpoint\" }".to_string(), "trace = { channel = \"trace\" }".to_string()])
         .collect();
     let manifest = format!(
@@ -161,7 +168,7 @@ bind = {{ {binds} }}
         channels: CHANNELS.iter().enumerate().map(|(i, (n, q))| ChannelSpec { id: i as u32, name: n.to_string(), qos: *q }).collect(),
     };
     let feeder = Endpoint::open(Box::new(LoopbackTransport::new(bus.clone())), &ctx, clock.clone(), audit.clone(), 1 << 18).unwrap();
-    for ch in 0..=CLOCK {
+    for ch in INPUTS {
         feeder.declare_out(ch).unwrap();
     }
     feeder.declare_in(TRACE, &[0]).unwrap();

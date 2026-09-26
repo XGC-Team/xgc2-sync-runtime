@@ -14,6 +14,8 @@
 //   in  vrpn_pose       xgc.pose/1                  (canonical pose, consistency check)
 //   in  command         xgc.command/1               (optional; takeoff/land/hover/custom1)
 //   in  clock           xgc.clock/1                 (optional; replay: advance time)
+//   in  alg_setpoint    xgc.position_target/1       (optional; planner setpoint, alg/setpoint_raw/local)
+//   in  hover_thrust    xgc.hover_thrust/1          (optional; hover_thrust/estimate_state)
 //   out setpoint        xgc.position_target/1       (mavros setpoint_raw/local)
 //   out attitude_rate   xgc.body_rate_thrust/1      (optional; setpoint_raw/attitude)
 //   out fcu_request     xgc.fcu_request/1           (optional; arming, set_mode)
@@ -60,6 +62,7 @@
 #include "px4_multirotor_controller/common/time.h"
 #include "px4_multirotor_controller/common/types.h"
 #include "px4_multirotor_controller/drone_controller.h"
+#include "px4_multirotor_controller/nmpc/nmpc_math_utils.h"
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
 
@@ -70,7 +73,7 @@ namespace sm = state_machine;
 
 enum Port : uint32_t {
   kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
-  kSetpoint, kAttitudeRate, kFcuRequest, kStatus, kTrace, kPortCount
+  kSetpoint, kAttitudeRate, kFcuRequest, kStatus, kTrace, kAlgSetpoint, kHoverThrust, kPortCount
 };
 constexpr uint32_t kFirstStatsPort = kEstimate;
 constexpr uint32_t kStatsPorts = 7;  // estimate .. vrpn_pose, in port order
@@ -252,6 +255,42 @@ struct CtlPx4 {
         }
         break;
       }
+      case kAlgSetpoint: {  // TrajectoryInputProducer::algSetpointCallback
+        if (controller.getConfig().tracking_backend != pmc::TrackingBackend::PX4_LOCAL) break;
+        xgc_position_target_v1 m;
+        if (!read(in.data, &m)) break;
+        pmc::MpcTrajectoryState traj;
+        traj.position_k = Eigen::Vector3d(m.position[0], m.position[1], m.position[2]);
+        traj.velocity_k = Eigen::Vector3d(m.velocity[0], m.velocity[1], m.velocity[2]);
+        traj.acceleration_k = Eigen::Vector3d(m.acceleration[0], m.acceleration[1], m.acceleration[2]);
+        // The receipt time is only the origin for between-sample lifting.
+        traj.planning_time = pmc::Time().fromNSec(in.t_ns);
+        const Eigen::Quaterniond q = pmc::yawToQuaternion(m.yaw);
+        traj.qx = q.x(); traj.qy = q.y(); traj.qz = q.z(); traj.qw = q.w();
+        traj.yaw_rate = m.yaw_rate;
+        traj.type_mask = m.type_mask;
+        traj.coordinate_frame = m.coordinate_frame;
+        traj.is_valid = true;
+        traj.new_data_received = false;
+        controller.mpcTrajectoryBuffer().cachePending(traj);
+        post(pmc::event_type::INPUT_MPC_TRAJECTORY_UPDATED, now, "alg/setpoint_raw/local");
+        break;
+      }
+      case kHoverThrust: {  // TrajectoryInputProducer::hoverThrustCallback
+        xgc_hover_thrust_v1 m;
+        if (!read(in.data, &m)) break;
+        if (!std::isfinite(m.hover_thrust) || m.hover_thrust <= 0.0 || m.hover_thrust >= 1.0) {
+          sensor.hover_thrust_estimate_available = false;
+          sensor.hover_thrust_estimate_flags = m.flags;
+          break;
+        }
+        sensor.hover_thrust_estimate = m.hover_thrust;
+        sensor.hover_thrust_estimate_stamp = m.stamp != 0.0 ? m.stamp : pmc::Time().fromNSec(in.t_ns).toSec();
+        sensor.hover_thrust_estimate_available = true;
+        sensor.hover_thrust_estimate_flags = m.flags;
+        post(pmc::event_type::INPUT_HOVER_THRUST_UPDATED, now, "hover_thrust/estimate_state");
+        break;
+      }
       default:
         break;
     }
@@ -310,7 +349,7 @@ struct CtlPx4 {
         m.position[0] = s.x; m.position[1] = s.y; m.position[2] = s.z;
         m.velocity[0] = s.vx; m.velocity[1] = s.vy; m.velocity[2] = s.vz;
         m.acceleration[0] = s.ax; m.acceleration[1] = s.ay; m.acceleration[2] = s.az;
-        m.q_xyzw[0] = s.qx; m.q_xyzw[1] = s.qy; m.q_xyzw[2] = s.qz; m.q_xyzw[3] = s.qw;
+        m.yaw = pmc::quaternionToYaw(s.qx, s.qy, s.qz, s.qw);  // as ControlOutputConsumer
         m.yaw_rate = s.yaw_rate;
         m.type_mask = s.type_mask;
         m.coordinate_frame = s.coordinate_frame;
@@ -370,7 +409,8 @@ struct CtlPx4 {
 
   void drain(std::vector<Input>& into) {
     xgc_sample_view v;
-    for (uint32_t port = kEstimate; port <= kClock; ++port) {
+    for (uint32_t port : {kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
+                          kAlgSetpoint, kHoverThrust}) {
       while (host->next(host->host, port, &v) == XGC_OK) {
         if (port == kClock) {
           xgc_clock_v1 c;
@@ -498,6 +538,8 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"fcu_request", XGC_PORT_OUT_OPTIONAL, "xgc.fcu_request/1", XGC_QOS_EVENT},
     {"status", XGC_PORT_OUT_OPTIONAL, "xgc.controller_status/1", XGC_QOS_STATE},
     {"trace", XGC_PORT_OUT_OPTIONAL, "xgc.text/1", XGC_QOS_BULK},
+    {"alg_setpoint", XGC_PORT_IN_OPTIONAL, "xgc.position_target/1", XGC_QOS_CONTROL},
+    {"hover_thrust", XGC_PORT_IN_OPTIONAL, "xgc.hover_thrust/1", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

@@ -10,6 +10,14 @@ its local position (the role EKF2 plays on the real vehicle) and follows the
 controller's /uav1/mavros/setpoint_raw/local with a simple position/velocity
 loop. It answers arming (cmd/command 400) and set_mode, sends "takeoff",
 then "land", and prints one JSON summary line.
+
+With TRACK_S > 0 it also flies the planner path (tracking_backend px4_local,
+Custom1): in Hover it publishes a 10 Hz planner setpoint on
+/uav1/alg/setpoint_raw/local that holds the hover point, sends "custom1",
+moves the plan +x at 0.3 m/s for TRACK_S seconds, holds 2 s, sends "hover",
+then lands as above.
+
+Usage: px4_standin.py [HOVER_S [TIMEOUT_S [TRACK_S]]]
 """
 import json
 import math
@@ -27,6 +35,8 @@ G = 9.8066
 NS = "/uav1"
 hover_s = float(sys.argv[1]) if len(sys.argv) > 1 else 4.0
 timeout_s = float(sys.argv[2]) if len(sys.argv) > 2 else 60.0
+track_s = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+TRACK_SPEED = 0.3
 
 rospy.init_node("px4_standin", disable_signals=True)
 lock = threading.Lock()
@@ -47,6 +57,8 @@ lpos_pub = rospy.Publisher(NS + "/mavros/local_position/pose", PoseStamped, queu
 lvel_pub = rospy.Publisher(NS + "/mavros/local_position/velocity_local", TwistStamped, queue_size=50)
 batt_pub = rospy.Publisher(NS + "/mavros/battery", BatteryState, queue_size=5)
 cmd_pub = rospy.Publisher("/command", String, queue_size=5, latch=False)
+plan_pub = rospy.Publisher(NS + "/alg/setpoint_raw/local", PositionTarget, queue_size=10)
+plan = {"origin": None, "t_move": None, "count": 0, "err": []}
 
 
 def truth_at(t):
@@ -199,8 +211,40 @@ def publish_loop():
         rate.sleep()
 
 
+def plan_at(t):
+    """The planner's path: hold the origin, then +x at TRACK_SPEED for track_s."""
+    x0, y0, z0 = plan["origin"]
+    tau = 0.0 if plan["t_move"] is None else max(0.0, min(track_s, t - plan["t_move"]))
+    moving = plan["t_move"] is not None and 0.0 < t - plan["t_move"] < track_s
+    return [x0 + TRACK_SPEED * tau, y0, z0], [TRACK_SPEED if moving else 0.0, 0.0, 0.0]
+
+
+def plan_loop():
+    """10 Hz planner setpoints (the DMPC planner's rate) while plan_on is set."""
+    rate = rospy.Rate(10)
+    while not rospy.is_shutdown() and not done.is_set():
+        if plan_on.is_set():
+            now = rospy.Time.now()
+            p, v = plan_at(now.to_sec())
+            m = PositionTarget()
+            m.header.stamp = now
+            m.header.frame_id = "map"
+            m.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+            m.type_mask = PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE
+            m.position.x, m.position.y, m.position.z = p
+            m.velocity.x, m.velocity.y, m.velocity.z = v
+            plan_pub.publish(m)
+            plan["count"] += 1
+            if plan["t_move"] is not None:
+                with lock:
+                    plan["err"].append(math.dist(p, plant["p"]))
+        rate.sleep()
+
+
 done = threading.Event()
+plan_on = threading.Event()
 threading.Thread(target=publish_loop, daemon=True).start()
+threading.Thread(target=plan_loop, daemon=True).start()
 start = rospy.Time.now().to_sec()
 
 
@@ -234,6 +278,24 @@ if ready:
     command("takeoff", lambda: states[-1] != "Ready")
     took_off = wait_for(lambda: bool(states) and states[-1] == "Hover", 30.0)
     result["hover_at_z"] = round(plant["p"][2], 3) if took_off else None
+    if took_off and track_s > 0.0:
+        with lock:
+            plan["origin"] = list(plant["p"])
+        plan_on.set()
+        rospy.sleep(0.5)
+        tracking = command("custom1", lambda: states[-1] == "Custom1")
+        result["custom1"] = tracking
+        if tracking:
+            plan["t_move"] = rospy.Time.now().to_sec()
+            rospy.sleep(track_s + 2.0)
+            with lock:
+                err = sorted(plan["err"])
+                result["x_after_track"] = round(plant["p"][0] - plan["origin"][0], 3)
+                result["track_err_p50_m"] = round(err[len(err) // 2], 4) if err else None
+                result["track_err_max_m"] = round(err[-1], 4) if err else None
+            command("hover", lambda: states[-1] == "Hover")
+        plan_on.clear()
+        result["plan_setpoints"] = plan["count"]
     if took_off:
         rospy.sleep(hover_s)
         result["z_after_hover"] = round(plant["p"][2], 3)

@@ -18,6 +18,7 @@
 //     fcu_imu          sensor_msgs/Imu                      -> xgc.imu/1
 //     battery          sensor_msgs/BatteryState             -> xgc.battery/1
 //     command          std_msgs/String                      -> xgc.command/1
+//     alg_setpoint     mavros_msgs/PositionTarget           -> xgc.position_target/1 (a planner's setpoint)
 //   module inputs -> ROS
 //     vision_pose      xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
 //     neighbor_plans   xgc.dmpc.assumed_trajectory/1 -> formation_generator/AssumedTrajectory
@@ -94,6 +95,7 @@ enum Port : uint32_t {
   kFcuImu,
   kBattery,
   kCommand,
+  kAlgSetpoint,
   kSetpoint,
   kAttitudeRate,
   kStatus,
@@ -104,7 +106,7 @@ enum Port : uint32_t {
 const char* const kPortNames[kPortCount] = {
     "imu",       "pose",       "attitude_target", "own_plan", "vision_pose", "neighbor_plans", "sync_trigger",
     "rigid_state_estimate", "fcu_state", "local_pose", "local_velocity", "fcu_imu", "battery", "command",
-    "setpoint",  "attitude_rate", "status", "fcu_request"};
+    "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -278,6 +280,25 @@ struct RosIo {
     write(kCommand, s);
   }
 
+  void on_alg_setpoint(const mavros_msgs::PositionTarget::ConstPtr& m) {
+    xgc_position_target_v1 s{};
+    s.stamp = stamp_or_now(m->header.stamp);
+    s.position[0] = m->position.x;
+    s.position[1] = m->position.y;
+    s.position[2] = m->position.z;
+    s.velocity[0] = m->velocity.x;
+    s.velocity[1] = m->velocity.y;
+    s.velocity[2] = m->velocity.z;
+    s.acceleration[0] = m->acceleration_or_force.x;
+    s.acceleration[1] = m->acceleration_or_force.y;
+    s.acceleration[2] = m->acceleration_or_force.z;
+    s.yaw = m->yaw;
+    s.yaw_rate = m->yaw_rate;
+    s.type_mask = m->type_mask;
+    s.coordinate_frame = m->coordinate_frame;
+    write(kAlgSetpoint, s);
+  }
+
   // --- fcu_request service calls -------------------------------------------
 
   void call_loop() {
@@ -444,8 +465,7 @@ struct RosIo {
       m.acceleration_or_force.x = s.acceleration[0];
       m.acceleration_or_force.y = s.acceleration[1];
       m.acceleration_or_force.z = s.acceleration[2];
-      const double qx = s.q_xyzw[0], qy = s.q_xyzw[1], qz = s.q_xyzw[2], qw = s.q_xyzw[3];
-      m.yaw = static_cast<float>(std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)));
+      m.yaw = static_cast<float>(s.yaw);
       m.yaw_rate = static_cast<float>(s.yaw_rate);
       pubs[kSetpoint].publish(m);
       ++to_ros;
@@ -520,6 +540,8 @@ struct RosIo {
     if (enabled(kFcuImu)) subs.push_back(nh->subscribe(topics[kFcuImu], queue_size, &RosIo::on_fcu_imu, this));
     if (enabled(kBattery)) subs.push_back(nh->subscribe(topics[kBattery], queue_size, &RosIo::on_battery, this));
     if (enabled(kCommand)) subs.push_back(nh->subscribe(topics[kCommand], queue_size, &RosIo::on_command, this));
+    if (enabled(kAlgSetpoint))
+      subs.push_back(nh->subscribe(topics[kAlgSetpoint], queue_size, &RosIo::on_alg_setpoint, this));
     if (enabled(kSetpoint)) pubs[kSetpoint] = nh->advertise<mavros_msgs::PositionTarget>(topics[kSetpoint], queue_size);
     if (enabled(kAttitudeRate))
       pubs[kAttitudeRate] = nh->advertise<mavros_msgs::AttitudeTarget>(topics[kAttitudeRate], queue_size);
@@ -635,6 +657,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"fcu_imu", XGC_PORT_OUT_OPTIONAL, "xgc.imu/1", XGC_QOS_STATE},
     {"battery", XGC_PORT_OUT_OPTIONAL, "xgc.battery/1", XGC_QOS_STATE},
     {"command", XGC_PORT_OUT_OPTIONAL, "xgc.command/1", XGC_QOS_EVENT},
+    {"alg_setpoint", XGC_PORT_OUT_OPTIONAL, "xgc.position_target/1", XGC_QOS_CONTROL},
     {"setpoint", XGC_PORT_IN_OPTIONAL, "xgc.position_target/1", XGC_QOS_CONTROL},
     {"attitude_rate", XGC_PORT_IN_OPTIONAL, "xgc.body_rate_thrust/1", XGC_QOS_CONTROL},
     {"status", XGC_PORT_IN_OPTIONAL, "xgc.controller_status/1", XGC_QOS_STATE},
