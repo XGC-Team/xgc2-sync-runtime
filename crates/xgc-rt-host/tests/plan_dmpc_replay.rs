@@ -14,7 +14,8 @@
 //!   is older than scene_state_timeout, and resumes;
 //! - the unmodified mixed_circle scenario (five UAVs, four Scout UGVs) with
 //!   its scene.yaml (static obstacles and one constant-velocity mover), from
-//!   the spawn poses of its swarm_pose.yaml; robot 1 is a UAV.
+//!   the spawn poses of its swarm_pose.yaml, recorded for robot 1 (a UAV:
+//!   position targets) and robot 6 (a Scout UGV: planar setpoints).
 //!
 //! Needs:
 //!   DMPC_LIB_DIR              libformation_generator_dmpc_{core,params,config}.so
@@ -43,7 +44,7 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
 // Channel ids = plan-dmpc port indices (the replay files use those).
-const CHANNELS: [(&str, Qos); 7] = [
+const CHANNELS: [(&str, Qos); 8] = [
     ("formation_tick", Qos::Control),
     ("plan_in", Qos::Control),
     ("plan_out", Qos::Control),
@@ -51,11 +52,13 @@ const CHANNELS: [(&str, Qos); 7] = [
     ("setpoint", Qos::Control),
     ("scene_snapshot", Qos::Event),
     ("scene_state", Qos::State),
+    ("planar_setpoint", Qos::Control),
 ];
 const INPUTS: [u32; 5] = [0, 1, 3, 5, 6];
 const TICK: u32 = 0;
 const PLAN_OUT: u32 = 2;
 const SETPOINT: u32 = 4;
+const PLANAR_SETPOINT: u32 = 7;
 const HOLD: u64 = 10;
 /// xgc.position_target/1 type_mask of the node's position hold.
 const POSITION_HOLD_MASK: u16 = 8 | 16 | 32 | 64 | 128 | 256 | 2048;
@@ -102,7 +105,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
 fn plan_dmpc_module_reproduces_the_fleet_replay_without_the_scene() {
-    replay("plan-dmpc-replay", "knot_fs150_uav", 5, &[], 60, 0);
+    replay("plan-dmpc-replay", "knot_fs150_uav", 5, 1, &[], 60, 0);
 }
 
 #[test]
@@ -111,6 +114,7 @@ fn plan_dmpc_module_reproduces_the_fleet_replay_with_the_knot_fs150_scene() {
         "plan-dmpc-replay-knot",
         "knot_fs150_full_uav",
         5,
+        1,
         &["--scene", "config/scenarios/knot_fs150/scene.yaml", "--scene-gap", "30:40"],
         80,
         5,
@@ -123,17 +127,31 @@ fn plan_dmpc_module_reproduces_the_fleet_replay_with_the_mixed_circle_mover() {
         "plan-dmpc-replay-mixed",
         "mixed_circle_agent",
         9,
+        1,
         &["--scene", "config/scenarios/mixed_circle/scene.yaml", "--spawn", "config/scenarios/mixed_circle/swarm_pose.yaml"],
         80,
         0,
     );
 }
 
-/// Robot 1 of the fleet `test/replay/plan_dmpc/{manifest}{1..robots}.yaml`
+#[test]
+fn plan_dmpc_module_reproduces_the_fleet_replay_for_a_mixed_circle_scout() {
+    replay(
+        "plan-dmpc-replay-scout",
+        "mixed_circle_agent",
+        9,
+        6,
+        &["--scene", "config/scenarios/mixed_circle/scene.yaml", "--spawn", "config/scenarios/mixed_circle/swarm_pose.yaml"],
+        80,
+        0,
+    );
+}
+
+/// Robot `record` of the fleet `test/replay/plan_dmpc/{manifest}{1..robots}.yaml`
 /// over `rounds`; `options` are dmpc_fleet_replay's (a path argument is
 /// relative to the package). The reference must hold position in exactly
 /// `holds` rounds.
-fn replay(name: &str, manifest: &str, robots: u32, options: &[&str], rounds: u64, holds: usize) {
+fn replay(name: &str, manifest: &str, robots: u32, record: u32, options: &[&str], rounds: u64, holds: usize) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (Some(lib_dir), Some(fg_root)) = (env_path("DMPC_LIB_DIR"), env_path("FORMATION_GENERATOR_ROOT")) else {
         eprintln!("skipped: set DMPC_LIB_DIR and FORMATION_GENERATOR_ROOT");
@@ -149,7 +167,7 @@ fn replay(name: &str, manifest: &str, robots: u32, options: &[&str], rounds: u64
     let (inputs_path, outputs_path) = (dir.join("inputs.bin"), dir.join("outputs.bin"));
     let mut command = Command::new(&tool);
     command
-        .args(["--record", "1", "--rounds", &rounds.to_string(), "--hold", &HOLD.to_string()])
+        .args(["--record", &record.to_string(), "--rounds", &rounds.to_string(), "--hold", &HOLD.to_string()])
         .arg("--inputs").arg(&inputs_path)
         .arg("--outputs").arg(&outputs_path);
     for option in options {
@@ -163,7 +181,8 @@ fn replay(name: &str, manifest: &str, robots: u32, options: &[&str], rounds: u64
     assert!(status.success(), "dmpc_fleet_replay failed");
     let inputs = read_records(&inputs_path);
     let expected = read_records(&outputs_path);
-    let expected_rolling = expected.iter().filter(|(r, p, _)| *p == SETPOINT && *r >= HOLD).count() as u64;
+    let expected_rolling =
+        expected.iter().filter(|(r, p, _)| (*p == SETPOINT || *p == PLANAR_SETPOINT) && *r >= HOLD).count() as u64;
     assert!(expected_rolling > (rounds - HOLD) * 9 / 10, "the reference must actually fly: {expected_rolling} rolling setpoints");
     // Scene holds: a setpoint without a plan in the same round.
     let plan_rounds: Vec<u64> = expected.iter().filter(|(_, p, _)| *p == PLAN_OUT).map(|(r, _, _)| *r).collect();
@@ -200,10 +219,10 @@ path = "{lib}"
 trigger = "on_dirty"
 step_budget_ms = 1000.0
 config = {{ param_manifest = "{param_manifest}" }}
-bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, plan_in = {{ channel = "plan_in", from = ["feeder"] }}, own_state = {{ channel = "own_state", from = ["feeder"] }}, scene_snapshot = {{ channel = "scene_snapshot", from = ["feeder"] }}, scene_state = {{ channel = "scene_state", from = ["feeder"] }}, plan_out = {{ channel = "plan_out" }}, setpoint = {{ channel = "setpoint" }} }}
+bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, plan_in = {{ channel = "plan_in", from = ["feeder"] }}, own_state = {{ channel = "own_state", from = ["feeder"] }}, scene_snapshot = {{ channel = "scene_snapshot", from = ["feeder"] }}, scene_state = {{ channel = "scene_state", from = ["feeder"] }}, plan_out = {{ channel = "plan_out" }}, setpoint = {{ channel = "setpoint" }}, planar_setpoint = {{ channel = "planar_setpoint" }} }}
 "#,
         lib = lib.display(),
-        param_manifest = manifests[0].display(),
+        param_manifest = manifests[record as usize - 1].display(),
     );
     let bus = LoopbackBus::new();
     let clock = Arc::new(WallClock::new(0));
@@ -233,6 +252,7 @@ bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, 
     }
     feeder.declare_in(PLAN_OUT, &[0]).unwrap();
     feeder.declare_in(SETPOINT, &[0]).unwrap();
+    feeder.declare_in(PLANAR_SETPOINT, &[0]).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let runner = {
@@ -279,7 +299,7 @@ bind = {{ formation_tick = {{ channel = "formation_tick", from = ["feeder"] }}, 
     );
     assert!(module.last_error.is_none(), "{module:?}");
     assert_eq!(module.domain_state, "rolling");
-    for port in [PLAN_OUT, SETPOINT] {
+    for port in [PLAN_OUT, SETPOINT, PLANAR_SETPOINT] {
         let g: Vec<_> = got.iter().filter(|(_, p, _)| *p == port).collect();
         let e: Vec<_> = expected.iter().filter(|(_, p, _)| *p == port).collect();
         assert_eq!(g.len(), e.len(), "port {port}: {} samples, reference {}", g.len(), e.len());

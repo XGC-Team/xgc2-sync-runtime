@@ -138,6 +138,10 @@ fn vendored_ros_messages_equal_their_originals() {
         ("rigid_state_estimator_msgs/RigidStateEstimate.msg", products.join("ros1/common/ros1-msgs/rigid_state_estimator_msgs/msg/RigidStateEstimate.msg")),
         ("formation_generator/AssumedTrajectory.msg", repos.join("academic/ros1_ws/src/planner/formation_generator/msg/AssumedTrajectory.msg")),
         ("periodic_sync/SyncTrigger.msg", repos.join("academic/ros1_ws/src/communication/periodic_sync/msg/SyncTrigger.msg")),
+        (
+            "unicycle_reference_trajectory_msgs/PlanarPvaReference.msg",
+            products.join("ros1/common/ros1-msgs/unicycle_reference_trajectory_msgs/msg/PlanarPvaReference.msg"),
+        ),
     ]
     .into_iter()
     .chain(["SceneSnapshot", "SceneObstacle", "ScenePart", "SceneGeometry", "SceneState", "SceneObstacleState"].map(|m| {

@@ -10,7 +10,9 @@
 //   in  plan_in         xgc.dmpc.assumed_trajectory/1   (neighbor plans over the link)
 //   out plan_out        xgc.dmpc.assumed_trajectory/1   (this robot's plan, every round)
 //   in  own_state       xgc.rigid_state/1               (measured state; seeds the plan)
-//   out setpoint        xgc.position_target/1           (the node's setpoint_raw/local)
+//   out setpoint        xgc.position_target/1           (optional; the node's setpoint_raw/local)
+//   out planar_setpoint xgc.planar_pva/1                (optional; with planar_reference_output,
+//                                                        the node's alg/reference/pva)
 //   in  scene_snapshot  xgc.scene.snapshot/1            (optional; the shared scene's definition)
 //   in  scene_state     xgc.scene.state/1               (optional; its obstacles' current state)
 //
@@ -30,6 +32,10 @@
 // holds position (the node's scene hold) while the scene is invalid, its
 // state is older than scene_state_timeout, or a new scene's first round fails.
 //
+// A robot with planar_reference_output (a Scout) publishes its setpoint,
+// and its position hold, on planar_setpoint instead of setpoint, as the node
+// publishes PlanarPvaReference instead of PositionTarget.
+//
 // Config: param_manifest (required): the robot's param manifest, the
 // scenario YAML files its launch block loads (rosparam_yaml.h,
 // ParamManifest); relative paths resolve against the manifest's directory.
@@ -38,6 +44,7 @@
 // wait_neighbors, hold, rolling, fault), or "unconfigured".
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -64,11 +71,15 @@ namespace {
 namespace fg = formation_generator_dmpc;
 
 enum Port : uint32_t {
-  kFormationTick, kPlanIn, kPlanOut, kOwnState, kSetpoint, kSceneSnapshot, kSceneState, kPortCount
+  kFormationTick, kPlanIn, kPlanOut, kOwnState, kSetpoint, kSceneSnapshot, kSceneState, kPlanarSetpoint,
+  kPortCount
 };
 
 static_assert(sizeof(fg::PositionTargetPayload) == sizeof(xgc_position_target_v1),
               "PositionTargetPayload is xgc_position_target_v1");
+static_assert(sizeof(fg::PlanarPvaPayload) == sizeof(xgc_planar_pva_v1) &&
+                  offsetof(fg::PlanarPvaPayload, ay) == offsetof(xgc_planar_pva_v1, ay),
+              "PlanarPvaPayload is xgc_planar_pva_v1");
 
 // The core logs through one process-wide sink; each module thread points it
 // at its own host while it calls into the agent.
@@ -222,6 +233,14 @@ struct PlanDmpc {
           return XGC_ERR;
         }
       }
+      if (out.has_planar) {
+        if (host->publish(host->host, kPlanarSetpoint, tick.round,
+                          reinterpret_cast<const uint8_t*>(&out.planar),
+                          static_cast<uint32_t>(sizeof out.planar)) != XGC_OK) {
+          log(XGC_LOG_ERROR, "plan-dmpc: publish planar setpoint failed");
+          return XGC_ERR;
+        }
+      }
       if (out.has_setpoint) {
         if (host->publish(host->host, kSetpoint, tick.round,
                           reinterpret_cast<const uint8_t*>(&out.setpoint),
@@ -268,11 +287,6 @@ xgc_status configure(void* p, const char* config) {
       return XGC_ERR;
     }
     self->agent = std::make_unique<fg::DmpcAgent>(fg::privateParamsFromManifest(fg::loadParamManifest(manifest)));
-    if (self->agent->configuration().planar_reference_output) {
-      self->agent.reset();
-      self->log(XGC_LOG_ERROR, "plan-dmpc: planar_reference_output has no output port yet (xgc.position_target/1 only)");
-      return XGC_ERR;
-    }
     return XGC_OK;
   });
 }
@@ -301,14 +315,15 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"plan_in", XGC_PORT_IN, "xgc.dmpc.assumed_trajectory/1", XGC_QOS_CONTROL},
     {"plan_out", XGC_PORT_OUT, "xgc.dmpc.assumed_trajectory/1", XGC_QOS_CONTROL},
     {"own_state", XGC_PORT_IN, "xgc.rigid_state/1", XGC_QOS_STATE},
-    {"setpoint", XGC_PORT_OUT, "xgc.position_target/1", XGC_QOS_CONTROL},
+    {"setpoint", XGC_PORT_OUT_OPTIONAL, "xgc.position_target/1", XGC_QOS_CONTROL},
     {"scene_snapshot", XGC_PORT_IN_OPTIONAL, "xgc.scene.snapshot/1", XGC_QOS_EVENT},
     {"scene_state", XGC_PORT_IN_OPTIONAL, "xgc.scene.state/1", XGC_QOS_STATE},
+    {"planar_setpoint", XGC_PORT_OUT_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
 
-const xgc_plugin_descriptor kDescriptor = {XGC_RT_ABI_VERSION, kPortCount, "plan-dmpc", "0.2.0", kPorts, &kVtbl};
+const xgc_plugin_descriptor kDescriptor = {XGC_RT_ABI_VERSION, kPortCount, "plan-dmpc", "0.3.0", kPorts, &kVtbl};
 
 }  // namespace
 
