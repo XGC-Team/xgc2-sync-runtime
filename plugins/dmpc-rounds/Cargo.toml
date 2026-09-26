@@ -13,3 +13,4 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 xgc-rt-abi.workspace = true
 toml.workspace = true
+sha2.workspace = true
