@@ -125,6 +125,31 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
         c
     });
 
+    // Optional: record the controller's inputs for its replay harness
+    // (multirotor-controller test/replay). Set XGC_RECORD_BAG=/path/flight.bag.
+    let recorder = std::env::var_os("XGC_RECORD_BAG").map(|bag| {
+        common::Roscore::spawn({
+            let mut c = common::ros_command(&prefix, "rosbag");
+            c.args(["record", "-O"]).arg(&bag).args([
+                "/uav1/alg/state_estimator/state",
+                "/uav1/mavros/local_position/pose",
+                "/uav1/mavros/local_position/velocity_local",
+                "/uav1/mavros/imu/data",
+                "/uav1/mavros/state",
+                "/uav1/mavros/battery",
+                "/uav1/pose",
+                "/command",
+                "/uav1/custom/statustext",
+                "/uav1/mavros/setpoint_raw/local",
+            ]);
+            c.env("ROS_HOME", &ros_home).env("ROS_MASTER_URI", &master).stdout(Stdio::null()).stderr(Stdio::null());
+            c
+        })
+    });
+    if recorder.is_some() {
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
     let out = common::ros_command(&prefix, "python3")
         .arg(common::workspace_root().join("crates/xgc-rt-host/tests/ros/px4_standin.py"))
         .args(["4.0", "60.0"])
@@ -132,6 +157,7 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
         .env("ROS_MASTER_URI", &master)
         .output()
         .unwrap();
+    drop(recorder); // SIGINT: rosbag closes the bag
     drop(controller); // SIGINT to the launch group: roslaunch stops the node
     stop.store(true, Ordering::Relaxed);
     let summary = runner.join().unwrap();

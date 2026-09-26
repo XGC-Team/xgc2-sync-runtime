@@ -188,9 +188,13 @@ impl Drop for Roscore {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         // SAFETY: signals only this child's own process group.
-        unsafe { kill(-pgid, 2) }; // SIGINT: let roslaunch stop its nodes
-        for _ in 0..50 {
-            if let Ok(Some(_)) = self.0.try_wait() {
+        unsafe { kill(-pgid, 2) }; // SIGINT: roslaunch stops its nodes, rosbag closes its bag
+        // Wait for the whole group, not just the direct child: the rosbag
+        // wrapper exits at once while its recorder is still writing the
+        // index. kill(-pgid, 0) fails once no member is left.
+        for _ in 0..100 {
+            let _ = self.0.try_wait();
+            if unsafe { kill(-pgid, 0) } != 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
