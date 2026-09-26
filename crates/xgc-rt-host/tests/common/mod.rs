@@ -140,3 +140,67 @@ pub fn est_rigid_state() -> &'static (PathBuf, PathBuf) {
         (lib, reference)
     })
 }
+
+// --- ROS helpers (tests that need ROS Noetic: set ROS_PREFIX) ---
+
+pub fn ros_prefix() -> Option<PathBuf> {
+    std::env::var_os("ROS_PREFIX").map(PathBuf::from).filter(|p| p.join("include/ros/ros.h").is_file())
+}
+
+pub fn ros_io_lib(prefix: &std::path::Path) -> &'static PathBuf {
+    static LIB: OnceLock<PathBuf> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let out = workspace_root().join("target/plugin-tests/ros");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("libros_io.so");
+        let status = std::process::Command::new(workspace_root().join("scripts/build-ros-io.sh")).arg(&lib).env("ROS_PREFIX", prefix).status().unwrap();
+        assert!(status.success(), "building ros_io failed");
+        lib
+    })
+}
+
+/// A command run with the ROS environment (`source $ROS_PREFIX/setup.sh`).
+pub fn ros_command(prefix: &std::path::Path, program: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("bash");
+    let path = format!("{}:{}", prefix.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    c.env("PATH", path).arg("-c").arg(format!("source '{}/setup.sh' && exec \"$0\" \"$@\"", prefix.display())).arg(program);
+    c
+}
+
+/// A child started in its own process group. Dropping it signals the whole
+/// group: roscore forks rosmaster and roslaunch forks its nodes, and killing
+/// only the parent would leave them running (and rejoining the next test's
+/// master on the same port).
+pub struct Roscore(pub std::process::Child);
+
+impl Roscore {
+    pub fn spawn(mut command: std::process::Command) -> Self {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        Self(command.spawn().expect("spawn"))
+    }
+}
+
+impl Drop for Roscore {
+    fn drop(&mut self) {
+        let pgid = self.0.id() as i32;
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: signals only this child's own process group.
+        unsafe { kill(-pgid, 2) }; // SIGINT: roslaunch stops its nodes, rosbag closes its bag
+        // Wait for the whole group, not just the direct child: the rosbag
+        // wrapper exits at once while its recorder is still writing the
+        // index. kill(-pgid, 0) fails once no member is left.
+        for _ in 0..100 {
+            let _ = self.0.try_wait();
+            if unsafe { kill(-pgid, 0) } != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        unsafe { kill(-pgid, 9) };
+        let _ = self.0.wait();
+    }
+}
+
