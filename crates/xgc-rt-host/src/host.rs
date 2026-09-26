@@ -317,6 +317,8 @@ struct Module {
     name: String,
     lib: Arc<LoadedPlugin>,
     trigger: Trigger,
+    /// Step again this long after the previous step (`wake_ms`).
+    wake: Option<Duration>,
     restart: RestartPolicy,
     config: CString,
     budget: Duration,
@@ -650,6 +652,7 @@ impl ModuleThread {
         }
         let mut last_round = None;
         let mut activated = false;
+        let mut last_step = Instant::now();
         loop {
             let schedule = {
                 let g = inst.inner.lock().unwrap();
@@ -681,7 +684,11 @@ impl ModuleThread {
                     rt.health.event(serde_json::json!({ "event": "rounds_skipped", "plugin": module.name, "from": p + 1, "to": k - 1 }));
                 }
                 last_round = Some(k);
-                if !self.step(&schedule, k, advanced) {
+                let wake_due = module.wake.is_some_and(|w| last_step.elapsed() >= w);
+                if wake_due || advanced {
+                    last_step = Instant::now();
+                }
+                if !self.step(&schedule, k, advanced, wake_due) {
                     return true;
                 }
             }
@@ -695,6 +702,9 @@ impl ModuleThread {
             }
             if let Some(at) = module.status.lock().unwrap().restart_at {
                 timeout = timeout.min(at.saturating_duration_since(Instant::now()));
+            }
+            if let Some(w) = module.wake {
+                timeout = timeout.min(w.saturating_sub(last_step.elapsed()));
             }
             let wakes_on_input = module.trigger != Trigger::OnRound;
             let g = inst.inner.lock().unwrap();
@@ -775,7 +785,7 @@ impl ModuleThread {
         self.bring_up() && self.activate()
     }
 
-    fn step(&mut self, schedule: &RoundSchedule, k: u64, advanced: bool) -> bool {
+    fn step(&mut self, schedule: &RoundSchedule, k: u64, advanced: bool, wake_due: bool) -> bool {
         let rt = self.rt();
         let m = self.s().module;
         let module = &rt.modules[m];
@@ -786,9 +796,9 @@ impl ModuleThread {
         let dirty = {
             let mut g = inst.inner.lock().unwrap();
             let run = match module.trigger {
-                Trigger::OnRound => advanced,
-                Trigger::OnDirty => g.dirty != 0,
-                Trigger::Both => advanced || g.dirty != 0,
+                Trigger::OnRound => advanced || wake_due,
+                Trigger::OnDirty => g.dirty != 0 || wake_due,
+                Trigger::Both => advanced || wake_due || g.dirty != 0,
             };
             if !run {
                 return true;
@@ -1137,6 +1147,7 @@ impl Host {
                 name: decl.name.clone(),
                 lib: Arc::new(lib),
                 trigger: decl.trigger,
+                wake: decl.wake_ms.map(|ms| Duration::from_secs_f64(ms / 1e3)),
                 restart: decl.restart,
                 config: CString::new(config).map_err(|_| HostError(format!("plugin {} config has NUL", decl.name)))?,
                 budget,
@@ -1327,6 +1338,12 @@ impl Host {
 
         let s = &self.manifest.session;
         let e0 = s.epoch_ns.unwrap_or_else(|| rt.clock.now() + (s.start_delay_ms as i64) * 1_000_000);
+        if s.epoch_ns.is_none() && rt.link {
+            // Rounds are only agreed absolute times across nodes when every
+            // node has the same E0 (the Session's epoch_ns). A local E0 still
+            // runs, but its boundaries are this process's own.
+            rt.health.event(serde_json::json!({ "event": "epoch_local_only", "e0": e0, "roster": s.roster.len() }));
+        }
         let schedule = RoundSchedule::new(e0, self.resolved.period_ns, self.resolved.publish_deadline_ns);
         let stop_at = s.run_for_ms.map(|ms| e0 + (ms as i64) * 1_000_000);
         rt.health.event(serde_json::json!({ "event": "epoch", "e0": e0, "period_ns": schedule.period }));

@@ -210,6 +210,10 @@ pub struct PluginDecl {
     /// Longest normal step. Longer marks the module Degraded; 10× longer is
     /// a hang. Default: one period.
     pub step_budget_ms: Option<f64>,
+    /// Also step at most this long after the previous step, within a round
+    /// (a local timer, never a tick from elsewhere). For an edge module that
+    /// services an outside queue in short slices (ros_io with `slice_ms`).
+    pub wake_ms: Option<f64>,
     #[serde(default)]
     pub config: toml::Table,
     #[serde(default)]
@@ -336,6 +340,9 @@ impl Manifest {
             }
             if p.step_budget_ms.is_some_and(|ms| !(ms.is_finite() && ms > 0.0)) {
                 return err(format!("plugin {}: step_budget_ms must be positive", p.name));
+            }
+            if p.wake_ms.is_some_and(|ms| !(ms.is_finite() && ms > 0.0)) {
+                return err(format!("plugin {}: wake_ms must be positive", p.name));
             }
             let mut ports = BTreeMap::new();
             for (port, b) in &p.bind {

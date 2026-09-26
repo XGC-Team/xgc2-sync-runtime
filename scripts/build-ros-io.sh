@@ -8,7 +8,7 @@
 #               boost and libstdc++ match roscpp.
 #   CXX         overrides the compiler.
 #
-# formation_generator/AssumedTrajectory, periodic_sync/SyncTrigger,
+# formation_generator/{AssumedTrajectory,FormationTick}, periodic_sync/SyncTrigger,
 # rigid_state_estimator_msgs/RigidStateEstimate, hover_thrust_estimator_msgs/
 # HoverThrustEstimate and the multirotor_reference_trajectory_msgs headers
 # are generated with
@@ -25,12 +25,12 @@ if [[ -z "$cxx" ]]; then
 fi
 gen="$(dirname "$1")/ros-io-gen"
 rm -rf "$gen"
-for msg in formation_generator/AssumedTrajectory periodic_sync/SyncTrigger rigid_state_estimator_msgs/RigidStateEstimate \
+for msg in formation_generator/AssumedTrajectory formation_generator/FormationTick periodic_sync/SyncTrigger rigid_state_estimator_msgs/RigidStateEstimate \
   multirotor_reference_trajectory_msgs/{AnalyticReference,SampledReference,FlatReferencePoint,WaypointReferenceRequest,ActivePolynomialReference,ReferenceStatus} \
   hover_thrust_estimator_msgs/HoverThrustEstimate; do
   pkg="${msg%/*}"
   "$python" "$prefix/lib/gencpp/gen_cpp.py" "$root/plugins/ros-io/msg/$msg.msg" -p "$pkg" \
-    -Istd_msgs:"$prefix/share/std_msgs/msg" -Igeometry_msgs:"$prefix/share/geometry_msgs/msg" -I"$pkg:$root/plugins/ros-io/msg/$pkg" \
+    -Istd_msgs:"$prefix/share/std_msgs/msg" -Igeometry_msgs:"$prefix/share/geometry_msgs/msg" -Iperiodic_sync:"$root/plugins/ros-io/msg/periodic_sync" -I"$pkg:$root/plugins/ros-io/msg/$pkg" \
     -o "$gen/$pkg" -e "$prefix/share/gencpp" >/dev/null
 done
 "$cxx" -std=c++17 -O2 -fPIC -Wall -Wextra -shared -fvisibility=hidden \
