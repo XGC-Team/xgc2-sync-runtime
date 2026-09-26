@@ -17,14 +17,19 @@
 
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
+#include <hover_thrust_estimator_msgs/HoverThrustEstimate.h>
 #include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/State.h>
+#include <multirotor_reference_trajectory_msgs/ActivePolynomialReference.h>
+#include <multirotor_reference_trajectory_msgs/AnalyticReference.h>
+#include <multirotor_reference_trajectory_msgs/SampledReference.h>
 #include <rigid_state_estimator_msgs/RigidStateEstimate.h>
 #include <ros/serialization.h>
 #include <sensor_msgs/BatteryState.h>
 #include <sensor_msgs/Imu.h>
 #include <std_msgs/String.h>
 
+#include "reference_wire.hpp"
 #include "xgc_schemas_v1.h"
 
 namespace {
@@ -164,11 +169,24 @@ int main(int argc, char** argv) {
         emit(t, 14, &s, sizeof s);
         break;
       }
-      case 10:
-        // Hover-thrust records come from a hover_thrust_estimator node; no
-        // recorded flight carries them yet (ctl-px4 takes them from the
-        // est-hover-thrust module in process).
-        throw std::runtime_error("record kind 10 (hover thrust) is not converted");
+      case 10: {  // hover-thrust estimate -> hover_thrust (port 15)
+        const auto m = decode<hover_thrust_estimator_msgs::HoverThrustEstimate>(d);
+        xgc_hover_thrust_v1 s{};
+        s.stamp = m.header.stamp.toSec();
+        s.hover_thrust = m.hover_thrust;
+        s.state = m.state;
+        s.flags = m.flags;
+        emit(t, 15, &s, sizeof s);
+        break;
+      }
+      case 11: case 12: case 13: {  // active references -> ref_active_* (ports 16-18)
+        namespace rm = multirotor_reference_trajectory_msgs;
+        const auto bytes = kind == 11   ? xgc_ref_wire::encode_analytic(decode<rm::AnalyticReference>(d))
+                           : kind == 12 ? xgc_ref_wire::encode_polynomial(decode<rm::ActivePolynomialReference>(d))
+                                        : xgc_ref_wire::encode_sampled(decode<rm::SampledReference>(d));
+        emit(t, 16 + (kind - 11), bytes.data(), static_cast<uint32_t>(bytes.size()));
+        break;
+      }
       default:
         throw std::runtime_error("unknown record kind");
     }

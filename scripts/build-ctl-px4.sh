@@ -33,7 +33,7 @@ $cxx -std=c++17 -O2 -fPIC -Wall -Wextra -shared -fvisibility=hidden -MD -MF "$de
   -I "$acados" -I "$acados/include" -I "$acados/include/blasfeo/include" -I "$acados/include/hpipm/include" \
   -I "$acados/interfaces" -I "$prefix/include" -isystem "$eigen" \
   -o "$1" "$root/plugins/ctl-px4/ctl_px4.cpp" \
-  -L "$core_lib" -Wl,-rpath,"$core_lib" -lpx4_multirotor_controller_core \
+  -L "$core_lib" -Wl,-rpath,"$core_lib" -lpx4_multirotor_controller_core -lpx4_multirotor_controller_uav_nmpc_runtime \
   -L "$prefix/lib" -Wl,-rpath,"$prefix/lib" -Wl,-rpath,"$acados/lib"
 if tr ' \\' '\n\n' < "$deps" | grep -E '/include/ros/|_msgs/|ros1_utils|rosconsole|roscpp|/rostime|xmlrpcpp' >&2; then
   echo "build-ctl-px4: the headers above are ROS headers; ctl-px4 must not use ROS" >&2
