@@ -150,6 +150,25 @@ typedef struct xgc_dmpc_sync_trigger_v1 {
   uint32_t reserved;
 } xgc_dmpc_sync_trigger_v1;
 
+/* "xgc.dmpc.mission_state/1": a robot's controller state and its locally
+ * derived mission phase, sent to its peers every round (data, never a tick). */
+typedef struct xgc_dmpc_mission_state_v1 {
+  double stamp;           /* sender's Session time when sent */
+  uint64_t round;         /* sender's round k */
+  uint32_t uav_id;
+  uint32_t rolling;       /* the sender's phase at round k */
+  double mission_time;
+  char state[48];         /* controller CONTROL state, NUL-terminated (e.g. "Custom1") */
+} xgc_dmpc_mission_state_v1;
+
+/* "xgc.dmpc.formation_tick/1": formation_generator/FormationTick from local
+ * rounds: this head, then an xgc.dmpc.sync_trigger/1 payload. */
+typedef struct xgc_dmpc_formation_tick_v1 {
+  double mission_time;
+  uint32_t rolling;
+  uint32_t reserved;
+} xgc_dmpc_formation_tick_v1;
+
 /* --- PX4 flight-controller interface (ctl-px4 <-> ros_io) ----------------
  * Field for field the MAVROS messages the PX4 controller reads or writes.
  * On every input, the sample's envelope t_produce is its receive time. */
@@ -369,6 +388,8 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_rate_cmd_v1) == 104, "xgc_attitude_rate_cm
 XGC_SCHEMA_ASSERT(sizeof(xgc_rigid_state_estimate_v1) == 304, "xgc_rigid_state_estimate_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_assumed_trajectory_v1) == 32, "xgc_dmpc_assumed_trajectory_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_sync_trigger_v1) == 32, "xgc_dmpc_sync_trigger_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_mission_state_v1) == 80, "xgc_dmpc_mission_state_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_formation_tick_v1) == 16, "xgc_dmpc_formation_tick_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_state_v1) == 48, "xgc_fcu_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_twist_v1) == 56, "xgc_twist_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_battery_v1) == 24, "xgc_battery_v1");

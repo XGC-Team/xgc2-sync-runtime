@@ -24,6 +24,7 @@
 //     ref_sampled      multirotor_reference_trajectory_msgs/SampledReference        -> xgc.ref.sampled/1
 //     ref_reset        std_msgs/Empty                        -> xgc.ref.reset/1
 //     hover_thrust     hover_thrust_estimator_msgs/HoverThrustEstimate -> xgc.hover_thrust/1
+//     controller_state std_msgs/String (custom/statustext) -> xgc.controller_status/1 (stamp = receipt)
 //   module inputs -> ROS
 //     vision_pose      xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
 //     neighbor_plans   xgc.dmpc.assumed_trajectory/1 -> formation_generator/AssumedTrajectory
@@ -42,6 +43,11 @@
 //     ref_active_polynomial xgc.ref.polynomial/1    -> .../ActivePolynomialReference (latched)
 //     ref_active_sampled    xgc.ref.sampled/1       -> .../SampledReference (latched)
 //   (the ref_* outputs are latched, as the reference trajectory node's are)
+//     formation_tick   xgc.dmpc.formation_tick/1    -> formation_generator/FormationTick
+//   sync_trigger and formation_tick are local facades for the unchanged DMPC
+//   planner: dmpc-rounds writes them on this robot's own round boundaries
+//   (E0 + k*P on the aligned OS clock). Publish them on the robot's own topic;
+//   they are never a timing authority for another robot.
 //
 // Threading: ROS callbacks run on this plugin's own thread. Each step first
 // publishes what the modules wrote since the last step, then services this
@@ -52,7 +58,11 @@
 // Session time (both are the host clock in wall-clock runs).
 //
 // Config: `<port>_topic` (string), `node_name`, `frame_id` (default "world"),
-// `queue_size` (default 10).
+// `queue_size` (default 10), `slice_ms` (default 0: service ROS until the
+// round's deadline). With long rounds (DMPC, 100 ms) set `slice_ms` (e.g. 2)
+// and the plugin's `wake_ms` to the same value: each step then services ROS
+// for at most one slice, and module outputs (the planner's local
+// FormationTick) reach ROS within about a slice instead of a round.
 
 #include <algorithm>
 #include <cmath>
@@ -67,6 +77,7 @@
 #include <vector>
 
 #include <formation_generator/AssumedTrajectory.h>
+#include <formation_generator/FormationTick.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <hover_thrust_estimator_msgs/HoverThrustEstimate.h>
@@ -127,6 +138,8 @@ enum Port : uint32_t {
   kRefActivePolynomial,
   kRefActiveSampled,
   kHoverThrust,
+  kControllerState,
+  kFormationTick,
   kPortCount
 };
 
@@ -135,7 +148,7 @@ const char* const kPortNames[kPortCount] = {
     "rigid_state_estimate", "fcu_state", "local_pose", "local_velocity", "fcu_imu", "battery", "command",
     "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
     "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled",
-    "hover_thrust"};
+    "hover_thrust", "controller_state", "formation_tick"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -171,6 +184,7 @@ struct RosIo {
   std::string node_name{"xgc_ros_io"};
   std::string frame_id{"world"};
   int queue_size{10};
+  double slice_ms{0.0};
   ros::CallbackQueue queue;
   std::unique_ptr<ros::NodeHandle> nh;
   std::vector<ros::Subscriber> subs;
@@ -345,6 +359,13 @@ struct RosIo {
 
   void on_ref_reset(const std_msgs::Empty::ConstPtr&) { write(kRefReset, xgc_ref_reset_v1{}); }
 
+  void on_controller_state(const std_msgs::String::ConstPtr& m) {
+    xgc_controller_status_v1 s{};
+    s.stamp = ros::Time::now().toSec();
+    text(s.state, m->data);
+    write(kControllerState, s);
+  }
+
   void on_hover_thrust(const hover_thrust_estimator_msgs::HoverThrustEstimate::ConstPtr& m) {
     xgc_hover_thrust_v1 s{};
     s.stamp = stamp_or_now(m->header.stamp);
@@ -454,6 +475,24 @@ struct RosIo {
       m.active_participant_ids.resize(h.count);
       std::memcpy(m.active_participant_ids.data(), v.data + sizeof h, 4 * static_cast<size_t>(h.count));
       pubs[kSyncTrigger].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kFormationTick, &v) == XGC_OK) {
+      xgc_dmpc_formation_tick_v1 f;
+      xgc_dmpc_sync_trigger_v1 h;
+      if (v.len < sizeof f + sizeof h) continue;
+      std::memcpy(&f, v.data, sizeof f);
+      std::memcpy(&h, v.data + sizeof f, sizeof h);
+      if (v.len != sizeof f + sizeof h + 4 * static_cast<size_t>(h.count)) continue;
+      formation_generator::FormationTick m;
+      m.trigger.sequence_id = h.sequence_id;
+      m.trigger.trigger_time.fromSec(h.trigger_time);
+      m.trigger.published_time = ros::Time::now();
+      m.trigger.active_participant_ids.resize(h.count);
+      std::memcpy(m.trigger.active_participant_ids.data(), v.data + sizeof f + sizeof h, 4 * static_cast<size_t>(h.count));
+      m.rolling = f.rolling != 0;
+      m.mission_time = f.mission_time;
+      pubs[kFormationTick].publish(m);
       ++to_ros;
     }
     while (host->next(host->host, kRigidStateEstimate, &v) == XGC_OK) {
@@ -632,6 +671,10 @@ struct RosIo {
       subs.push_back(nh->subscribe(topics[kRefWaypoint], queue_size, &RosIo::on_ref_waypoint, this));
     if (enabled(kRefSampled))
       subs.push_back(nh->subscribe(topics[kRefSampled], queue_size, &RosIo::on_ref_sampled, this));
+    if (enabled(kControllerState))
+      subs.push_back(nh->subscribe(topics[kControllerState], queue_size, &RosIo::on_controller_state, this));
+    if (enabled(kFormationTick))
+      pubs[kFormationTick] = nh->advertise<formation_generator::FormationTick>(topics[kFormationTick], queue_size);
     if (enabled(kHoverThrust))
       subs.push_back(nh->subscribe(topics[kHoverThrust], queue_size, &RosIo::on_hover_thrust, this));
     if (enabled(kRefReset)) subs.push_back(nh->subscribe(topics[kRefReset], queue_size, &RosIo::on_ref_reset, this));
@@ -654,7 +697,8 @@ struct RosIo {
     // message becomes a module output as soon as it arrives; at least once per
     // round, so short (1 ms) rounds still take what has arrived.
     queue.callAvailable(ros::WallDuration(0));
-    const int64_t until = ctx->deadline - 1000000;
+    int64_t until = ctx->deadline - 1000000;
+    if (slice_ms > 0.0) until = std::min<int64_t>(until, host->now(host->host) + static_cast<int64_t>(slice_ms * 1e6));
     while (ros::ok()) {
       const int64_t left = until - host->now(host->host);
       if (left <= 0) break;
@@ -705,6 +749,10 @@ xgc_status configure(void* p, const char* config) {
     for (uint32_t i = 0; i < kPortCount; ++i) self->topics[i] = cfg::text_or(t, (std::string(kPortNames[i]) + "_topic").c_str(), "");
     self->node_name = cfg::text_or(t, "node_name", "xgc_ros_io");
     self->frame_id = cfg::text_or(t, "frame_id", "world");
+    if (!cfg::number(t, "slice_ms", &self->slice_ms) || self->slice_ms < 0.0) {
+      self->log(XGC_LOG_ERROR, "ros_io: invalid slice_ms");
+      return XGC_ERR;
+    }
     if (!cfg::integer(t, "queue_size", &self->queue_size) || self->queue_size <= 0) {
       self->log(XGC_LOG_ERROR, "ros_io: invalid queue_size");
       return XGC_ERR;
@@ -768,6 +816,8 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"ref_active_polynomial", XGC_PORT_IN_OPTIONAL, "xgc.ref.polynomial/1", XGC_QOS_STATE},
     {"ref_active_sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
     {"hover_thrust", XGC_PORT_OUT_OPTIONAL, "xgc.hover_thrust/1", XGC_QOS_STATE},
+    {"controller_state", XGC_PORT_OUT_OPTIONAL, "xgc.controller_status/1", XGC_QOS_STATE},
+    {"formation_tick", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.formation_tick/1", XGC_QOS_CONTROL},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
