@@ -1,6 +1,7 @@
 //! Local stream socket. One request, one reply. Not a bus and not telemetry.
 
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -85,6 +86,20 @@ impl Listener {
             return Ok(None);
         }
         if self.current.is_none() {
+            // Even a nonblocking accept allocates an fd before checking the queue.
+            // At a file-table boundary that can wait for RCU despite no connection.
+            // Readiness with a zero timeout avoids that work on every idle step.
+            let mut readiness = libc::pollfd {
+                fd: self.listener.as_raw_fd(), events: libc::POLLIN, revents: 0,
+            };
+            // The listener owns this valid fd for the entire call.
+            let ready = unsafe { libc::poll(&mut readiness, 1, 0) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted { return Ok(None); }
+                return Err(error.to_string());
+            }
+            if ready == 0 { return Ok(None); }
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -167,6 +182,43 @@ impl Listener {
         self.pending.extend_from_slice(&(reason.len() as u32).to_le_bytes());
         self.pending.extend_from_slice(reason);
         self.flush_pending().map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_listener_needs_no_spare_file_descriptor() {
+        const CHILD: &str = "XGC_STATION_IDLE_FD_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "socket::tests::idle_listener_needs_no_spare_file_descriptor"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("xgc-station-idle-{}.sock", std::process::id()));
+        let mut listener = Listener::bind(&path).unwrap();
+        let mut previous = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // This test runs in a subprocess so its fd limit cannot affect other tests.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut previous) }, 0);
+        // poll's one-element array must itself fit the soft limit.
+        let limited = libc::rlimit { rlim_cur: 1, ..previous };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
+        let result = listener.poll();
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &previous) }, 0);
+        assert!(matches!(result, Ok(None)), "idle poll attempted to allocate an fd");
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&[KIND_COMMAND, 7, 0, 0, 0]).unwrap();
+        client.write_all(b"prepare").unwrap();
+        assert!(matches!(listener.poll(), Ok(Some(Request::Command(token))) if token == "prepare"));
+        listener.reply(true, "queued").unwrap();
+        let mut reply = [0; 5];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[0], QUEUED);
     }
 }
 

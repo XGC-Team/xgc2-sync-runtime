@@ -16,6 +16,7 @@ name = "station-io-cmd"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 xgc-rt-abi.workspace = true
 serde_json.workspace = true
 toml.workspace = true
