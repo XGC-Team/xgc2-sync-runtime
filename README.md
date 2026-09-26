@@ -2,7 +2,7 @@
 
 One module skeleton for every onboard and station module: perception, estimation, planning, control, DMPC neighbor exchange and simulation adapters. Communications are one plugin family on the same skeleton, with Zenoh as the cross-host transport. Latency, loss, reordering and throughput are audited per link against exact definitions.
 
-**It is not:** a planner, PX4 HIL, a ROS replacement mandate, or anything to do with AI chat. "Agent" in XGC2 means the robot `xgc-agent` ops process, which launches the aggregator.
+**It is not:** a planner, PX4 HIL, a ROS replacement mandate, or anything to do with AI chat. "Agent" in XGC2 means the robot `xgc-agent` ops process. Agent-managed deployment and native module validation are separate acceptance steps; see [migration status](docs/native-migration-status.md).
 
 ## Topology
 
@@ -51,6 +51,12 @@ examples/z1-pipeline/run.sh      # release build, 5-plugin host for 5 s, merged 
 ```
 
 Rust ≥ 1.75 (matches the pinned zenoh 1.9.0).
+
+Some native integration tests return early when ROS/core dependencies are
+absent. A successful default `cargo test` run alone does not show they ran.
+With the real dependencies configured, `scripts/check-native-gates.sh` checks
+the executed test counts and rejects those skips. The [recorded validation](docs/validation/native-20260926/README.md)
+lists source identities, replay hashes, software-plant results and limitations.
 
 ## Design and plan
 

@@ -30,6 +30,7 @@ Usage: px4_standin.py [HOVER_S [TIMEOUT_S [TRACK_S [planner|reference]]]]
 """
 import json
 import math
+import os
 import sys
 import threading
 
@@ -47,6 +48,9 @@ timeout_s = float(sys.argv[2]) if len(sys.argv) > 2 else 60.0
 track_s = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
 tracking = sys.argv[4] if len(sys.argv) > 4 else "planner"
 HOVER_THRUST = 0.5
+native_hover = os.environ.get("XGC_STANDIN_NATIVE_HOVER") == "1"
+feedback_samples = [0]
+synthetic_estimates = [0]
 try:
     from hover_thrust_estimator_msgs.msg import HoverThrustEstimate
 except ImportError:
@@ -200,7 +204,8 @@ def on_set_mode(req):
 rospy.Subscriber(NS + "/mavros/vision_pose/pose", PoseStamped, on_vision)
 rospy.Subscriber(NS + "/mavros/setpoint_raw/local", PositionTarget, on_setpoint)
 rospy.Subscriber(NS + "/mavros/setpoint_raw/attitude", AttitudeTarget, on_attitude)
-hte_pub = rospy.Publisher(NS + "/hover_thrust/estimate_state", HoverThrustEstimate, queue_size=10) if HoverThrustEstimate else None
+hte_pub = rospy.Publisher(NS + "/hover_thrust/estimate_state", HoverThrustEstimate, queue_size=10) if HoverThrustEstimate and not native_hover else None
+attitude_feedback_pub = rospy.Publisher(NS + "/mavros/setpoint_raw/target_attitude", AttitudeTarget, queue_size=50) if native_hover else None
 rospy.Subscriber(NS + "/custom/statustext", String, on_status)
 rospy.Service(NS + "/mavros/cmd/command", CommandLong, on_command)
 rospy.Service(NS + "/mavros/set_mode", SetMode, on_set_mode)
@@ -246,6 +251,10 @@ def step_plant(dt):
             q_new = tilt_for(a) if fcu["armed"] and p[2] > 0.0 else [1.0, 0.0, 0.0, 0.0]
             w[:] = rates_between(q, q_new, dt)
             q[:] = q_new
+        # Actuator feedback from this same plant, not an estimated hover value.
+        # Capture it before ground reaction changes the simulated accelerometer.
+        plant["applied_thrust"] = (max(0.0, att["msg"].thrust) if use_att else
+            HOVER_THRUST * math.sqrt(a[0] ** 2 + a[1] ** 2 + (a[2] + G) ** 2) / G if flying else 0.0)
         for i in range(3):
             v[i] += a[i] * dt
             p[i] += v[i] * dt
@@ -284,6 +293,13 @@ def publish_loop():
          imu.linear_acceleration.z) = unrotate(q, [a[0], a[1], a[2] + G])
         imu_raw_pub.publish(imu)
         imu_pub.publish(imu)
+        if attitude_feedback_pub is not None:
+            feedback = AttitudeTarget()
+            feedback.header.stamp = now
+            feedback.orientation.w, feedback.orientation.x, feedback.orientation.y, feedback.orientation.z = q
+            feedback.thrust = plant["applied_thrust"]
+            attitude_feedback_pub.publish(feedback)
+            feedback_samples[0] += 1
         if i % 2 == 0:
             vp = PoseStamped()
             vp.header.stamp = now
@@ -304,6 +320,7 @@ def publish_loop():
             h.state = HoverThrustEstimate.STATE_AIRBORNE if p[2] > 0.5 else HoverThrustEstimate.STATE_GROUND
             h.hover_thrust = HOVER_THRUST
             hte_pub.publish(h)
+            synthetic_estimates[0] += 1
         if i % 200 == 0:
             b = BatteryState()
             b.header.stamp = now
@@ -426,6 +443,8 @@ with lock:
     err = sorted(vision["err"])
     result.update({
         "states": states,
+        "synthetic_hover_estimates": synthetic_estimates[0],
+        "attitude_feedback_samples": feedback_samples[0],
         "max_z": round(max_z[0], 3),
         "final_z": round(plant["p"][2], 3),
         "armed_at_end": fcu["armed"],

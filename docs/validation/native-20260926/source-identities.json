@@ -1,0 +1,32 @@
+[
+  {
+    "path": "/home/lxk/Dev/xgc2-harness/devops/products/common/math",
+    "head": "e4d57bc654cb815ac24a0765162f6aefdaf9f859",
+    "status": ""
+  },
+  {
+    "path": "/home/lxk/Dev/xgc2-harness/devops/products/common/state-machine",
+    "head": "6f31e524dc14a16c709ec0b33641e1091bd77eec",
+    "status": ""
+  },
+  {
+    "path": "/home/lxk/Dev/xgc2-harness/devops/products/ros1/perception/estimator/rigid-state",
+    "head": "681c5d0dbb0b549926254357a90a4deeb177367e",
+    "status": ""
+  },
+  {
+    "path": "/home/lxk/Dev/xgc2-harness/devops/products/ros1/perception/estimator/hover-thrust",
+    "head": "9affbb0eedd75fafe16a9cadc08749539e41c064",
+    "status": ""
+  },
+  {
+    "path": "/home/lxk/Dev/xgc2-harness/devops/products/ros1/controller/multirotor-controller",
+    "head": "40bc1084677901f2f5cbf15eb1f64b227a9cd37a",
+    "status": ""
+  },
+  {
+    "path": "/home/lxk/Dev/xgc2-harness/devops/products/ros1/common/ros1-msgs",
+    "head": "0fab57cecee3e7daa519c9c6bfac8509972c9ca9",
+    "status": ""
+  }
+]

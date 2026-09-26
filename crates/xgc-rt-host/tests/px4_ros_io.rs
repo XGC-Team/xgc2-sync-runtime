@@ -138,7 +138,9 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
     // configuration; for dfbc/nmpc only the backend and the activated
     // reference (circle entry instead of the torus knot, which needs more
     // height than a 2.3 m takeoff) change.
-    let yaml = std::fs::read_to_string(ws.join("src/px4_multirotor_controller/config/uav_nmpc.yaml")).unwrap();
+    let controller_root = std::env::var_os("PX4_CONTROLLER_ROOT").map(PathBuf::from)
+        .unwrap_or_else(|| ws.join("src/px4_multirotor_controller"));
+    let yaml = std::fs::read_to_string(controller_root.join("config/uav_nmpc.yaml")).unwrap();
     assert!(yaml.contains("tracking_backend: px4_local\n") && yaml.contains("  reference_analytic_type: 9\n"));
     let yaml = yaml
         .replace("tracking_backend: px4_local\n", &format!("tracking_backend: {backend}\n"))
