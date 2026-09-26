@@ -13,6 +13,11 @@
  *  - Every vtable call happens on the host's executor thread for that plugin,
  *    never concurrently. `step` is called only on a round boundary or when an
  *    in-port is dirty, as the manifest trigger says.
+ *  - ROS edge rule: a domain plugin (estimation, control, planning, DMPC)
+ *    never calls ROS: no ros::init/rospy, no publish/subscribe, no ROS
+ *    libraries. Only one host-loaded bridge plugin (ros1-bridge) talks ROS,
+ *    converting inbound topics into input samples and output samples into
+ *    outbound topics. VRPN, simulators and legacy ROS stacks stay behind it.
  *  - Times are Session nanoseconds (see docs/time-model.md).
  *  - Strings are UTF-8, NUL-terminated, and owned by whoever returned them;
  *    descriptor strings must stay valid for the lifetime of the library.
@@ -82,9 +87,13 @@ typedef struct xgc_step_ctx {
   uint32_t reserved;
 } xgc_step_ctx;
 
+/* Minor revisions only append functions to xgc_host_api. A plugin checks
+ * `abi_minor` before calling a function added in that minor. */
+#define XGC_RT_ABI_MINOR 1u
+
 typedef struct xgc_host_api {
   uint32_t abi_version;
-  uint32_t reserved;
+  uint32_t abi_minor;     /* 0: through request_recover; 1: + port_origins, node_id */
   void* host;
   /* Publish on an out-port for `round`. The host stamps, audits and sends. */
   xgc_status (*publish)(void* host, uint32_t port, uint64_t round,
@@ -96,6 +105,12 @@ typedef struct xgc_host_api {
   /* Ask the host to move this plugin Active -> Degraded / back. */
   void (*request_degrade)(void* host, const char* reason);
   void (*request_recover)(void* host);
+  /* abi_minor >= 1 */
+  /* Roster ids an in-port receives from (the manifest `from`). Writes up to
+   * `cap` ids and returns the total count, or 0 for an out-port. */
+  uint32_t (*port_origins)(void* host, uint32_t port, uint16_t* out, uint32_t cap);
+  /* This node's roster id. */
+  uint16_t (*node_id)(void* host);
 } xgc_host_api;
 
 typedef struct xgc_plugin_vtbl {

@@ -22,6 +22,9 @@ pub trait Clock: Send + Sync {
     /// plus the receiver's bound.
     fn bound_ns(&self) -> u32;
     fn domain(&self) -> ClockDomain;
+    /// Update the bound from a measurement (probe, chrony). Clocks with a
+    /// fixed bound ignore it.
+    fn set_bound_ns(&self, _bound_ns: u32) {}
 }
 
 /// The host's disciplined `CLOCK_REALTIME`. In Z1 the bound is supplied by
@@ -35,10 +38,6 @@ pub struct WallClock {
 impl WallClock {
     pub fn new(bound_ns: u32) -> Self {
         Self { bound_ns: std::sync::atomic::AtomicU32::new(bound_ns) }
-    }
-
-    pub fn set_bound_ns(&self, bound_ns: u32) {
-        self.bound_ns.store(bound_ns, Ordering::Relaxed);
     }
 }
 
@@ -54,6 +53,42 @@ impl Clock for WallClock {
 
     fn domain(&self) -> ClockDomain {
         ClockDomain::Wall
+    }
+
+    fn set_bound_ns(&self, bound_ns: u32) {
+        self.bound_ns.store(bound_ns, Ordering::Relaxed);
+    }
+}
+
+/// The host clock displaced by a fixed offset: a stand-in for a node whose
+/// clock is off, so probe and bound can be tested on one machine.
+#[derive(Debug)]
+pub struct SkewedClock {
+    wall: WallClock,
+    offset_ns: i64,
+}
+
+impl SkewedClock {
+    pub fn new(offset_ns: i64) -> Self {
+        Self { wall: WallClock::new(u32::MAX), offset_ns }
+    }
+}
+
+impl Clock for SkewedClock {
+    fn now(&self) -> i64 {
+        self.wall.now() + self.offset_ns
+    }
+
+    fn bound_ns(&self) -> u32 {
+        self.wall.bound_ns()
+    }
+
+    fn domain(&self) -> ClockDomain {
+        ClockDomain::Wall
+    }
+
+    fn set_bound_ns(&self, bound_ns: u32) {
+        self.wall.set_bound_ns(bound_ns);
     }
 }
 

@@ -1,0 +1,9 @@
+[package]
+name = "xgc-rt-clock"
+description = "Clock-error bound: NTP-style probe estimator over the data path, chrony tracking reader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

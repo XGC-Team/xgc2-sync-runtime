@@ -20,6 +20,6 @@ fn step_ctx_and_descriptor_layout_match_header() {
     assert_eq!(size_of::<XgcPortDecl>(), 32);
     assert_eq!(size_of::<XgcPluginDescriptor>(), 40);
     assert_eq!(offset_of!(XgcPluginDescriptor, vtbl), 32);
-    assert_eq!(size_of::<XgcHostApi>(), 16 + 6 * 8);
+    assert_eq!(size_of::<XgcHostApi>(), 16 + 8 * 8);
     assert_eq!(size_of::<XgcPluginVtbl>(), 7 * 8);
 }

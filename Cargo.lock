@@ -459,6 +459,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmpc-exchange-demo"
+version = "0.1.0"
+dependencies = [
+ "xgc-rt-abi",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3047,6 +3054,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xgc-rt-clock"
+version = "0.1.0"
+
+[[package]]
 name = "xgc-rt-core"
 version = "0.1.0"
 dependencies = [
@@ -3065,6 +3076,7 @@ dependencies = [
  "toml 0.8.23",
  "xgc-rt-abi",
  "xgc-rt-audit",
+ "xgc-rt-clock",
  "xgc-rt-core",
  "xgc-rt-impair",
  "xgc-rt-transport-loopback",
