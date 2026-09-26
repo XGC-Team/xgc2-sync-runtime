@@ -214,3 +214,45 @@ pub fn command(text: &str) -> Vec<u8> {
     out[..text.len()].copy_from_slice(text.as_bytes());
     out
 }
+
+/// A ground robot (Scout) following the DMPC planner's planar setpoint
+/// (xgc.planar_pva/1) directly: velocity command 1.5 (p_sp - p) + v_sp in
+/// the plane, at most 1.0 m/s, acceleration (v_cmd - v) / 0.3 within
+/// 2 m/s^2; heading along the velocity while moving; height fixed.
+pub struct GroundPlant {
+    pub p: [f64; 3],
+    pub v: [f64; 3],
+    pub yaw: f64,
+    pub setpoint: Option<Vec<u8>>,
+}
+
+impl GroundPlant {
+    pub fn new(p: [f64; 3], yaw: f64) -> Self {
+        Self { p, v: [0.0; 3], yaw, setpoint: None }
+    }
+
+    pub fn step(&mut self, dt: f64) {
+        let mut vcmd = [0.0; 2];
+        if let Some(m) = &self.setpoint {
+            // stamp, x, y, yaw, vx, vy, ax, ay
+            vcmd = [1.5 * (f64_at(m, 1) - self.p[0]) + f64_at(m, 4), 1.5 * (f64_at(m, 2) - self.p[1]) + f64_at(m, 5)];
+            let norm = (vcmd[0] * vcmd[0] + vcmd[1] * vcmd[1]).sqrt();
+            if norm > 1.0 {
+                vcmd = [vcmd[0] / norm, vcmd[1] / norm];
+            }
+        }
+        for i in 0..2 {
+            let a = ((vcmd[i] - self.v[i]) / 0.3).clamp(-2.0, 2.0);
+            self.v[i] += a * dt;
+            self.p[i] += self.v[i] * dt;
+        }
+        if (self.v[0] * self.v[0] + self.v[1] * self.v[1]).sqrt() > 0.05 {
+            self.yaw = self.v[1].atan2(self.v[0]);
+        }
+    }
+
+    pub fn rigid_state(&self, t: f64) -> Vec<u8> {
+        let (s, c) = (0.5 * self.yaw).sin_cos();
+        f64s(&[t, self.p[0], self.p[1], self.p[2], self.v[0], self.v[1], 0.0, c, 0.0, 0.0, s, 0.0, 0.0, 0.0])
+    }
+}
