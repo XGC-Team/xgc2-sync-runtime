@@ -14,6 +14,8 @@
 //   out planar_setpoint xgc.planar_pva/1                (optional; with planar_reference_output,
 //                                                        the node's alg/reference/pva)
 //   in  clock           xgc.clock/1                     (optional; pass_through_clock = "input")
+//   out round_done      xgc.clock/1                     (optional; each tick's trigger time, after
+//                                                        its outputs, for a lockstep simulator)
 //   in  scene_snapshot  xgc.scene.snapshot/1            (optional; the shared scene's definition)
 //   in  scene_state     xgc.scene.state/1               (optional; its obstacles' current state)
 //
@@ -87,7 +89,7 @@ namespace fg = formation_generator_dmpc;
 
 enum Port : uint32_t {
   kFormationTick, kPlanIn, kPlanOut, kOwnState, kSetpoint, kSceneSnapshot, kSceneState, kPlanarSetpoint,
-  kClock, kPortCount
+  kClock, kRoundDone, kPortCount
 };
 
 static_assert(sizeof(fg::PositionTargetPayload) == sizeof(xgc_position_target_v1),
@@ -288,6 +290,8 @@ struct PlanDmpc {
       ticked = true;
       last_tick = tick.round;
       if (publishOutputs(tick.round, out) != XGC_OK) return XGC_ERR;
+      const double done = tick.trigger_time;
+      host->publish(host->host, kRoundDone, tick.round, reinterpret_cast<const uint8_t*>(&done), sizeof done);
     }
     const fg::DmpcConfiguration& c = agent->configuration();
     if (!input_clock && ticked && c.passThrough() && c.pass_through_hold_rate_hz > 0.0) {
@@ -376,6 +380,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"scene_state", XGC_PORT_IN_OPTIONAL, "xgc.scene.state/1", XGC_QOS_STATE},
     {"planar_setpoint", XGC_PORT_OUT_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
     {"clock", XGC_PORT_IN_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
+    {"round_done", XGC_PORT_OUT_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
