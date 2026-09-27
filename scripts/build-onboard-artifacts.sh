@@ -91,8 +91,9 @@ read -r image_id actual_platform extra <<< "$info"
 cache_key="$(python3 -c 'import hashlib,sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:24])' "$root" "$project" "$image_id" "$acados_prefix")"
 cache="$cache_root/$platform/$cache_key"
 mkdir -p "$output" "$cache/home" "$cache/cargo" "$cache/target"
+echo "build-onboard-artifacts: cache=$cache (compile network disabled)"
 stage="$(mktemp -d "$output/.${platform}.XXXXXX")"
-cmd=("${docker_cmd[@]}" run --rm --pull=never --platform "$docker_platform"
+cmd=("${docker_cmd[@]}" run --rm --pull=never --network none --platform "$docker_platform"
   --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges
   --mount "type=bind,src=$root,dst=/workspace/runtime,readonly"
   --mount "type=bind,src=$project,dst=/workspace/project,readonly"
@@ -102,7 +103,13 @@ cmd=("${docker_cmd[@]}" run --rm --pull=never --platform "$docker_platform"
   -e CARGO_TARGET_DIR=/workspace/cache/target
   -e "XGC2_TARGET_PLATFORM=$platform" -e "XGC2_RUST_TARGET=$rust_target"
   -e "XGC2_ACADOS_PREFIX=$acados_prefix" -e "XGC2_BUILD_JOBS=$jobs"
-  --entrypoint /bin/bash "$image_id" /workspace/runtime/scripts/build-onboard-container.sh)
+)
+# Current standalone CMake also configures the workspace's opt-in harness target.
+# Keep its original adjacent source path available without copying or changing it.
+if [[ -d "$project/../tests" ]]; then
+  cmd+=(--mount "type=bind,src=$project/../tests,dst=/workspace/tests,readonly")
+fi
+cmd+=(--entrypoint /bin/bash "$image_id" /workspace/runtime/scripts/build-onboard-container.sh)
 printf '%q ' "${cmd[@]}" > "$stage/command.txt"; printf '\n' >> "$stage/command.txt"
 printf 'TARGET_PLATFORM=%q\nDOCKER_PLATFORM=%q\nRUST_TARGET=%q\nBUILDER_IMAGE_ID=%q\nCACHE_KEY=%q\n' "$platform" "$docker_platform" "$rust_target" "$image_id" "$cache_key" > "$stage/build-target.env"
 # Record source provenance without recursively hashing or copying source. A dirty

@@ -241,10 +241,18 @@ class BuildTests(unittest.TestCase):
             self.assertFalse((target/'BUNDLE.json').exists())
         call = self.calls('run')[0]
         self.assertIn('--pull=never', call); self.assertNotIn('--privileged', call)
+        self.assertEqual('none', call[call.index('--network')+1])
         self.assertIn('--user', call); self.assertIn('--cap-drop', call)
         self.assertTrue(any('dst=/workspace/project,readonly' in arg for arg in call))
         self.assertTrue(any('dst=/workspace/runtime,readonly' in arg for arg in call))
         self.assertFalse(any('/var/run/docker.sock' in arg for arg in call))
+
+    def test_adjacent_workspace_tests_are_read_only(self):
+        (self.project.parent/'tests').mkdir()
+        result = self.build()
+        self.assertEqual(0, result.returncode, result.stderr)
+        call = self.calls('run')[0]
+        self.assertTrue(any('dst=/workspace/tests,readonly' in arg for arg in call))
 
     def test_failure_retains_logs_without_final_output(self):
         result = self.build(FAKE_BUILD_RC='17')
@@ -324,6 +332,14 @@ class BuildTests(unittest.TestCase):
             result = run(['bash', IMAGE_SCRIPT]+args, self.env)
             self.assertEqual(2, result.returncode)
         self.assertFalse(self.log.exists())
+
+    @unittest.skipUnless(IMAGE_SCRIPT, 'set XGC2_IMAGES_SOURCE for the W08 image PR checks')
+    def test_sitl_default_parent_matches_explicit_architecture_tag(self):
+        result = run(['bash', IMAGE_SCRIPT, 'fs150-focal-noetic-sitl', 'linux/amd64'], self.env)
+        self.assertEqual(0, result.returncode, result.stderr)
+        call = self.calls('build')[0]
+        self.assertIn('PARENT_IMAGE=onboard-sim-fs150-focal-noetic:base-local-amd64', call)
+        self.assertEqual('onboard-sim-fs150-focal-noetic:base-local-amd64-sitl-1.1.0-23', call[call.index('-t')+1])
 
     @unittest.skipUnless(IMAGE_SCRIPT, 'set XGC2_IMAGES_SOURCE for the W08 image PR checks')
     def test_sitl_parent_architecture_checked_before_build(self):

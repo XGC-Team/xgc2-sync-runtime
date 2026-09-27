@@ -46,9 +46,13 @@ done
 bash "$runtime/scripts/build-plan-dmpc.sh" --core-prefix "$cache/core-install" \
   --acados-prefix "$acados" --build-dir "$cache/plan"
 # Generated ROS headers/objects stay in cache, never in the exported plugin dir.
+# gencpp imports genmsg from the selected ROS environment. setup.bash is not nounset-safe.
+set +u
+source /opt/ros/noetic/setup.bash
+set -u
 ROS_PREFIX=/opt/ros/noetic CXX=c++ bash "$runtime/scripts/build-ros-io.sh" "$cache/ros/libros_io.so"
 cd "$runtime"
-cargo build --locked --release --target "$XGC2_RUST_TARGET" --jobs "$XGC2_BUILD_JOBS" \
+cargo build --offline --locked --release --target "$XGC2_RUST_TARGET" --jobs "$XGC2_BUILD_JOBS" \
   -p xgc-rt-host -p xgc-rt-audit -p dmpc-rounds -p numeric-vehicle -p station-io
 release="$CARGO_TARGET_DIR/$XGC2_RUST_TARGET/release"
 for binary in xgc-rt-host xgc-rt-render xgc-rt-audit; do

@@ -9,6 +9,8 @@ below establish a usable robot deployment.
 Run `bash scripts/build-onboard-artifacts.sh --help` from this repository.
 `--project` is the **reviewed ROS workspace src directory**, containing
 `planner/formation_generator/standalone/CMakeLists.txt` and `common/` siblings.
+The adjacent workspace `tests/` directory is also mounted read-only when present,
+because the standalone CMake configures the existing opt-in harness target.
 It is not a robot ID, a whole paper repository, or a path on a remote machine.
 Select the successful algorithm checkout with Root/W33; this driver does not
 fetch, change, patch or select algorithm revisions. Current HEAD is not evidence
@@ -20,7 +22,7 @@ userland**, on a matching local CPU or with already-configured local binfmt/QEMU
 This is not host compilation followed by a renamed artifact. The script does
 not install emulators or create a remote builder. It refuses non-Unix-socket
 Docker endpoints and runs the inspected local image by its immutable image ID,
-with `--pull=never`. No Docker socket is mounted into the build container.
+with `--pull=never --network none`. No Docker socket is mounted into the build container.
 
 Pass a real local image using `--builder-image` (or
 `XGC2_ONBOARD_BUILDER_IMAGE`). There is intentionally **no fictional default tag**.
@@ -29,8 +31,11 @@ and admit a local development image containing Ubuntu 20.04, target ROS Noetic
 headers/libraries and gencpp, CMake, C++, Python 3, binutils, Eigen, yaml-cpp, and
 Rust/Cargo capable of reading the checked-in workspace/lock file. Rustup/toolchain
 files must be accessible to the invoking UID independently of `CARGO_HOME`;
-the driver uses persistent writable Cargo/home caches. Dependency downloads by
-Cargo are local build activity, not robot installation or APT publication.
+the driver uses persistent writable Cargo/home caches. Populate the target cache
+`cargo/registry` with the lockfile dependencies during toolchain preparation;
+the compile container has no network. The selected cache path is printed before
+compilation. Image/package preparation is separate
+from compilation and does not install software on robots.
 
 The image must contain the reviewed **target-architecture** acados install at
 `--acados-prefix` (default `/opt/acados`), including the original required solver
@@ -135,7 +140,7 @@ XGC2_IMAGES_SOURCE="$IMAGES_CHECKOUT" python3 scripts/test-onboard-build.py
 They compile small real freestanding amd64/arm64 ELF fixtures, exercise target
 checks and shell boundaries, and use a **Docker test double** for export/error
 paths. They do not build the actual runtime, ROS or acados. Without
-`XGC2_IMAGES_SOURCE`, the four image-script tests are explicitly skipped, not
+`XGC2_IMAGES_SOURCE`, the five image-script tests are explicitly skipped, not
 reported as image validation. The initial isolated environment has no Docker,
 Rust toolchain, ROS/acados or robot; actual dual-target builds, measured cache
 reuse, W09 packaging/target loading and hardware validation remain unexecuted.
