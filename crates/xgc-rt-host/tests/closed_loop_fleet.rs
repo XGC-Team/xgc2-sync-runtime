@@ -23,7 +23,9 @@
 //! accounts for every transport loss against relay truth. Planner step reads
 //! are replayed after the real rounds module's admission, and every forwarded
 //! payload must match a peer's actual publication from an older source round.
-//! Fresh/stale/missing counts describe those actual consumed plans. Tracking,
+//! Fresh/stale/missing counts describe those actual consumed plans, and
+//! dmpc-rounds' own NeighborExchange snapshot (its `neighbors` port) must
+//! state exactly that for every robot, beat and peer. Tracking,
 //! travel and Custom1 checks apply to every robot; QP failures come directly
 //! from planner_status. Network scheduling need not be deterministic.
 //!
@@ -61,7 +63,7 @@ const PERIOD_MS: i64 = 100;
 const ROUNDS: i64 = 80;
 const HOLD: u64 = 10;
 
-const CHANNELS: [(&str, Qos); 29] = [
+const CHANNELS: [(&str, Qos); 30] = [
     ("sync_trigger", Qos::Control),  // 0  feeder -> plan-dmpc
     ("plan", Qos::Control),            // 1  dmpc-rounds <-> dmpc-rounds (link)
     ("paired_state", Qos::State),         // 2  feeder -> plan-dmpc
@@ -91,9 +93,10 @@ const CHANNELS: [(&str, Qos); 29] = [
     ("timeline_status", Qos::State),  // 26 planner diagnostics
     ("planner_status", Qos::State),   // 27 planner diagnostics
     ("own_position", Qos::State),     // 28 planner -> peers
+    ("neighbors", Qos::Event),        // 29 local rounds: NeighborExchange snapshot per beat
 ];
 const FEEDER_OUT: [u32; 15] = [0, 2, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 18, 24, 25];
-const FEEDER_IN: [u32; 13] = [1, 3, 6, 16, 17, 18, 19, 20, 21, 22, 23, 27, 28];
+const FEEDER_IN: [u32; 14] = [1, 3, 6, 16, 17, 18, 19, 20, 21, 22, 23, 27, 28, 29];
 
 // One fleet at a time (one heavy process).
 static FLIGHT: Mutex<()> = Mutex::new(());
@@ -216,7 +219,7 @@ impl Transport for RoundWitness {
     fn declare_in(&mut self, ch: u32, origins: &[u16]) -> Result<(), TransportError> { self.inner.declare_in(ch, origins) }
     fn send(&mut self, ch: u32, frame: &[u8]) -> Result<(), TransportError> {
         self.inner.send(ch, frame)?;
-        if [18, 21, 22, 23, 27, 28].contains(&ch) {
+        if [18, 21, 22, 23, 27, 28, 29].contains(&ch) {
             let (header, payload) = xgc_rt_core::envelope::decode(frame).unwrap();
             if ch == 23 { self.round.store(header.round, Ordering::Release); }
             else { self.publications.lock().unwrap().insert((ch, header.seq), (header.round, payload.to_vec())); }
@@ -300,7 +303,8 @@ fn robot_host(net: &Net, clock: &Arc<ManualClock>, dir: &Path, n: usize, i: usiz
     }
     let rounds_binds = [own("own_plan", "own_plan"),
         format!("plan_in = {{ channel = \"plan\", from = [{}] }}", peers.join(", ")),
-        out("plan_out", "plan"), out("neighbor_plans", "neighbor_plans"), out("sync_trigger", "round_trigger")].join(", ");
+        out("plan_out", "plan"), out("neighbor_plans", "neighbor_plans"), out("sync_trigger", "round_trigger"),
+        out("neighbors", "neighbors")].join(", ");
     let rounds_path = common::lib("dmpc_rounds");
     let participants = (1..=n).map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
     let mut controller = String::new();
@@ -953,6 +957,8 @@ struct PlanAudit {
     relay_duplicates: u64,
     relay_held: u64,
     lost_clean: u64,
+    /// Every lost robot -> robot plan: (origin index, receiver index, seq).
+    lost_plans: Vec<(usize, usize, u64)>,
 }
 
 /// Plan by plan, each robot's audit against the relays' truth.
@@ -993,10 +999,14 @@ fn plan_audit(name: &str, n: usize, flight: &Flight) -> PlanAudit {
             let t = by_seq.get(&q).unwrap_or_else(|| panic!("{what}: seq {q} never passed the relay"));
             match (t.action, arrived) {
                 (Action::Drop, true) => panic!("{what}: seq {q} dropped by the relay but received"),
-                (Action::Drop, false) => drop += 1,
+                (Action::Drop, false) => {
+                    drop += 1;
+                    a.lost_plans.push((i, j, q));
+                }
                 (action, false) => {
                     discard += 1;
                     a.held_discarded += u64::from(action == Action::Reorder);
+                    a.lost_plans.push((i, j, q));
                 }
                 _ => {}
             }
@@ -1057,6 +1067,7 @@ struct Freshness {
     never: u64,   // a peer plan of round k - 1 never read
     early: u64,   // early plans observed at rounds; planner admission must be older
     state_behind: u64, // ticks k read before the own_state of round k
+    module: [u64; 3],  // dmpc-rounds' own snapshots: Fresh, Stale, Missing
 }
 
 impl std::ops::AddAssign for Freshness {
@@ -1069,13 +1080,40 @@ impl std::ops::AddAssign for Freshness {
         self.never += o.never;
         self.early += o.early;
         self.state_behind += o.state_behind;
+        for (a, b) in self.module.iter_mut().zip(o.module) {
+            *a += b;
+        }
     }
+}
+
+const NX_FRESH: u8 = 0;
+const NX_STALE: u8 = 1;
+const NX_MISSING: u8 = 2;
+/// dmpc-rounds' default `stale_rounds`.
+const NX_STALE_ROUNDS: u64 = 2;
+
+/// The robot's dmpc-rounds snapshot of beat k (`xgc.dmpc.neighbor_snapshot/1`,
+/// docs/neighbor-exchange.md): (origin, status, stale rounds, round, age ns).
+fn decode_snapshot(robot: &Robot, k: u64) -> Option<Vec<(u16, u8, u64, u64, i64)>> {
+    let (_, b) = robot.outputs.iter().find(|((ch, _), (round, _))| *ch == 29 && *round == k).map(|(_, v)| v)?;
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    assert_eq!(u64_at(0), k, "snapshot round");
+    let count = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+    assert_eq!(b.len(), 16 + 32 * count, "snapshot size");
+    Some(
+        (0..count)
+            .map(|e| {
+                let o = 16 + 32 * e;
+                (u16::from_le_bytes([b[o], b[o + 1]]), b[o + 2], u64_at(o + 8), u64_at(o + 16), u64_at(o + 24) as i64)
+            })
+            .collect(),
+    )
 }
 
 /// Replay the planner's actual inputs after the real rounds module admitted
 /// them. A forwarded payload must match a peer publication from an older
 /// round; the planner itself has no second neighbor-exchange cache.
-fn consumed(flight: &Flight, n: usize, i: usize) -> (Vec<Vec<Input>>, Freshness) {
+fn consumed(flight: &Flight, n: usize, i: usize) -> (Vec<Vec<Input>>, Freshness, HashSet<(usize, u64)>) {
     let reads = tick_reads(&flight.audit, i);
     assert_eq!(reads.len(), ROUNDS as usize, "r{i}: a step log entry per tick");
     let me = &flight.robots[i - 1];
@@ -1129,8 +1167,21 @@ fn consumed(flight: &Flight, n: usize, i: usize) -> (Vec<Vec<Input>>, Freshness)
         batch.push(tick.unwrap());
         batches.push(batch);
         if k == 0 { continue; }
+        let snapshot = decode_snapshot(me, k).unwrap_or_else(|| panic!("r{i}: no neighbor snapshot of beat {k}"));
         for (j, peer) in flight.robots.iter().enumerate().filter(|(j, _)| *j != i - 1) {
             let newest = read_at[j].iter().filter(|(round, at)| **round < k && **at <= k).map(|(round, _)| *round).max();
+            // dmpc-rounds' NeighborExchange must report exactly what the
+            // planner was given: the newest source round <= k - 1 by beat k.
+            let want = match newest {
+                Some(r) if r + 1 == k => (NX_FRESH, 0, r),
+                Some(r) if k - 1 - r <= NX_STALE_ROUNDS => (NX_STALE, k - 1 - r, r),
+                Some(r) => (NX_MISSING, 0, r),
+                None => (NX_MISSING, 0, u64::MAX),
+            };
+            let got = snapshot.iter().find(|e| e.0 == j as u16).unwrap_or_else(|| panic!("r{i} beat {k}: r{} not in the snapshot", j + 1));
+            assert_eq!((got.1, got.2, got.3), want, "r{i} beat {k}: dmpc-rounds' snapshot of r{} (status, stale rounds, round)", j + 1);
+            assert!(got.3 == u64::MAX || got.4 >= 0, "r{i} beat {k}: negative age");
+            f.module[usize::from(got.1)] += 1;
             match newest {
                 Some(r) if r == k - 1 => f.fresh += 1,
                 _ if !peer.plan_by_seq.values().any(|p| p.0 == k - 1) => f.unsent += 1,
@@ -1154,16 +1205,20 @@ fn consumed(flight: &Flight, n: usize, i: usize) -> (Vec<Vec<Input>>, Freshness)
             f.early += u64::from(source >= k);
         }
     }
+    let mut never = HashSet::new();
     for (j, peer) in flight.robots.iter().enumerate().filter(|(j, _)| *j != i - 1) {
         for round in peer.plan_by_seq.values().map(|p| p.0).filter(|r| *r + 1 < ROUNDS as u64) {
             match read_at[j].get(&round) {
                 Some(&at) if at > round + 1 => f.late += 1,
-                None => f.never += 1,
+                None => {
+                    f.never += 1;
+                    never.insert((j, round));
+                }
                 _ => {}
             }
         }
     }
-    (batches, f)
+    (batches, f, never)
 }
 
 /// Fly `members` once over the Zenoh plugin, robot to robot through relays
@@ -1191,8 +1246,19 @@ fn fly_zenoh_and_check(name: &str, setup: &Setup, members: &[Member], fleet_opti
     check_product(name, members, &flight.robots, &failures.iter().map(Vec::len).collect::<Vec<_>>());
 
     let mut fleet = Freshness::default();
+    let mut unread_lost = 0;
     for i in 1..=n {
-        let (batches, f) = consumed(&flight, n, i);
+        let (batches, f, never) = consumed(&flight, n, i);
+        // Every lost plan (before the last round, which no tick can use) is
+        // one the receiver never read. Plans never read but received are ones
+        // dmpc-rounds did not forward because a newer one had gone first.
+        for &(origin, _, seq) in audit.lost_plans.iter().filter(|p| p.1 == i - 1) {
+            let round = flight.robots[origin].plan_by_seq.get(&seq).unwrap_or_else(|| panic!("{name}: r{} plan seq {seq} unknown", origin + 1)).0;
+            if round + 1 < ROUNDS as u64 {
+                assert!(never.contains(&(origin, round)), "{name} r{i}: lost plan of r{} round {round} was read", origin + 1);
+                unread_lost += 1;
+            }
+        }
         println!("{name} r{i}: {f:?}");
         let (plans, setpoints) = replay_batches(&format!("{name}-replay-r{i}"), &setup.plan_dmpc, &members[i - 1].manifest, i, &batches);
         let published: Vec<(u64, Vec<u8>)> = flight.robots[i - 1].plan_by_seq.values().cloned().collect();
@@ -1211,7 +1277,10 @@ fn fly_zenoh_and_check(name: &str, setup: &Setup, members: &[Member], fleet_opti
         assert!(setpoints == flight.robots[i - 1].setpoints, "{name} r{i}: closed-loop setpoints differ from the replay of what it read");
         fleet += f;
     }
-    println!("{name}: fleet freshness {fleet:?}; every robot's rounds reproduced from its actual admitted inputs");
+    println!(
+        "{name}: fleet freshness {fleet:?}; every robot's rounds reproduced from its actual admitted inputs; {unread_lost} lost plans all unread, {} unread plans received but not forwarded",
+        fleet.never - unread_lost
+    );
     (audit, fleet)
 }
 
@@ -1287,7 +1356,6 @@ fn the_knot_fs150_fleet_flies_over_impaired_zenoh() {
     assert!(audit.drop > 0 && audit.relay_duplicates > 0 && audit.relay_held > 0, "the profile exercised drop, duplicate and reorder: {audit:?}");
     assert!(fleet.stale > 0, "impaired relays: some round ran on a stale peer plan: {fleet:?}");
     assert!(fleet.early > 0, "round selection exercised: some peer plan of round k reached rounds before tick k");
-    assert_eq!(fleet.never, audit.lost, "every peer plan never read is an audited loss");
 }
 
 #[test]

@@ -50,6 +50,13 @@
 //! before the cache when the id, finiteness, or n / N+1 / rest count disagree.
 //! Every `step` output round is the planner k. See `round`.
 //!
+//! Neighbor snapshot (optional `neighbors` out port,
+//! `xgc.dmpc.neighbor_snapshot/1`, docs/neighbor-exchange.md): at every
+//! planner beat k, after the plans of source rounds < k were forwarded, each
+//! neighbor as the NeighborExchange saw it — Fresh (round k - 1), Stale(n)
+//! (n <= `stale_rounds` older) or Missing — with the round and age of its
+//! newest admitted plan.
+//!
 //! Domain state: `waiting` until the node published its own plan, then
 //! `complete` or `partial` (every neighbor fresh for the last round or not).
 
@@ -76,6 +83,7 @@ const MISSION_REQUEST: u32 = 10;
 const TIMELINE_ACK: u32 = 11;
 const TIMELINE_STATUS: u32 = 12;
 const TIMELINE_COMMIT: u32 = 13;
+const NEIGHBORS: u32 = 14;
 
 /// Bytes before the doubles in `xgc.dmpc.assumed_trajectory/1`.
 pub const PLAN_HEADER: usize = 32;
@@ -576,6 +584,7 @@ impl Plugin for DmpcRounds {
             if beat.advance {
                 let snap = nx.snapshot(k, ctx.now);
                 self.complete = snap.neighbors.iter().all(|n| n.status == NeighborStatus::Fresh);
+                self.host.publish(NEIGHBORS, k, &snap.encode()).map_err(|s| format!("publish neighbor snapshot: {s}"))?;
             }
         }
         if beat.advance {
@@ -638,6 +647,7 @@ export_plugin! {
         ("timeline_ack", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.timeline_ack/1", XGC_QOS_EVENT),
         ("timeline_status", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.timeline_status/1", XGC_QOS_STATE),
         ("timeline_commit", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.mission_commit/1", XGC_QOS_EVENT),
+        ("neighbors", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.neighbor_snapshot/1", XGC_QOS_EVENT),
     ],
 }
 

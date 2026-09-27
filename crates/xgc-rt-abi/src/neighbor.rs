@@ -28,6 +28,9 @@
 //! Nothing blocks: the planner decides at its own deadline with whatever
 //! has arrived, and the snapshot says exactly what that was. Every plan's
 //! delivery is independently audited by the host (loss, OWD, age at use).
+//!
+//! The same contract for C and C++ is `abi/include/xgc_rt_nx.h`; a snapshot
+//! goes on the wire as [`SNAPSHOT_SCHEMA`] ([`Snapshot::encode`]).
 
 use std::collections::HashMap;
 
@@ -58,7 +61,35 @@ pub struct Snapshot<'a> {
     pub neighbors: Vec<NeighborView<'a>>,
 }
 
+/// The snapshot record: `round` u64, `count` u32, reserved u32, then per
+/// neighbor 32 bytes: origin u16, status u8 (0 Fresh, 1 Stale, 2 Missing),
+/// 5 reserved, stale rounds u64 (0 unless Stale), round u64 (`u64::MAX` when
+/// never admitted), age ns i64 (0 when never admitted). Little-endian.
+pub const SNAPSHOT_SCHEMA: &str = "xgc.dmpc.neighbor_snapshot/1";
+
 impl Snapshot<'_> {
+    /// This snapshot as a [`SNAPSHOT_SCHEMA`] record.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + 32 * self.neighbors.len());
+        out.extend(self.round.to_le_bytes());
+        out.extend((self.neighbors.len() as u32).to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        for n in &self.neighbors {
+            let (status, stale) = match n.status {
+                NeighborStatus::Fresh => (0u8, 0u64),
+                NeighborStatus::Stale(k) => (1, k),
+                NeighborStatus::Missing => (2, 0),
+            };
+            out.extend(n.origin.to_le_bytes());
+            out.push(status);
+            out.extend([0u8; 5]);
+            out.extend(stale.to_le_bytes());
+            out.extend(n.round.unwrap_or(u64::MAX).to_le_bytes());
+            out.extend(n.age_ns.unwrap_or(0).to_le_bytes());
+        }
+        out
+    }
+
     /// Fraction of neighbors that are Fresh (1.0 with no neighbors).
     pub fn completeness(&self) -> f64 {
         if self.neighbors.is_empty() {
@@ -178,6 +209,25 @@ mod tests {
         assert_eq!(s.neighbors[0].data, b"a");
         assert!(s.neighbors[2].data.is_empty() && s.neighbors[3].round.is_none());
         assert_eq!(s.completeness(), 0.25);
+    }
+
+    #[test]
+    fn a_snapshot_encodes_as_its_record() {
+        let mut nx = NeighborExchange::with_neighbors(vec![1, 2, 3], 0, 1, 2);
+        assert!(nx.offer(10, 1, 9, 5, 100, b"a"));
+        assert!(nx.offer(10, 2, 7, 4, 40, b"b"));
+        let b = nx.snapshot(10, 1_100).encode();
+        assert_eq!(b.len(), 16 + 3 * 32);
+        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 3);
+        let entry = |i: usize| {
+            let e = &b[16 + 32 * i..16 + 32 * (i + 1)];
+            let u = |o: usize| u64::from_le_bytes(e[o..o + 8].try_into().unwrap());
+            (u16::from_le_bytes([e[0], e[1]]), e[2], u(8), u(16), u(24) as i64)
+        };
+        assert_eq!(entry(0), (1, 0, 0, 9, 1_000));
+        assert_eq!(entry(1), (2, 1, 2, 7, 1_060));
+        assert_eq!(entry(2), (3, 2, 0, u64::MAX, 0));
     }
 
     #[test]
