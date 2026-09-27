@@ -89,10 +89,12 @@ concurrent builds. No new lock service or executor is introduced.
 - `bin/`: `xgc-rt-host`, `xgc-rt-render`, `xgc-rt-audit`.
 - `plugins/`: `libplan_dmpc.so`, `libros_io.so`, `libdmpc_rounds.so`,
   `libnumeric_vehicle.so`, `libstation_io.so`.
-- `lib/`: installed standalone core/config/params and acados shared libraries;
-  validated same-directory aliases are dereferenced. No host libc is copied.
+- `lib/`: installed standalone core/config/params, acados and the target
+  builder's resolved ROS/native shared dependencies (including yaml-cpp).
+  Aliases are dereferenced under their SONAME. The existing W09 Focal base
+  libc6/libgcc-s1/libstdc++6 dependencies and loader remain external.
 - Local evidence: `build-target.env`, `command.txt`, `build.log`, `toolchain.txt`,
-  `ELF.txt`, `timing.env`.
+  `ELF.txt`, `dependencies.txt`, `timing.env`.
 
 The current build surface is **planner/numeric plus ROS/station I/O**. It does
 not build the separate C++ controller/estimator/reference plugins and must not
@@ -100,6 +102,12 @@ be described as a full control composition or full HIL implementation. Those
 existing build entrypoints and W23/W24 integration need separately reviewed
 inputs. No stub/demo libraries, generated ROS headers, source directories,
 static archives or CMake exports are exported here.
+
+`dependencies.txt` records native `ldd` resolution inside the admitted target
+builder. Missing dependencies and same-name byte conflicts fail the export.
+The existing W09 packager/verifier remains responsible for static dependency
+closure, ABI ceilings and target validation; the build driver creates no new
+package manifest or dependency registry.
 
 These are **precompiled inputs**, not an installed bundle. No placeholder
 `BUNDLE.json`, deployment descriptor or manifests are emitted. W09 must use the

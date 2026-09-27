@@ -5,7 +5,7 @@ runtime=/workspace/runtime; project=/workspace/project
 cache=/workspace/cache; output=/workspace/output
 : "${XGC2_TARGET_PLATFORM:?}" "${XGC2_RUST_TARGET:?}" "${XGC2_ACADOS_PREFIX:?}" "${XGC2_BUILD_JOBS:?}"
 check=(python3 "$runtime/scripts/verify-onboard-elf.py" --platform "$XGC2_TARGET_PLATFORM")
-for tool in cargo rustc cmake c++ python3 readelf dpkg install; do
+for tool in cargo rustc cmake c++ python3 readelf dpkg install ldd cmp awk sort; do
   command -v "$tool" >/dev/null || { echo "builder is missing $tool" >&2; exit 3; }
 done
 # The Docker image tag is not proof of its userland/toolchain identity.
@@ -79,5 +79,29 @@ for directory in "$cache/core-install/lib" "$acados/lib"; do
     install -m 0755 "$library" "$output/lib/$name"
   done
 done
+# Export the target image's resolved ROS/native dependencies into the same lib/
+# input consumed by the existing W09 packager. Keep its Focal base libc6 +
+# libgcc-s1 + libstdc++6 contract external; never copy the builder's loader.
+# ldd runs only inside the already-validated native target image.
+export LD_LIBRARY_PATH="$output/lib:$acados/lib:/opt/ros/noetic/lib"
+: > "$output/dependencies.txt"
+for artifact in "$output/bin/"* "$output/plugins/"*.so "$output/lib/"*.so*; do
+  ldd "$artifact" >> "$output/dependencies.txt"
+done
+if grep -q '=> not found' "$output/dependencies.txt"; then
+  echo 'unresolved target dependency; see dependencies.txt' >&2; exit 4
+fi
+while read -r name source; do
+  case "$name" in
+    libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|libresolv.so.2|libutil.so.1|libgcc_s.so.1|libstdc++.so.6) continue ;;
+  esac
+  "${check[@]}" "$source"
+  if [[ -e "$output/lib/$name" ]]; then
+    cmp -s "$source" "$output/lib/$name" || { echo "conflicting dependency: $name" >&2; exit 4; }
+  else
+    install -m 0755 "$source" "$output/lib/$name"
+  fi
+done < <(awk '$2 == "=>" && $3 ~ /^\// { print $1, $3 }' "$output/dependencies.txt" | sort -u)
+
 "${check[@]}" "$output/bin/"* "$output/plugins/"*.so "$output/lib/"*.so* > "$output/ELF.txt"
 echo 'Target ELF export complete; this is not a W09 bundle/load or robot-motion test.'
