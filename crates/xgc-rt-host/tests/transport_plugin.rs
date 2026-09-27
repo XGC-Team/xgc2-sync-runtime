@@ -30,10 +30,6 @@ fn now_ns() -> i64 {
     WallClock::new(0).now()
 }
 
-fn free_tcp() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 const CHANNELS: &str = r#"
 [[channel]]
 name = "detections"
@@ -173,7 +169,7 @@ fn the_z1_pipeline_split_over_two_hosts_hands_off_over_the_loopback_plugin() {
 fn the_z1_pipeline_split_over_two_host_processes_runs_over_the_zenoh_plugin() {
     let dir = common::scratch("z2e-zenoh");
     let audit = dir.join("audit");
-    let port = free_tcp();
+    let port = common::listen_port();
     let plugin_path = common::transport_plugin("zenoh");
     let e0 = now_ns() + 4_000_000_000;
     let roster = ["uav1", "uav2"];
