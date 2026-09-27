@@ -143,6 +143,14 @@ fn validate_fleet(members: &[RobotMember], deployment: &Deployment, authority: &
 
 fn validate_radio_station(radio: &Radio, station: &Station) -> Result<()> {
     require(!radio.listen.is_empty() && radio.listen.iter().chain(&radio.connect).all(|e| tcp(e)), "explicit radio TCP endpoints required")?;
+    let listen: BTreeSet<_> = radio.listen.iter().map(String::as_str).collect();
+    let connect: BTreeSet<_> = radio.connect.iter().map(String::as_str).collect();
+    require(
+        listen.len() == radio.listen.len()
+            && connect.len() == radio.connect.len()
+            && listen.is_disjoint(&connect),
+        "radio endpoints must be unique and listen/connect disjoint",
+    )?;
     require(
         station.robot_id.len() >= 3
             && station.robot_id.len() <= 128
