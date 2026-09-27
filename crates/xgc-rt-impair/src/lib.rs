@@ -77,6 +77,10 @@ pub struct TruthRecord {
     pub t_in: i64,
     /// Injected delay per released copy, ns (empty when dropped).
     pub delays_ns: Vec<i64>,
+    /// Wall ns just before each copy was sent on toward the target (the
+    /// delay the relay really applied is `released - t_in`).
+    #[serde(default)]
+    pub released_ns: Vec<i64>,
 }
 
 fn wall_ns() -> i64 {
@@ -121,6 +125,8 @@ struct Pending {
     due: Instant,
     order: u64,
     bytes: Vec<u8>,
+    // Truth records of the envelopes in `bytes`.
+    idx: Vec<usize>,
 }
 
 impl PartialEq for Pending {
@@ -175,12 +181,12 @@ impl Relay {
                 let mut buf = vec![0u8; 65_536];
                 let jitter_ns = (profile.jitter_ms * 1e6) as i64;
                 let base_ns = (profile.delay_ms * 1e6) as i64;
-                let schedule = |bytes: Vec<u8>, rng: &mut Rng, order: &mut u64| -> i64 {
+                let schedule = |bytes: Vec<u8>, idx: Vec<usize>, rng: &mut Rng, order: &mut u64| -> i64 {
                     let j = if jitter_ns > 0 { ((rng.unit() * 2.0 - 1.0) * jitter_ns as f64) as i64 } else { 0 };
                     let d = (base_ns + j).max(0);
                     *order += 1;
                     let (lock, cv) = &*queue;
-                    lock.lock().unwrap().push(Reverse(Pending { due: Instant::now() + Duration::from_nanos(d as u64), order: *order, bytes }));
+                    lock.lock().unwrap().push(Reverse(Pending { due: Instant::now() + Duration::from_nanos(d as u64), order: *order, bytes, idx }));
                     cv.notify_one();
                     d
                 };
@@ -191,7 +197,7 @@ impl Relay {
                     let bytes = buf[..n].to_vec();
                     let samples = envelopes_in(&bytes);
                     if samples.is_empty() {
-                        schedule(bytes, &mut rng, &mut order);
+                        schedule(bytes, Vec::new(), &mut rng, &mut order);
                         continue;
                     }
                     let lost = match profile.gilbert_elliott {
@@ -214,7 +220,7 @@ impl Relay {
                     let mut log = truth.lock().unwrap();
                     let first = log.len();
                     for &(origin, channel, seq) in &samples {
-                        log.push(TruthRecord { origin, channel, seq, action, t_in, delays_ns: Vec::new() });
+                        log.push(TruthRecord { origin, channel, seq, action, t_in, delays_ns: Vec::new(), released_ns: Vec::new() });
                     }
                     let idx: Vec<usize> = (first..log.len()).collect();
                     match action {
@@ -224,14 +230,14 @@ impl Relay {
                             continue;
                         }
                         Action::Duplicate => {
-                            let d1 = schedule(bytes.clone(), &mut rng, &mut order);
-                            let d2 = schedule(bytes, &mut rng, &mut order);
+                            let d1 = schedule(bytes.clone(), idx.clone(), &mut rng, &mut order);
+                            let d2 = schedule(bytes, idx.clone(), &mut rng, &mut order);
                             for &i in &idx {
                                 log[i].delays_ns = vec![d1, d2];
                             }
                         }
                         Action::Forward => {
-                            let d = schedule(bytes, &mut rng, &mut order);
+                            let d = schedule(bytes, idx.clone(), &mut rng, &mut order);
                             for &i in &idx {
                                 log[i].delays_ns = vec![d];
                             }
@@ -240,7 +246,7 @@ impl Relay {
                     if action != Action::Drop {
                         if let Some((hb, hidx)) = held.take() {
                             // Release strictly after the datagram just scheduled.
-                            let d = schedule(hb, &mut rng, &mut order);
+                            let d = schedule(hb, hidx.clone(), &mut rng, &mut order);
                             for i in hidx {
                                 log[i].delays_ns = vec![d];
                             }
@@ -251,7 +257,7 @@ impl Relay {
         }
         // Delayed sender for the impaired direction.
         {
-            let (back, stop, queue) = (back.clone(), stop.clone(), queue.clone());
+            let (back, stop, queue, truth) = (back.clone(), stop.clone(), queue.clone(), truth.clone());
             threads.push(std::thread::Builder::new().name("impair-out".into()).spawn(move || {
                 let (lock, cv) = &*queue;
                 let mut q = lock.lock().unwrap();
@@ -261,7 +267,16 @@ impl Relay {
                         Some(Reverse(p)) if p.due <= now => {
                             let Reverse(p) = q.pop().unwrap();
                             drop(q);
+                            // Stamped before the send, so no receiver can stamp
+                            // its arrival earlier.
+                            let released = wall_ns();
                             let _ = back.send(&p.bytes);
+                            if !p.idx.is_empty() {
+                                let mut log = truth.lock().unwrap();
+                                for i in p.idx {
+                                    log[i].released_ns.push(released);
+                                }
+                            }
                             q = lock.lock().unwrap();
                         }
                         Some(Reverse(p)) => {
