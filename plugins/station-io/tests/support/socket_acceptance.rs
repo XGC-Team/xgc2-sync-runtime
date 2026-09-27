@@ -37,19 +37,22 @@ fn occupied_socket_is_not_stolen() {
     let path = dir.socket(0);
     let mut first = Listener::bind(&path).unwrap();
     assert!(Listener::bind(&path).is_err());
+    // The liveness probe closes without sending a request.
+    assert!(matches!(first.poll(), Ok(None)));
     let _client = send_frame(&path, "hold");
     assert!(matches!(first.poll(), Ok(Some(Request::Command(token))) if token == "hold"));
     first.reply(true, "queued").unwrap();
 }
 
 #[test]
-fn stale_path_requires_explicit_cleanup() {
+fn stale_path_is_reclaimed_for_restart() {
     let dir = FixtureDir::new();
     let path = dir.socket(0);
     drop(UnixListener::bind(&path).unwrap());
-    assert!(Listener::bind(&path).is_err());
-    std::fs::remove_file(&path).unwrap();
-    assert!(Listener::bind(&path).is_ok());
+    let mut restarted = Listener::bind(&path).unwrap();
+    let _client = send_frame(&path, "hold");
+    assert!(matches!(restarted.poll(), Ok(Some(Request::Command(token))) if token == "hold"));
+    restarted.reply(true, "queued").unwrap();
 }
 
 #[test]

@@ -36,9 +36,7 @@ impl Listener {
         if path.as_os_str().len() > 100 {
             return Err("command_socket path is too long".into());
         }
-        // Let bind fail on an occupied path. Unlinking here could steal a live
-        // authority's command endpoint. Stale paths need explicit owner cleanup.
-        let listener = UnixListener::bind(path).map_err(|e| format!("command_socket: {e}"))?;
+        let listener = bind_listener(path).map_err(|e| format!("command_socket: {e}"))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         Ok(Self {
@@ -243,6 +241,31 @@ impl Drop for Listener {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
+    }
+}
+
+fn bind_listener(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            let prior = std::fs::symlink_metadata(path)?;
+            if !prior.file_type().is_socket() { return Err(error); }
+            // Reclaim only a socket whose listener has exited. A live or full
+            // endpoint remains owned by its process; never unlink it to bind.
+            match connect_once(path, Instant::now() + TRANSACTION_TIMEOUT) {
+                Err(probe) if probe.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                    let current = std::fs::symlink_metadata(path)?;
+                    if !current.file_type().is_socket()
+                        || (prior.dev(), prior.ino()) != (current.dev(), current.ino()) {
+                        return Err(error);
+                    }
+                    std::fs::remove_file(path)?;
+                    UnixListener::bind(path)
+                }
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
