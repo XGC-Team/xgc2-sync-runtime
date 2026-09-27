@@ -1,11 +1,12 @@
 //! Local stream socket. One request, one reply. Not a bus and not telemetry.
 
-use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileTypeExt;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::wire::{self, COMMAND_LEN, TIMELINE_LEN};
 
@@ -13,9 +14,12 @@ pub const KIND_COMMAND: u8 = 1;
 pub const KIND_MISSION: u8 = 2;
 const QUEUED: u8 = 0;
 const REJECTED: u8 = 1;
+const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct Listener {
     path: PathBuf,
+    identity: (u64, u64),
+    accepted_at: Option<Instant>,
     listener: UnixListener,
     current: Option<UnixStream>,
     buf: Vec<u8>,
@@ -32,20 +36,18 @@ impl Listener {
         if path.as_os_str().len() > 100 {
             return Err("command_socket path is too long".into());
         }
-        if path.exists() {
-            let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-            if !meta.file_type().is_socket() {
-                return Err("command_socket path exists and is not a socket".into());
-            }
-            std::fs::remove_file(path).map_err(|e| e.to_string())?;
-        }
-        let listener = UnixListener::bind(path).map_err(|e| format!("command_socket: {e}"))?;
+        let listener = bind_listener(path).map_err(|e| format!("command_socket: {e}"))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        Ok(Self { path: path.to_path_buf(), listener, current: None, buf: Vec::new(), pending: Vec::new() })
+        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        Ok(Self {
+            path: path.to_path_buf(), identity: (meta.dev(), meta.ino()),
+            accepted_at: None, listener, current: None, buf: Vec::new(), pending: Vec::new(),
+        })
     }
 
     fn drop_stream(&mut self) {
         self.current = None;
+        self.accepted_at = None;
         self.buf.clear();
         self.pending.clear();
     }
@@ -82,6 +84,12 @@ impl Listener {
     }
 
     pub fn poll(&mut self) -> Result<Option<Request>, String> {
+        // A partial request or unread reply must not monopolize this authority.
+        // This is one absolute deadline, not reset by trickling more bytes.
+        if self.accepted_at.is_some_and(|at| at.elapsed() >= TRANSACTION_TIMEOUT) {
+            self.drop_stream();
+            return Err("command_socket request/reply deadline exceeded".into());
+        }
         if !self.flush_pending()? {
             return Ok(None);
         }
@@ -104,6 +112,7 @@ impl Listener {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(true).map_err(|e| e.to_string())?;
                     self.current = Some(stream);
+                    self.accepted_at = Some(Instant::now());
                     self.buf.clear();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -119,6 +128,7 @@ impl Listener {
                     return Ok(None);
                 }
                 Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(e) => {
                     self.drop_stream();
@@ -175,8 +185,9 @@ impl Listener {
         if self.current.is_none() {
             return Ok(());
         }
-        let reason = reason.as_bytes();
-        let reason = if reason.len() > 200 { &reason[..200] } else { reason };
+        let mut end = reason.len().min(200);
+        while !reason.is_char_boundary(end) { end -= 1; }
+        let reason = &reason.as_bytes()[..end];
         self.pending.clear();
         self.pending.push(if queued { QUEUED } else { REJECTED });
         self.pending.extend_from_slice(&(reason.len() as u32).to_le_bytes());
@@ -224,37 +235,158 @@ mod tests {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Do not unlink a replacement installed at the same pathname.
+        if let Ok(meta) = std::fs::symlink_metadata(&self.path) {
+            if meta.file_type().is_socket() && (meta.dev(), meta.ino()) == self.identity {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
+fn bind_listener(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            let prior = std::fs::symlink_metadata(path)?;
+            if !prior.file_type().is_socket() { return Err(error); }
+            // Reclaim only a socket whose listener has exited. A live or full
+            // endpoint remains owned by its process; never unlink it to bind.
+            match connect_once(path, Instant::now() + TRANSACTION_TIMEOUT) {
+                Err(probe) if probe.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                    let current = std::fs::symlink_metadata(path)?;
+                    if !current.file_type().is_socket()
+                        || (prior.dev(), prior.ino()) != (current.dev(), current.ino()) {
+                        return Err(error);
+                    }
+                    std::fs::remove_file(path)?;
+                    UnixListener::bind(path)
+                }
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline.checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "transaction deadline exceeded"))
+}
+
+fn connect_once(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    // Nonblocking connect also bounds a full local listen backlog. No request
+    // has been sent yet; EAGAIN is returned as a connect failure, never retried.
+    let bytes = path.as_os_str().as_bytes();
+    // sockaddr_un is a plain C structure; zeroing also terminates sun_path.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid command_socket path"));
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *byte as libc::c_char;
+    }
+    remaining(deadline)?;
+    // On supported Linux targets these flags set both properties atomically.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 { return Err(io::Error::last_os_error()); }
+    // The new descriptor is exclusively owned by this stream, including errors.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let connected = unsafe {
+        libc::connect(fd, (&address as *const libc::sockaddr_un).cast(),
+                      std::mem::size_of_val(&address) as libc::socklen_t)
+    };
+    if connected < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) { return Err(error); }
+        loop {
+            let timeout = remaining(deadline)?.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let mut ready = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            // The stream owns fd and ready is valid for this call only.
+            let result = unsafe { libc::poll(&mut ready, 1, timeout) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(error);
+            }
+            if result == 0 { continue; }
+            if let Some(error) = stream.take_error()? { return Err(error); }
+            stream.peer_addr()?;
+            break;
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+fn write_before(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "request peer closed")),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_before(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "reply peer closed")),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn unknown(reason: impl std::fmt::Display) -> String {
+    format!("outcome unknown: {reason}; not retried; inspect controller telemetry before another command")
+}
+
 pub fn transact(path: &Path, kind: u8, payload: &[u8]) -> Result<(), String> {
+    transact_with_timeout(path, kind, payload, TRANSACTION_TIMEOUT)
+}
+
+fn transact_with_timeout(path: &Path, kind: u8, payload: &[u8], timeout: Duration) -> Result<(), String> {
     if payload.len() > TIMELINE_LEN || (kind == KIND_COMMAND && payload.len() >= COMMAND_LEN) {
         return Err("payload does not fit the typed frame".into());
     }
-    let mut stream = UnixStream::connect(path).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    let deadline = Instant::now() + timeout;
+    let mut stream = connect_once(path, deadline).map_err(|e| format!("connect: {e}"))?;
     let mut frame = Vec::with_capacity(5 + payload.len());
     frame.push(kind);
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(payload);
-    stream.write_all(&frame).map_err(|e| e.to_string())?;
+    // Even a failed write may have delivered a request. Never infer rejection
+    // from transport failure or repeat a flight command after a missing reply.
+    write_before(&mut stream, &frame, deadline).map_err(unknown)?;
     let mut header = [0u8; 5];
-    stream.read_exact(&mut header).map_err(|e| format!("reply: {e}"))?;
+    read_before(&mut stream, &mut header, deadline).map_err(unknown)?;
     let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-    if len > 200 {
-        return Err("reply is too long".into());
-    }
+    if len > 200 { return Err(unknown("reply is too long")); }
     let mut body = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut body).map_err(|e| e.to_string())?;
-    }
-    let text = String::from_utf8_lossy(&body);
-    if header[0] == QUEUED {
-        println!("queued");
-        Ok(())
-    } else {
-        Err(format!("rejected: {text}"))
+    read_before(&mut stream, &mut body, deadline).map_err(unknown)?;
+    let text = std::str::from_utf8(&body).map_err(unknown)?;
+    match header[0] {
+        QUEUED => {
+            // Keep the existing CLI contract. Queued means local publication,
+            // not controller consumption, arming, takeoff, or mission completion.
+            println!("queued");
+            Ok(())
+        }
+        REJECTED => Err(format!("rejected: {text}")),
+        status => Err(unknown(format!("invalid reply status {status}"))),
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/socket_acceptance.rs"]
+mod acceptance_tests;
