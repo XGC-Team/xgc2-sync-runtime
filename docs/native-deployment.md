@@ -1,6 +1,30 @@
 # Native deployment renderer v1
 
-The release-owned `xgc-rt-render` selects one of two frozen, single-robot five-module compositions. Deployment validation and native control acceptance are separate gates. Both profiles use a 1 ms period and a 10 ms controller watchdog budget; this does not establish a 1 ms execution deadline. Native functional evidence is listed in [the validation record](validation/native-20260926/README.md).
+`xgc-rt-render` renders a selected fixed composition for one robot process. The
+experiment workflow owns process placement, startup dependencies and stopping
+the fleet. The renderer does not orchestrate an experiment or provide a separate
+startup-preview engine. Native functional evidence is listed in
+[the validation record](validation/native-20260926/README.md).
+
+| Composition | Purpose |
+| --- | --- |
+| `uav-dmpc-native/v1` | Colocated DMPC, rounds, ROS edge, SMC and station link; same graph for centralized processes, robot containers and boards. SMC reads raw MAVROS pose/velocity; no estimator or hover-thrust module. |
+| `uav-dmpc-planner/v1` | Ground-station planner half of split deployment, with no actuator output. |
+| `uav-dmpc-smc/v1` | Board controller half, receiving planner PVA over the explicit radio link. |
+| `uav-dmpc-numeric-hil/v1` | DMPC with the lightweight numerical vehicle; no actuator output or controller/estimator. |
+| `uav-control-dfbc-native-hover/v1`, `uav-control-px4-local-native-hover/v1` | Existing control-only graphs described below; they are not the TRO SMC graph. |
+
+SOTA reproductions remain external ROS processes under the same workflow
+infrastructure. They do not acquire a native composition just to run a comparison.
+Implemented rendering is not evidence of a completed fleet experiment. Packaging
+uses the product's existing `scripts/package-sync-runtime.py`; no parallel source
+pin registry or second robot-bundle builder is needed.
+
+## Existing control-only profiles
+
+These two profiles use a 1 ms period and a 10 ms controller watchdog budget;
+this does not establish a 1 ms execution deadline. Their graph bytes remain
+unchanged by the DMPC and SMC additions.
 
 Executable: `xgc-rt-render` (same bundle/bin directory as xgc-rt-host). The existing xgc-rt-host `--manifest` CLI is unchanged.
 
@@ -18,7 +42,8 @@ xgc-rt-render run --bundle-root /opt/xgc2/sync-runtime --deployment-json JSON
 ```
 
 `describe` without a selector retains `uav-control-dfbc-native-hover/v1`. The
-explicit selector accepts only that ID and `uav-control-px4-local-native-hover/v1`.
+explicit selector accepts the composition IDs in the table above. In this section,
+the other control-only ID is `uav-control-px4-local-native-hover/v1`.
 The latter uses the controller's PX4_LOCAL backend to consume PositionTarget
 messages on the declared `alg_setpoint_topic`; it has no built-in DMPC planner.
 The reference module remains available in this five-module graph, but its
