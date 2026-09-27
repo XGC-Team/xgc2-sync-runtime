@@ -201,6 +201,21 @@ typedef struct xgc_scene_state_v1 {
   uint32_t obstacle_count;
 } xgc_scene_state_v1;
 
+/* "xgc.planar_pva/1": unicycle_reference_trajectory_msgs/PlanarPvaReference,
+ * a planar position-velocity-acceleration setpoint for a ground robot (the
+ * DMPC planner's output with planar_reference_output; the Scout controller's
+ * alg/reference/pva input). */
+typedef struct xgc_planar_pva_v1 {
+  double stamp;           /* header.stamp */
+  double x;
+  double y;
+  double yaw;
+  double vx;
+  double vy;
+  double ax;
+  double ay;
+} xgc_planar_pva_v1;
+
 /* --- PX4 flight-controller interface (ctl-px4 <-> ros_io) ----------------
  * Field for field the MAVROS messages the PX4 controller reads or writes.
  * On every input, the sample's envelope t_produce is its receive time. */
@@ -424,6 +439,7 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_mission_state_v1) == 80, "xgc_dmpc_mission_sta
 XGC_SCHEMA_ASSERT(sizeof(xgc_dmpc_formation_tick_v1) == 16, "xgc_dmpc_formation_tick_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_scene_snapshot_v1) == 24, "xgc_scene_snapshot_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_scene_state_v1) == 32, "xgc_scene_state_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_planar_pva_v1) == 64, "xgc_planar_pva_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_state_v1) == 48, "xgc_fcu_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_twist_v1) == 56, "xgc_twist_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_battery_v1) == 24, "xgc_battery_v1");

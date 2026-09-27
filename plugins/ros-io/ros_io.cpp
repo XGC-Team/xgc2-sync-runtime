@@ -46,6 +46,8 @@
 //     ref_active_sampled    xgc.ref.sampled/1       -> .../SampledReference (latched)
 //   (the ref_* outputs are latched, as the reference trajectory node's are)
 //     formation_tick   xgc.dmpc.formation_tick/1    -> formation_generator/FormationTick
+//     planar_pva       xgc.planar_pva/1             -> unicycle_reference_trajectory_msgs/PlanarPvaReference
+//                      (a planner's planar setpoint for a ground robot, e.g. /uav6/alg/reference/pva)
 //   sync_trigger and formation_tick are local facades for the unchanged DMPC
 //   planner: dmpc-rounds writes them on this robot's own round boundaries
 //   (E0 + k*P on the aligned OS clock). Publish them on the robot's own topic;
@@ -103,6 +105,7 @@
 #include <xgc2_geometry_msgs/SceneState.h>
 #include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
+#include <unicycle_reference_trajectory_msgs/PlanarPvaReference.h>
 
 #include "../common/flat_config.hpp"
 #include "../common/reference_wire.hpp"
@@ -147,6 +150,7 @@ enum Port : uint32_t {
   kFormationTick,
   kSceneSnapshot,
   kSceneState,
+  kPlanarPva,
   kPortCount
 };
 
@@ -155,7 +159,7 @@ const char* const kPortNames[kPortCount] = {
     "rigid_state_estimate", "fcu_state", "local_pose", "local_velocity", "fcu_imu", "battery", "command",
     "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
     "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled",
-    "hover_thrust", "controller_state", "formation_tick", "scene_snapshot", "scene_state"};
+    "hover_thrust", "controller_state", "formation_tick", "scene_snapshot", "scene_state", "planar_pva"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -517,6 +521,22 @@ struct RosIo {
       pubs[kFormationTick].publish(m);
       ++to_ros;
     }
+    while (host->next(host->host, kPlanarPva, &v) == XGC_OK) {
+      if (v.len != sizeof(xgc_planar_pva_v1)) continue;
+      xgc_planar_pva_v1 p;
+      std::memcpy(&p, v.data, sizeof p);
+      unicycle_reference_trajectory_msgs::PlanarPvaReference m;
+      m.header.stamp.fromSec(p.stamp);
+      m.x = p.x;
+      m.y = p.y;
+      m.yaw = p.yaw;
+      m.vx = p.vx;
+      m.vy = p.vy;
+      m.ax = p.ax;
+      m.ay = p.ay;
+      pubs[kPlanarPva].publish(m);
+      ++to_ros;
+    }
     while (host->next(host->host, kRigidStateEstimate, &v) == XGC_OK) {
       if (v.len != sizeof(xgc_rigid_state_estimate_v1)) continue;
       xgc_rigid_state_estimate_v1 e;
@@ -697,6 +717,8 @@ struct RosIo {
       subs.push_back(nh->subscribe(topics[kControllerState], queue_size, &RosIo::on_controller_state, this));
     if (enabled(kFormationTick))
       pubs[kFormationTick] = nh->advertise<formation_generator::FormationTick>(topics[kFormationTick], queue_size);
+    if (enabled(kPlanarPva))
+      pubs[kPlanarPva] = nh->advertise<unicycle_reference_trajectory_msgs::PlanarPvaReference>(topics[kPlanarPva], queue_size);
     if (enabled(kHoverThrust))
       subs.push_back(nh->subscribe(topics[kHoverThrust], queue_size, &RosIo::on_hover_thrust, this));
     if (enabled(kRefReset)) subs.push_back(nh->subscribe(topics[kRefReset], queue_size, &RosIo::on_ref_reset, this));
@@ -846,6 +868,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"formation_tick", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.formation_tick/1", XGC_QOS_CONTROL},
     {"scene_snapshot", XGC_PORT_OUT_OPTIONAL, "xgc.scene.snapshot/1", XGC_QOS_EVENT},
     {"scene_state", XGC_PORT_OUT_OPTIONAL, "xgc.scene.state/1", XGC_QOS_STATE},
+    {"planar_pva", XGC_PORT_IN_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
