@@ -30,6 +30,29 @@ pub const SMC_COMPOSITION: &str = include_str!("composition-dmpc-smc.toml");
 pub const BUNDLE_FILE: &str = "DEPLOYMENT-BUNDLE.json";
 pub const MAX_INPUT: usize = 64 * 1024;
 
+// Target identity comes from the compiled binary, not uname on the build host
+// and not a caller-controlled deployment label.
+fn elf_machine_for_target(os: &str, arch: &str) -> Result<u16> {
+    match (os, arch) {
+        ("linux", "x86_64") => Ok(62),
+        ("linux", "aarch64") => Ok(183),
+        _ => Err(format!("unsupported native runtime target: {os}-{arch}")),
+    }
+}
+
+pub(crate) fn target_elf_machine() -> Result<u16> {
+    elf_machine_for_target(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Platform described and accepted by this target-local renderer.
+pub fn target_platform() -> Result<&'static str> {
+    match target_elf_machine()? {
+        62 => Ok("linux-amd64"),
+        183 => Ok("linux-arm64"),
+        _ => Err("unsupported native runtime ELF machine".into()),
+    }
+}
+
 /// Release-owned graphs. The deployment cannot add roles or edit a graph.
 pub struct Composition {
     pub id: &'static str,
@@ -327,9 +350,10 @@ impl Deployment {
             ros_namespace(&self.robot_namespace),
             "invalid canonical relative robot namespace",
         )?;
+        let expected_platform = target_platform()?;
         require(
-            self.platform == "linux-amd64",
-            "only linux-amd64 is supported by this composition release",
+            self.platform == expected_platform,
+            &format!("deployment platform {} does not match renderer target {expected_platform}", self.platform),
         )?;
         require(
             self.composition_sha256 == composition(&self.composition_id)?.sha256(),
@@ -711,4 +735,87 @@ pub fn managed_root(agent: Option<&str>, core: Option<&str>) -> Result<PathBuf> 
     let root = Path::new(root);
     require(absolute(root), "managed root must be a clean absolute path")?;
     Ok(root.join("sync-runtime"))
+}
+
+#[cfg(test)]
+mod target_platform_tests {
+    use super::*;
+
+    fn deployment() -> Deployment {
+        let mut topics = serde_json::Map::new();
+        for role in [
+            "imu_topic", "pose_topic", "vision_pose_topic", "rigid_state_estimate_topic",
+            "fcu_state_topic", "local_pose_topic", "local_velocity_topic", "fcu_imu_topic",
+            "battery_topic", "command_topic", "alg_setpoint_topic", "attitude_target_topic",
+            "setpoint_topic", "attitude_rate_topic", "status_topic", "fcu_request_topic",
+        ] {
+            topics.insert(role.into(), serde_json::json!(format!("/uav1/{role}")));
+        }
+        let configuration_json = serde_json::json!({
+            "input_time_domain": "wall-unix", "ros_master_uri": "http://127.0.0.1:17671",
+            "ros_ip": "127.0.0.1", "takeoff_altitude_m": 2.3, "topics": topics,
+            "calibration": {
+                "verified": false, "field_offset_xyz": [0.0, 0.0, 0.0],
+                "field_offset_rpy": [0.0, 0.0, 0.0], "imu_to_vrpn_marker_xyz": [0.0, 0.0, 0.0],
+                "imu_to_vrpn_marker_rpy": [0.0, 0.0, 0.0],
+                "provenance": {"kind": "unverified", "source_id": "platform-test",
+                    "source_sha256": "ab".repeat(32), "robot_asset_id": "platform-test-asset"}
+            }
+        }).to_string();
+        Deployment {
+            schema_version: 1,
+            session_id: "platform-test".into(),
+            node_id: "uav1".into(),
+            robot_namespace: "uav1".into(),
+            platform: target_platform().unwrap().into(),
+            bundle_sha256: "ab".repeat(32),
+            composition_id: COMPOSITION_ID.into(),
+            composition_sha256: composition_sha256(),
+            configuration_sha256: sha256(configuration_json.as_bytes()),
+            configuration_json,
+        }
+    }
+
+    #[test]
+    fn both_linux_targets_have_explicit_elf_machines() {
+        assert_eq!(elf_machine_for_target("linux", "x86_64").unwrap(), 62);
+        assert_eq!(elf_machine_for_target("linux", "aarch64").unwrap(), 183);
+        for (os, arch) in [
+            ("linux", "arm"), ("linux", "riscv64"), ("linux", "amd64"),
+            ("linux", "arm64"), ("macos", "aarch64"), ("windows", "x86_64"),
+        ] {
+            assert!(elf_machine_for_target(os, arch).is_err());
+        }
+    }
+
+    #[test]
+    fn deployment_platform_must_match_compiled_target() {
+        let good = deployment();
+        assert!(good.validate().is_ok());
+        let original = good.identity_bytes().unwrap();
+        assert!(Deployment::parse(std::str::from_utf8(&original).unwrap()).is_ok());
+        assert_eq!(original, good.identity_bytes().unwrap());
+        let foreign = if good.platform == "linux-amd64" { "linux-arm64" } else { "linux-amd64" };
+        for platform in [foreign, "linux-aarch64", "linux-riscv64", "darwin-arm64", ""] {
+            let mut bad = good.clone();
+            bad.platform = platform.into();
+            assert!(bad.validate().unwrap_err().contains("platform"));
+        }
+    }
+
+    #[test]
+    fn platform_admission_preserves_configuration_and_composition_pins() {
+        let good = deployment();
+        let mut bad_config = good.clone();
+        bad_config.configuration_json.push(' ');
+        assert!(bad_config.validate().unwrap_err().contains("configuration bytes/digest"));
+        let mut bad_composition = good.clone();
+        bad_composition.composition_sha256 = "00".repeat(32);
+        assert!(bad_composition.validate().unwrap_err().contains("composition identity/digest"));
+        let mut bad_schema = good;
+        bad_schema.schema_version = 2;
+        assert!(bad_schema.validate().is_err());
+        assert_eq!(COMPOSITION_ID, "uav-control-dfbc-native-hover/v1");
+        assert_eq!(composition_sha256(), "e9589ea20818504ab2e698ac0ffd8db21e0410581c41c70147e4ebe06b37b985");
+    }
 }
