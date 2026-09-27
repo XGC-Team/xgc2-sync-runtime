@@ -22,13 +22,14 @@ An aggregator is a plain process (`xgc-rt-host`) that loads the `.so` modules on
 
 | Piece | What |
 |---|---|
-| `abi/include/xgc_rt.h` | The C ABI (v1). A plugin is a `.so` exporting `xgc_rt_plugin_v1`, in any language. |
+| `abi/include/xgc_rt.h` | The C ABI (v1). A plugin is a `.so` exporting `xgc_rt_plugin_v1`, in any language. A transport plugin is a `.so` exporting `xgc_rt_transport_v1`. |
 | `crates/xgc-rt-abi` | Rust mirror of the ABI, plus the safe plugin SDK (`Plugin` trait, `export_plugin!`) |
-| `crates/xgc-rt-core` | Envelope v2, the lifecycle state machine, `Clock`/`RoundSchedule`, the `Transport` and `AuditSink` interfaces, and the manifest |
+| `crates/xgc-rt-core` | Envelope v2, the lifecycle state machine, `Clock`/`RoundSchedule`, the `Transport` and `AuditSink` interfaces, the manifest, and `transport_abi` (the Rust side of `xgc_rt_transport_v1`; `export_transport!` exports any `Transport` as a transport plugin) |
 | `crates/xgc-rt-audit` | Lossless records, the multi-node merge, and the `audit-def/1` report (`xgc-rt-audit merge`) |
 | `crates/xgc-rt-transport-loopback` | In-memory stand-in for a link between nodes, with a seeded ground-truth impairment injector (tests only; never used between modules of one aggregator) |
 | `crates/xgc-rt-host` | The aggregator (`xgc-rt-host --manifest`): loader, one thread per module, memory handoff, watchdog, restart policy, health and step logs |
 | `plugins/stub-*`, `plugins/c-stub` | Z1 domain stubs (Rust) and the pure-C plugin |
+| `plugins/transport-loopback`, `plugins/transport-zenoh` | The loopback and Zenoh transports as transport plugins. A manifest names one with `[transport] kind = "zenoh"` and `path = "libtransport_zenoh.so"` (optionally `sha256`), exactly as a `[[plugin]] path`; without `path` the host uses its built-in transport of that kind. |
 
 ## Host behavior
 

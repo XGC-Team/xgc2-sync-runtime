@@ -111,6 +111,14 @@ fn default_start_delay_ms() -> u64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransportSpec {
     pub kind: String,
+    /// A transport plugin (`xgc_rt_transport_v1`), relative to the manifest
+    /// like `[[plugin]] path`; unset: the host's built-in transport `kind`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Digest pin of `path`, as for plugins.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// The transport's own options (e.g. zenoh `listen` / `connect`).
     #[serde(flatten)]
     pub options: toml::Table,
 }

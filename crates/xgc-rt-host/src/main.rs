@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use xgc_rt_core::manifest::Manifest;
 use xgc_rt_core::transport::Transport;
+use xgc_rt_host::transport_so::SoTransport;
 use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 use xgc_rt_transport_zenoh::{ZenohOptions, ZenohTransport};
@@ -55,12 +56,15 @@ fn run() -> Result<bool, String> {
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let manifest = Manifest::from_toml_str(&text).map_err(|e| e.to_string())?;
     let base = path.parent().map(PathBuf::from).unwrap_or_default();
-    let transport: Box<dyn Transport> = match manifest.transport.kind.as_str() {
+    let spec = &manifest.transport;
+    let transport: Box<dyn Transport> = match (&spec.path, spec.kind.as_str()) {
+        // A transport plugin, loaded like a module plugin.
+        (Some(path), kind) => Box::new(SoTransport::load(&base.join(path), spec.sha256.as_deref(), kind, &spec.options).map_err(|e| e.0)?),
         // A single-process bus: every roster node on it must run in this
         // process.
-        "loopback" => Box::new(LoopbackTransport::new(LoopbackBus::new())),
-        "zenoh" => Box::new(ZenohTransport::new(ZenohOptions::from_table(&manifest.transport.options).map_err(|e| e.0)?)),
-        other => return Err(format!("transport kind {other:?} is not available in this build")),
+        (None, "loopback") => Box::new(LoopbackTransport::new(LoopbackBus::new())),
+        (None, "zenoh") => Box::new(ZenohTransport::new(ZenohOptions::from_table(&manifest.transport.options).map_err(|e| e.0)?)),
+        (None, other) => return Err(format!("transport kind {other:?} is not built in; name its plugin with [transport] path")),
     };
     let host = Host::with_manifest_clock(manifest, &base, transport, opts).map_err(|e| e.to_string())?;
     let summary = host.run(&STOP).map_err(|e| e.to_string())?;

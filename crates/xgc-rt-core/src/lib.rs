@@ -9,6 +9,7 @@ pub mod envelope;
 pub mod lifecycle;
 pub mod manifest;
 pub mod transport;
+pub mod transport_abi;
 
 /// Interned channel id: the channel's index in the Session manifest.
 pub type ChannelId = u32;
