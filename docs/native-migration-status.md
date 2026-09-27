@@ -15,6 +15,7 @@ establish deployment on a vehicle. Exact sources, commands and results are in
 | ROS boundary | `ros-io` | Real ROS subscriptions, publications and service calls; contains the ROS dependencies. |
 | UGV control | No UGV domain wrapper in this tree | Upstream ROS-free core extraction is separate work; it is not an aggregated UGV deployment here. |
 | DMPC | Exchange/round protocol plugins | `dmpc-exchange-demo` and `dmpc-rounds` exercise exchange, timing and coordination. Their existence does not establish a migrated full DMPC optimizer or its closed-loop vehicle acceptance. |
+| DMPC planner | `plan-dmpc` | Links the academic planner's ROS-free DMPC agent (configuration from the scenario YAML, the optimizer core and acados); its plans and setpoints are byte-equivalent to the academic fleet replay for one robot of a five-robot knot_fs150 fleet over 60 rounds (`plan_dmpc_replay`). No scene input yet (static and moving obstacles off), no planar or pass-through output, and no closed-loop run with `ctl-px4` or on a vehicle. |
 
 The native-hover integration fixture loads `ros-io`, `est-rigid-state`,
 `est-hover-thrust`, `ctl-px4` and `ref-trajectory` into one host. Domain handoff
