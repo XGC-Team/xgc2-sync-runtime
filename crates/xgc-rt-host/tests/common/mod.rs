@@ -287,3 +287,18 @@ pub fn loopback_plugin_flush(bus: &str) {
     let name = std::ffi::CString::new(bus).unwrap();
     assert_eq!(unsafe { flush(name.as_ptr()) }, 0, "no loopback bus {bus}");
 }
+
+/// A localhost port for a Zenoh listener, free for both TCP and UDP when
+/// picked. It is below the ephemeral range (32768-60999): a port the OS
+/// hands out for `bind(0)` can be taken by an outgoing connection before
+/// the listener binds it, which tests running in parallel did.
+pub fn listen_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let base = 20_000 + (std::process::id() % 1_000) as u16 * 10;
+    loop {
+        let port = base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2_000;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}

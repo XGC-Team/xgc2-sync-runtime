@@ -20,10 +20,6 @@ use xgc_rt_transport_zenoh::{ZenohOptions, ZenohTransport};
 
 const SAMPLES: u64 = 2_000;
 
-fn free_udp() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 fn pct(v: &mut [i64], p: f64) -> i64 {
     v.sort_unstable();
     v[((p / 100.0 * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1]
@@ -57,7 +53,7 @@ fn calibrate_with(name: &str, profile: Profile, transport: &dyn Fn(ZenohOptions)
     let clock = Arc::new(WallClock::new(0));
     let roster = vec!["uav1".to_string(), "uav2".to_string()];
     let channels = vec![ChannelSpec { id: 0, name: "dmpc/plan".into(), qos: Qos::Control }];
-    let pb = free_udp();
+    let pb = common::listen_port();
     let relay = Relay::start("127.0.0.1:0".parse().unwrap(), format!("127.0.0.1:{pb}").parse().unwrap(), profile).unwrap();
     let opts = [
         ZenohOptions { listen: vec![], connect: vec![format!("udp/{}", relay.listen)] },
