@@ -54,10 +54,6 @@ const RATE_HZ: u64 = 20;
 const SECONDS: u64 = 30;
 const PAYLOAD: usize = 1024;
 
-fn free_udp() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 fn pct(v: &mut [i64], p: f64) -> i64 {
     if v.is_empty() {
         return 0;
@@ -84,7 +80,7 @@ fn mesh(name: &str, nodes: usize, channels: &[ChannelSpec], profile: &dyn Fn(usi
     let run = common::scratch(name);
     let clock = Arc::new(WallClock::new(0));
     let roster: Vec<String> = (1..=nodes).map(|i| format!("uav{i}")).collect();
-    let ports: Vec<u16> = (0..nodes).map(|_| free_udp()).collect();
+    let ports: Vec<u16> = (0..nodes).map(|_| common::listen_port()).collect();
     let mut relays = HashMap::new();
     for i in 0..nodes {
         for j in i + 1..nodes {
