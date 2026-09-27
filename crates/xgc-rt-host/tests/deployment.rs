@@ -1137,6 +1137,8 @@ fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
     assert_eq!(ros["config"]["local_pose_topic"].as_str(), Some("/uav2/mavros/local_position/pose"));
     assert_eq!(ros["config"]["local_velocity_topic"].as_str(), Some("/uav2/mavros/local_position/velocity_local"));
     let ctl = plugin(&m, "ctl-px4");
+    assert_eq!(ctl["bind"]["alg_setpoint"]["channel"].as_str(), Some("position_target"));
+    assert_eq!(ctl["bind"]["alg_setpoint"]["from"].as_array().unwrap(), &["board-b".into()]);
     assert!(ctl["bind"].get("paired_state").is_none());
     assert!(ctl["bind"].get("estimate").is_none());
     assert!(ctl["bind"].get("hover_thrust").is_none());
@@ -1146,6 +1148,8 @@ fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
     assert_eq!(ctl["bind"]["local_pose"]["from"].as_array().unwrap(), &["board-b".into()]);
     assert_eq!(ctl["config"]["tracking_backend"].as_str(), Some("smc"));
     assert_eq!(plugin(&m, "plan-dmpc")["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
+    assert_eq!(plugin(&m, "plan-dmpc")["bind"]["position_target"]["channel"].as_str(), Some("position_target"));
+    assert!(plugin(&m, "plan-dmpc")["bind"]["position_target"].get("from").is_none());
     assert_plan_configure(&plugin(&m, "plan-dmpc")["config"], 2, 0);
     let station = plugin(&m, "station-io");
     assert_eq!(station["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
@@ -1180,6 +1184,8 @@ fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
     assert!(plugin(&m, "ros_io")["bind"]["paired_state"].get("from").is_none());
     assert_eq!(plugin(&m, "ros_io")["bind"]["vision_pose"]["channel"].as_str(), Some("pose"));
     assert!(plugin(&m, "ctl-px4")["bind"].get("paired_state").is_none());
+    assert_eq!(plugin(&m, "ctl-px4")["bind"]["alg_setpoint"]["channel"].as_str(), Some("position_target"));
+    assert_eq!(plugin(&m, "ctl-px4")["bind"]["alg_setpoint"]["from"].as_array().unwrap(), &["gcs-b".into()]);
     assert!(plugin(&m, "ctl-px4")["bind"].get("attitude_rate").is_none());
     let station = plugin(&m, "station-io");
     assert_eq!(station["bind"]["paired_state"]["from"].as_array().unwrap(), &["board-b".into()]);
@@ -1192,6 +1198,33 @@ fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
     assert!(station["bind"].get("command").is_none());
     assert!(station["bind"].get("mission_request").is_none());
     assert!(!channel_names(&m).contains(&"estimate"));
+}
+
+#[test]
+fn dmpc_transport_is_explicit_and_rejects_self_loop_aliases() {
+    for kind in ["native", "planner", "smc"] {
+        let c = dmpc_case(kind);
+        let prepared = c.prepare().unwrap();
+        let m = manifest(&prepared);
+        assert_eq!(m["transport"]["kind"].as_str(), Some("zenoh"));
+        assert_eq!(m["transport"]["listen"].as_array().unwrap(), &["tcp/127.0.0.1:17442".into()]);
+        assert_eq!(m["transport"]["connect"].as_array().unwrap(), &["tcp/127.0.0.1:17441".into()]);
+        drop(prepared);
+
+        let mut c = dmpc_case(kind);
+        c.config(|v| {
+            let endpoint = v["radio"]["listen"][0].clone();
+            v["radio"]["connect"] = json!([endpoint]);
+        });
+        c.rejected("listen/connect disjoint");
+
+        let mut c = dmpc_case(kind);
+        c.config(|v| {
+            let endpoint = v["radio"]["listen"][0].clone();
+            v["radio"]["listen"] = json!([endpoint.clone(), endpoint]);
+        });
+        c.rejected("unique");
+    }
 }
 
 #[test]
