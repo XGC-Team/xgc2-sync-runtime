@@ -43,7 +43,7 @@ impl Case {
         };
         let descriptor = Bundle {
             schema_version: 1,
-            platform: "linux-amd64".into(),
+            platform: target_platform().unwrap().into(),
             composition_sha256: composition_sha256(),
             host: pin("bin/xgc-rt-host"),
             plugins: Plugins {
@@ -70,7 +70,7 @@ impl Case {
             session_id: "experiment-52".into(),
             node_id: "robot-208".into(),
             robot_namespace: "uav2".into(),
-            platform: "linux-amd64".into(),
+            platform: target_platform().unwrap().into(),
             bundle_sha256: sha256(&bytes),
             composition_id: COMPOSITION_ID.into(),
             composition_sha256: composition_sha256(),
@@ -246,7 +246,7 @@ fn strict_envelope_and_nested_schema_and_original_json_hash() {
 fn unsupported_composition_platform_simtime_and_noncanonical_names_rejected() {
     for (field, value) in [
         ("composition_id", "dmpc"),
-        ("platform", "linux-arm64"),
+        ("platform", if target_platform().unwrap() == "linux-amd64" { "linux-arm64" } else { "linux-amd64" }),
         ("composition_sha256", &"0".repeat(64)),
         ("session_id", "../escape"),
         ("node_id", "bad/node"),
@@ -323,6 +323,19 @@ fn calibration_claim_requires_matching_explicit_provenance() {
     c.config(|v| v["takeoff_altitude_m"] = json!(-1));
     c.rejected("finite and positive");
 }
+#[test]
+fn foreign_elf_is_rejected_even_with_matching_file_digest() {
+    let mut c = Case::new();
+    let path = c.bundle.join("plugins/ctl.so");
+    let mut bytes = fs::read(&path).unwrap();
+    let foreign: u16 = if target_elf_machine().unwrap() == 62 { 183 } else { 62 };
+    bytes[18..20].copy_from_slice(&foreign.to_le_bytes());
+    fs::write(path, &bytes).unwrap();
+    c.descriptor(|b| b.plugins.controller.as_mut().unwrap().sha256 = sha256(&bytes));
+    c.rejected("plugins/ctl.so is not little-endian ELF64");
+    assert!(!c.state.exists());
+}
+
 #[test]
 fn artifacts_and_descriptor_bytes_are_verified_before_state_creation() {
     let c = Case::new();
@@ -604,7 +617,7 @@ fn describe_selects_only_compiled_compositions_and_preserves_legacy_default() {
             value,
             json!({"schema_version":1,"composition_id":id,
             "composition_sha256":composition(id).unwrap().sha256(),
-            "composition_bytes":composition(id).unwrap().bytes,"platform":"linux-amd64",
+            "composition_bytes":composition(id).unwrap().bytes,"platform":target_platform().unwrap(),
             "input_time_domain":"wall-unix","managed_launch":"run","live_readiness":false})
         );
     }
