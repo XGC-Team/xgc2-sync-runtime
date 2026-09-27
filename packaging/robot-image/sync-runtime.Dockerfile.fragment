@@ -1,0 +1,24 @@
+# Fragment for the FS150 robot image (XGC-Team/xgc2 robot-container/fs150/
+# Dockerfile, after the source-pinned Agent): the sync-runtime bundle, staged
+# by this repository's scripts/stage-robot-bundle.sh from pinned revisions
+# into the build context's .build/sync-runtime/, copied in and refused unless
+# every file matches SHA256SUMS and the pins match the build arguments.
+# Nothing comes from APT; no CI or Jenkins job builds it (decision B).
+ARG XGC2_SYNC_RUNTIME_REVISION
+ARG XGC2_ACADEMIC_REVISION
+ARG XGC2_SYNC_RUNTIME_PINS_SHA256
+COPY .build/sync-runtime/ /opt/xgc2/sync-runtime/
+RUN set -eux \
+    && printf '%s\n' "${XGC2_SYNC_RUNTIME_REVISION}" | grep -Eqx '[0-9a-f]{40}' \
+    && printf '%s\n' "${XGC2_ACADEMIC_REVISION}" | grep -Eqx '[0-9a-f]{40}' \
+    && printf '%s  %s\n' "${XGC2_SYNC_RUNTIME_PINS_SHA256}" /opt/xgc2/sync-runtime/SOURCE-PINS.json | sha256sum --check --strict - \
+    && cd /opt/xgc2/sync-runtime && sha256sum --check --strict SHA256SUMS \
+    && grep -q "\"revision\": \"${XGC2_SYNC_RUNTIME_REVISION}\"" SOURCE-PINS.json \
+    && grep -q "\"revision\": \"${XGC2_ACADEMIC_REVISION}\"" SOURCE-PINS.json \
+    && ! find /opt/xgc2/sync-runtime -type l | grep -q . \
+    && chmod -R a-w /opt/xgc2/sync-runtime \
+    && LD_LIBRARY_PATH=/opt/xgc2/sync-runtime/lib:/opt/acados/lib /opt/xgc2/sync-runtime/bin/xgc-rt-render describe >/dev/null
+LABEL io.xgc2.robot-image.sync-runtime-source="source-pinned" \
+      io.xgc2.robot-image.sync-runtime-revision="${XGC2_SYNC_RUNTIME_REVISION}" \
+      io.xgc2.robot-image.academic-revision="${XGC2_ACADEMIC_REVISION}" \
+      io.xgc2.robot-image.sync-runtime-pins-sha256="${XGC2_SYNC_RUNTIME_PINS_SHA256}"
