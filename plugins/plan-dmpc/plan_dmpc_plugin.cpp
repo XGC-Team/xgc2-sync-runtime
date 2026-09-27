@@ -1,6 +1,8 @@
 #include "plan_dmpc.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +30,9 @@ enum Port : uint32_t {
   kPlannerStatus,
   kNeighborPosition,
   kOwnPosition,
+  kPlanarTarget,
+  kClock,
+  kRoundDone,
   kPortCount
 };
 
@@ -40,11 +45,14 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"neighbor_plan", XGC_PORT_IN, "xgc.dmpc.assumed_trajectory/1", XGC_QOS_CONTROL},
     {"sync_trigger", XGC_PORT_IN, "xgc.dmpc.sync_trigger/1", XGC_QOS_CONTROL},
     {"timeline_status", XGC_PORT_OUT, "xgc.dmpc.timeline_status/1", XGC_QOS_STATE},
-    {"position_target", XGC_PORT_OUT, "xgc.position_target/1", XGC_QOS_CONTROL},
+    {"position_target", XGC_PORT_OUT_OPTIONAL, "xgc.position_target/1", XGC_QOS_CONTROL},
     {"own_plan", XGC_PORT_OUT, "xgc.dmpc.assumed_trajectory/1", XGC_QOS_CONTROL},
     {"planner_status", XGC_PORT_OUT, "xgc.dmpc.planner_status/1", XGC_QOS_STATE},
     {"neighbor_position", XGC_PORT_IN, "xgc.dmpc.measured_position/1", XGC_QOS_STATE},
     {"own_position", XGC_PORT_OUT, "xgc.dmpc.measured_position/1", XGC_QOS_STATE},
+    {"planar_target", XGC_PORT_OUT_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
+    {"clock", XGC_PORT_IN_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
+    {"round_done", XGC_PORT_OUT_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
 };
 
 void sha256(const uint8_t* data, size_t len, uint8_t out[32]) {
@@ -100,6 +108,8 @@ struct Plugin {
   std::string domain = "unconfigured";
   bool have_planner_round = false;
   uint64_t planner_k = 0;
+  bool input_clock = false;
+  int64_t next_hold_ns = 0;
   std::optional<xgc_dmpc_measured_position_v1> own_position;
 };
 
@@ -177,6 +187,9 @@ xgc_status configure(void* p, const char* text) {
       if (self->host && self->host->log) self->host->log(self->host->host, XGC_LOG_ERROR, error.c_str());
       return XGC_ERR;
     }
+    const auto clock = cfg::text_or(config, "pass_through_clock", "session");
+    if (clock != "session" && clock != "input") return XGC_ERR;
+    self->input_clock = clock == "input";
     self->plan = std::move(plan);
     self->domain = "configured";
     return XGC_OK;
@@ -195,6 +208,41 @@ bool take_last(const xgc_host_api* host, uint32_t port, T* out) {
     got = true;
   }
   return got;
+}
+
+xgc_status publish_setpoints(Plugin* self, uint64_t round, const xgc_plan_dmpc::StepTrace& trace) {
+  if (trace.have_position_target &&
+      self->host->publish(self->host->host, kPositionTarget, round,
+                          reinterpret_cast<const uint8_t*>(&trace.position_target),
+                          sizeof trace.position_target) != XGC_OK) return XGC_ERR;
+  if (trace.have_planar_target &&
+      self->host->publish(self->host->host, kPlanarTarget, round,
+                          reinterpret_cast<const uint8_t*>(&trace.planar_target),
+                          sizeof trace.planar_target) != XGC_OK) return XGC_ERR;
+  return XGC_OK;
+}
+
+xgc_status publish_holds(Plugin* self, const xgc_step_ctx* ctx) {
+  xgc_sample_view sample{};
+  while (self->host->next(self->host->host, kClock, &sample) == XGC_OK) {
+    if (!self->input_clock || !sample.data || sample.len != sizeof(double)) continue;
+    double stamp;
+    std::memcpy(&stamp, sample.data, sizeof stamp);
+    if (!std::isfinite(stamp) || stamp < 0.0) continue;
+    if (publish_setpoints(self, self->planner_k, self->plan->pass_through_hold(stamp)) != XGC_OK) return XGC_ERR;
+  }
+  const auto& loaded = self->plan->loaded();
+  if (!self->input_clock && self->have_planner_round && loaded.passThrough() && loaded.pass_through_hold_rate_hz > 0.0) {
+    const int64_t period = std::max<int64_t>(1, static_cast<int64_t>(1e9 / loaded.pass_through_hold_rate_hz));
+    if (self->next_hold_ns == 0) self->next_hold_ns = (ctx->now / period + 1) * period;
+    if (self->next_hold_ns <= ctx->now) {
+      // A delayed host step needs the current hold, not a burst of old ones.
+      if (publish_setpoints(self, self->planner_k,
+                            self->plan->pass_through_hold(ctx->now * 1e-9)) != XGC_OK) return XGC_ERR;
+      self->next_hold_ns = (ctx->now / period + 1) * period;
+    }
+  }
+  return XGC_OK;
 }
 
 xgc_status step(void* p, const xgc_step_ctx* ctx) {
@@ -252,12 +300,14 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
       if (view.data == nullptr || view.len < sizeof(xgc_dmpc_sync_trigger_v1)) continue;
       xgc_dmpc_sync_trigger_v1 trigger{};
       std::memcpy(&trigger, view.data, sizeof trigger);
-      if (self->have_planner_round && trigger.sequence_id == self->planner_k) continue;
+      if (!std::isfinite(trigger.trigger_time) || trigger.trigger_time < 0.0 ||
+          (self->have_planner_round && trigger.sequence_id <= self->planner_k) ||
+          (planner_due && trigger.sequence_id <= planner_k)) continue;
       planner_due = true;
       planner_k = trigger.sequence_id;
       trigger_time = trigger.trigger_time;
     }
-    if (!planner_due) return XGC_OK;
+    if (!planner_due) return publish_holds(self, ctx);
     self->have_planner_round = true;
     self->planner_k = planner_k;
     if (self->own_position &&
@@ -281,18 +331,15 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
                             reinterpret_cast<const uint8_t*>(&trace.status), sizeof trace.status) != XGC_OK) {
       return XGC_ERR;
     }
-    if (trace.have_position_target &&
-        self->host->publish(self->host->host, kPositionTarget, planner_k,
-                            reinterpret_cast<const uint8_t*>(&trace.position_target),
-                            sizeof trace.position_target) != XGC_OK) {
-      return XGC_ERR;
-    }
+    if (publish_setpoints(self, planner_k, trace) != XGC_OK) return XGC_ERR;
     if (!trace.own_plan.empty() &&
         self->host->publish(self->host->host, kOwnPlan, planner_k, trace.own_plan.data(),
                             static_cast<uint32_t>(trace.own_plan.size())) != XGC_OK) {
       return XGC_ERR;
     }
-    return XGC_OK;
+    if (self->host->publish(self->host->host, kRoundDone, planner_k,
+                            reinterpret_cast<const uint8_t*>(&trigger_time), sizeof trigger_time) != XGC_OK) return XGC_ERR;
+    return publish_holds(self, ctx);
   });
 }
 

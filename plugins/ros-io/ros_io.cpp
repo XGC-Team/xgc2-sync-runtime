@@ -44,6 +44,7 @@
 //     ref_active_sampled    xgc.ref.sampled/1       -> .../SampledReference (latched)
 //   (the ref_* outputs are latched, as the reference trajectory node's are)
 //     formation_tick   xgc.dmpc.formation_tick/1    -> formation_generator/FormationTick
+//     planar_pva       xgc.planar_pva/1             -> unicycle_reference_trajectory_msgs/PlanarPvaReference
 //   sync_trigger and formation_tick are local facades for the unchanged DMPC
 //   planner: dmpc-rounds writes them on this robot's own round boundaries
 //   (E0 + k*P on the aligned OS clock). Publish them on the robot's own topic;
@@ -100,6 +101,7 @@
 #include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
 #include <std_msgs/UInt8MultiArray.h>
+#include <unicycle_reference_trajectory_msgs/PlanarPvaReference.h>
 
 #include "../common/flat_config.hpp"
 #include "../common/reference_wire.hpp"
@@ -153,6 +155,7 @@ enum Port : uint32_t {
   kMissionRequest,
   kTimelineAck,
   kTimelineStatus,
+  kPlanarPva,
   kPortCount
 };
 
@@ -162,7 +165,7 @@ const char* const kPortNames[kPortCount] = {
     "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
     "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled",
     "hover_thrust", "controller_state", "formation_tick", "paired_state", "scene_snapshot",
-    "scene_heartbeat", "mission_request", "timeline_ack", "timeline_status"};
+    "scene_heartbeat", "mission_request", "timeline_ack", "timeline_status", "planar_pva"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -600,6 +603,22 @@ struct RosIo {
       pubs[kFormationTick].publish(m);
       ++to_ros;
     }
+    while (host->next(host->host, kPlanarPva, &v) == XGC_OK) {
+      if (v.len != sizeof(xgc_planar_pva_v1)) continue;
+      xgc_planar_pva_v1 p;
+      std::memcpy(&p, v.data, sizeof p);
+      unicycle_reference_trajectory_msgs::PlanarPvaReference m;
+      m.header.stamp.fromSec(p.stamp);
+      m.x = p.x;
+      m.y = p.y;
+      m.yaw = p.yaw;
+      m.vx = p.vx;
+      m.vy = p.vy;
+      m.ax = p.ax;
+      m.ay = p.ay;
+      pubs[kPlanarPva].publish(m);
+      ++to_ros;
+    }
     while (host->next(host->host, kRigidStateEstimate, &v) == XGC_OK) {
       if (v.len != sizeof(xgc_rigid_state_estimate_v1)) continue;
       xgc_rigid_state_estimate_v1 e;
@@ -802,6 +821,9 @@ struct RosIo {
       pubs[kTimelineAck] = nh->advertise<std_msgs::UInt8MultiArray>(topics[kTimelineAck], queue_size);
     if (enabled(kTimelineStatus))
       pubs[kTimelineStatus] = nh->advertise<std_msgs::UInt8MultiArray>(topics[kTimelineStatus], queue_size);
+    if (enabled(kPlanarPva))
+      pubs[kPlanarPva] =
+          nh->advertise<unicycle_reference_trajectory_msgs::PlanarPvaReference>(topics[kPlanarPva], queue_size);
     if (enabled(kHoverThrust))
       subs.push_back(nh->subscribe(topics[kHoverThrust], queue_size, &RosIo::on_hover_thrust, this));
     if (enabled(kRefReset)) subs.push_back(nh->subscribe(topics[kRefReset], queue_size, &RosIo::on_ref_reset, this));
@@ -972,6 +994,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"mission_request", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.mission_timeline/1", XGC_QOS_EVENT},
     {"timeline_ack", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.timeline_ack/1", XGC_QOS_EVENT},
     {"timeline_status", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.timeline_status/1", XGC_QOS_STATE},
+    {"planar_pva", XGC_PORT_IN_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

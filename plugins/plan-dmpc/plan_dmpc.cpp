@@ -8,12 +8,6 @@
 #include <stdexcept>
 #include <utility>
 
-#include "formation_generator/config/leader_reference_config.h"
-#include "formation_generator/core/dmpc_round.h"
-#include "formation_generator/core/position_target_output.h"
-#include "formation_generator/dmpc_scheduler/configuration_loader.h"
-#include "formation_generator/dmpc_scheduler/dmpc_factory.h"
-#include "formation_generator/lifecycle/goal_apply.h"
 #include "formation_generator/params/rosparam_yaml.h"
 
 namespace xgc_plan_dmpc {
@@ -68,32 +62,25 @@ std::unique_ptr<PlanDmpc> PlanDmpc::open(const PlanDmpcOpen& request, std::strin
     if (request.manifest_path.empty()) return fail("manifest path is required");
     if (request.scene_id.empty()) return fail("scene_id is required");
     if (request.self_id < 1) return fail("self_id is required");
-    using formation_generator_dmpc::ConfigurationLoader;
-    using formation_generator_dmpc::DmpcConfiguration;
     const auto params = formation_generator_dmpc::privateParamsFromManifest(
         formation_generator_dmpc::loadParamManifest(request.manifest_path));
-    DmpcConfiguration loaded;
-    loaded.params = params;
-    ConfigurationLoader::loadFromParameters(params, loaded);
+    auto agent = std::make_unique<formation_generator_dmpc::DmpcAgent>(params);
+    const auto& loaded = agent->configuration();
+    const int horizon = agent->leader()->getHorizon() - 1;
     if (!loaded.params.hasParam("num_uavs")) return fail("manifest is missing num_uavs");
     if (!loaded.params.hasParam("uav_id")) return fail("manifest is missing uav_id");
     if (static_cast<int>(loaded.uav_id) != request.self_id) {
       return fail("self_id does not match the manifest uav_id");
     }
-    if (loaded.algorithm != "legacy") return fail("unsupported algorithm");
-    // Same assignment createLegacyOptimizer writes before building the QP.
-    loaded.chain_n = 3;
-    loaded.chain_q = 3;
-    loaded.assumed_state_dim = 9;
     if (request.algorithm && *request.algorithm != loaded.algorithm) return fail(mismatch("algorithm"));
     if (request.chain_n && *request.chain_n != loaded.chain_n) return fail(mismatch("chain_n"));
     if (request.state_dim && *request.state_dim != loaded.assumed_state_dim) return fail(mismatch("state_dim"));
-    if (request.horizon && *request.horizon != loaded.mpc_params.horizon) return fail(mismatch("horizon"));
+    if (request.horizon && *request.horizon != horizon) return fail(mismatch("horizon"));
     if (request.fleet_count && *request.fleet_count != loaded.num_uavs) return fail(mismatch("fleet_count"));
     if (request.sampling_time && *request.sampling_time != loaded.mpc_params.sampling_time) {
       return fail(mismatch("sampling_time"));
     }
-    if (loaded.mpc_params.horizon <= 0 || !std::isfinite(loaded.mpc_params.sampling_time) ||
+    if (horizon <= 0 || !std::isfinite(loaded.mpc_params.sampling_time) ||
         loaded.mpc_params.sampling_time <= 0.0 || loaded.num_uavs < 1 || loaded.uav_id < 1 ||
         loaded.uav_id > loaded.num_uavs) {
       return fail("loaded roster or horizon is not usable");
@@ -104,48 +91,30 @@ std::unique_ptr<PlanDmpc> PlanDmpc::open(const PlanDmpcOpen& request, std::strin
     std::snprintf(fields.scene_id, sizeof fields.scene_id, "%s", request.scene_id.c_str());
     fields.chain_n = loaded.chain_n;
     fields.state_dim = loaded.assumed_state_dim;
-    fields.horizon = loaded.mpc_params.horizon;
+    fields.horizon = horizon;
     fields.sampling_time = loaded.mpc_params.sampling_time;
     fields.self_id = static_cast<int32_t>(loaded.uav_id);
     fields.fleet_count = loaded.num_uavs;
     fields.timeline_authority = request.timeline_authority;
-    auto plan = std::unique_ptr<PlanDmpc>(new PlanDmpc(fields, std::move(loaded)));
-    if (!plan->configure_error_.empty()) return fail(plan->configure_error_);
-    return plan;
+    return std::unique_ptr<PlanDmpc>(new PlanDmpc(fields, std::move(agent)));
   } catch (const std::exception& ex) {
     return fail(ex.what());
   }
 }
 
 PlanDmpc::PlanDmpc(const xgc_dmpc_planner_config_v1& config,
-                   formation_generator_dmpc::DmpcConfiguration loaded)
-    : config_(config), loaded_(std::move(loaded)) {
-  lifecycle_.setHooks({}, {}, [this](std::string& fault) { return initialize_optimizer(fault); });
-  lifecycle_.start();
-  try {
-    const auto spec = formation_generator_dmpc::loadLeaderReferenceSpec(loaded_.params);
-    leader_ = formation_generator_dmpc::makeLeaderReference(spec, config_.sampling_time, config_.horizon + 1);
-    const double origin_z =
-        loaded_.params.param("leader_initial_position_z", loaded_.takeoff_altitude);
-    leader_->initialize(Eigen::Vector3d(loaded_.params.param("leader_initial_position_x", 0.0),
-                                        loaded_.params.param("leader_initial_position_y", 0.0), origin_z));
-    patterns_ = std::make_unique<formation_generator_dmpc::PatternManager>(loaded_);
-    patterns_->initialize(config_.fleet_count);
-  } catch (const std::exception& error) {
-    configure_error_ = error.what();
-  }
-}
+                   std::unique_ptr<formation_generator_dmpc::DmpcAgent> agent)
+    : config_(config), agent_(std::move(agent)) {}
 
 int PlanDmpc::leader_rows() const {
-  return leader_ ? static_cast<int>(leader_->getPredictedTrajectory().rows()) : 0;
+  return agent_ && agent_->leader() ? static_cast<int>(agent_->leader()->getPredictedTrajectory().rows()) : 0;
 }
 
 int PlanDmpc::leader_cols() const {
-  return leader_ ? static_cast<int>(leader_->getPredictedTrajectory().cols()) : 0;
+  return agent_ && agent_->leader() ? static_cast<int>(agent_->leader()->getPredictedTrajectory().cols()) : 0;
 }
 
 std::string PlanDmpc::push_state(const xgc_dmpc_paired_state_v1& state, double now_sec) {
-  if (!configure_error_.empty()) return configure_error_;
   if (state.pose_stamp_sec != state.twist_stamp_sec) {
     state_ok_ = false;
     return "pose and twist stamps differ";
@@ -159,33 +128,29 @@ std::string PlanDmpc::push_state(const xgc_dmpc_paired_state_v1& state, double n
   state_stamp_sec_ = state.pose_stamp_sec;
   measured_ << state.position[0], state.position[1], state.position[2], state.linear_velocity[0],
       state.linear_velocity[1], state.linear_velocity[2];
+  agent_->observeState(measured_, Eigen::Vector4d(state.orientation_xyzw[0], state.orientation_xyzw[1],
+                                               state.orientation_xyzw[2], state.orientation_xyzw[3]), state_stamp_sec_);
   return {};
 }
 
 std::string PlanDmpc::push_controller(const xgc_dmpc_controller_status_v1& status, double now_sec) {
-  if (!configure_error_.empty()) return configure_error_;
   const std::string stamp = stamp_error(status.stamp_sec, now_sec, "controller");
   if (!stamp.empty()) {
-    controller_ok_ = false;
+    agent_->observeController("", now_sec);
     return stamp;
   }
-  std::strncpy(controller_state_, status.state, sizeof(controller_state_) - 1);
-  controller_state_[sizeof(controller_state_) - 1] = '\0';
-  controller_ok_ = true;
-  controller_stamp_sec_ = status.stamp_sec;
+  const std::string state(status.state, strnlen(status.state, sizeof status.state));
+  agent_->observeController(state, status.stamp_sec);
   return {};
 }
 
 std::string PlanDmpc::push_scene(const xgc_dmpc_scene_ids_v1& snapshot, const xgc_dmpc_scene_ids_v1& state) {
-  if (!configure_error_.empty()) return configure_error_;
-  scene_ids_match_ = false;
   if (std::strcmp(snapshot.scene_id, config_.scene_id) != 0 ||
       std::strcmp(state.scene_id, config_.scene_id) != 0 || snapshot.revision == 0 ||
       snapshot.revision != state.revision) {
     return "scene snapshot/state identity does not match";
   }
-  // Identity match is not a loaded scene. ScenarioInput / SharedSceneAdapter
-  // are not in the core yet, so no obstacle is installed.
+  // Identity alone does not supply the scene geometry.
   return "scene geometry is not loaded; refusing id-only acceptance";
 }
 
@@ -203,25 +168,63 @@ xgc_dmpc_mission_ack_v1 PlanDmpc::acknowledge(const xgc_dmpc_mission_timeline_v1
 
 std::string PlanDmpc::push_scene_definition(const formation_generator_dmpc::PlainSceneDefinitionView& snapshot,
                                             const formation_generator_dmpc::PlainSceneDynamicState* state) {
-  if (!configure_error_.empty()) return configure_error_;
+  namespace fg = formation_generator_dmpc;
   geometry_ready_ = false;
-  scene_ids_match_ = false;
   scene_epoch_.clear();
-  try {
-    const formation_generator_dmpc::AdaptedScene adapted = scene_adapter_.convert(snapshot, state);
-    formation_generator_dmpc::acceptScenePolicy(
-        adapted, loaded_.mpc_params.enable_static_obstacle_collision_constraints, false, false);
-    const int count = static_cast<int>(adapted.statics.size());
-    scene_.setGeometryTemplates(adapted.templates);
-    scene_.updateStaticObstacles(adapted.statics, config_.self_id, count);
-    templates_ = adapted.templates;
-    statics_ = adapted.statics;
-  } catch (const std::exception& error) {
-    return error.what();
+  // One scene converter in the academic core. The native wire supplies its
+  // ROS-free scene data; the planner owns geometry admission and local crop.
+  auto pose = [](const fg::PlainScenePose& value) {
+    convex_geometry::PlainPose out;
+    out.position = {value.position.x(), value.position.y(), value.position.z()};
+    out.orientation = {value.orientation.x(), value.orientation.y(), value.orientation.z(), value.orientation.w()};
+    return out;
+  };
+  fg::SceneSnapshotData data;
+  data.scene_id = config_.scene_id;
+  data.epoch = snapshot.epoch;
+  data.frame_id = snapshot.frame_id;
+  data.revision = snapshot.revision;
+  data.stamp = snapshot.definition.stamp_sec;
+  for (const auto& obstacle : snapshot.definition.obstacles) {
+    fg::SceneObstacleData entry;
+    entry.id = obstacle.id;
+    entry.dynamic = obstacle.dynamic;
+    entry.motion_type = obstacle.motion_type;
+    entry.pose = pose(obstacle.pose);
+    for (const auto& part : obstacle.parts) {
+      fg::ScenePartData item;
+      item.id = part.id;
+      item.pose = pose(part.pose);
+      item.geometry.type = part.type;
+      item.geometry.size = {part.size.x(), part.size.y(), part.size.z()};
+      item.geometry.radius = part.radius;
+      item.geometry.height = part.height;
+      for (const auto& vertex : part.vertices) {
+        item.geometry.vertices.push_back({vertex.x(), vertex.y(), vertex.z()});
+      }
+      entry.parts.push_back(std::move(item));
+    }
+    data.obstacles.push_back(std::move(entry));
   }
-  if (scene_.staticObstacles().size() != statics_.size()) return "planner scene did not keep the loaded obstacles";
+  agent_->receiveSceneSnapshot(data);
+  if (state) {
+    fg::SceneStateData dynamic;
+    dynamic.epoch = state->epoch;
+    dynamic.frame_id = state->frame_id;
+    dynamic.revision = state->revision;
+    dynamic.stamp = state->stamp_sec;
+    for (const auto& obstacle : state->obstacles) {
+      fg::SceneObstacleStateData entry;
+      entry.id = obstacle.id;
+      entry.pose = pose(obstacle.pose);
+      entry.twist.linear = {obstacle.twist.linear.x(), obstacle.twist.linear.y(), obstacle.twist.linear.z()};
+      entry.twist.angular = {obstacle.twist.angular.x(), obstacle.twist.angular.y(), obstacle.twist.angular.z()};
+      dynamic.obstacles.push_back(std::move(entry));
+    }
+    agent_->receiveSceneState(dynamic, state->stamp_sec);
+  }
+  if (!agent_->sceneValid()) return agent_->sceneError().empty() ? "scene awaits matching state" : agent_->sceneError();
   geometry_ready_ = true;
-  scene_ids_match_ = true;
   scene_epoch_ = snapshot.epoch;
   return {};
 }
@@ -234,9 +237,9 @@ std::string PlanDmpc::decode_records(const xgc_dmpc_scene_header_v1& header,
                                      formation_generator_dmpc::PlainSceneDynamicState* state,
                                      bool* have_state) const {
   static_assert(offsetof(xgc_dmpc_scene_header_v1, epoch) == 72, "epoch offset");
-  static_assert(sizeof(xgc_dmpc_scene_header_v1) == 136, "scene header");
-  static_assert(offsetof(xgc_dmpc_scene_obstacle_v1, motion_type) == 176, "motion_type offset");
-  static_assert(sizeof(xgc_dmpc_scene_obstacle_v1) == 192, "scene obstacle");
+  static_assert(sizeof(xgc_dmpc_scene_header_v1) == 144, "scene header");
+  static_assert(offsetof(xgc_dmpc_scene_obstacle_v1, motion_type) == 224, "motion_type offset");
+  static_assert(sizeof(xgc_dmpc_scene_obstacle_v1) == 240, "scene obstacle");
   static_assert(offsetof(xgc_dmpc_scene_part_v1, vertex_begin) == 56, "vertex_begin");
   static_assert(offsetof(xgc_dmpc_scene_part_v1, vertex_count) == 60, "vertex_count");
   static_assert(offsetof(xgc_dmpc_scene_part_v1, position) == 64, "part pose offset");
@@ -263,6 +266,7 @@ std::string PlanDmpc::decode_records(const xgc_dmpc_scene_header_v1& header,
   view->revision = header.revision;
   view->definition.epoch = epoch;
   view->definition.frame_id = frame;
+  view->definition.stamp_sec = header.stamp_sec;
   bool any_dynamic = false;
   for (uint32_t index = 0; index < header.obstacle_count; ++index) {
     formation_generator_dmpc::PlainSceneObstacle obstacle;
@@ -311,6 +315,7 @@ std::string PlanDmpc::decode_records(const xgc_dmpc_scene_header_v1& header,
   state->epoch = view->epoch;
   state->frame_id = view->frame_id;
   state->revision = view->revision;
+  state->stamp_sec = header.stamp_sec;
   for (uint32_t index = 0; index < header.obstacle_count; ++index) {
     formation_generator_dmpc::PlainSceneObstacleState item;
     if (!take_text(obstacles[index].id, sizeof obstacles[index].id, &item.id)) {
@@ -358,14 +363,12 @@ std::string PlanDmpc::push_scene_wire(const xgc_dmpc_scene_header_v1& header,
 }
 
 std::string PlanDmpc::push_heartbeat(const xgc_dmpc_scene_heartbeat_v1& beat) {
-  if (!configure_error_.empty()) return configure_error_;
   if (!std::isfinite(beat.received_wall_sec)) return "scene heartbeat is not finite";
   heartbeat_wall_sec_ = beat.received_wall_sec;
   return {};
 }
 
 std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, const uint8_t digest[32]) {
-  if (!configure_error_.empty()) return configure_error_;
   static_assert(sizeof(xgc_dmpc_mission_timeline_v1) == 240, "timeline request size");
   static_assert(sizeof(xgc_dmpc_mission_commit_v1) == 256, "timeline commit size");
   static_assert(sizeof(xgc_dmpc_timeline_status_v1) == 160, "timeline status size");
@@ -458,72 +461,22 @@ std::string PlanDmpc::push_commit(const xgc_dmpc_mission_commit_v1& commit, cons
   return {};
 }
 
-bool PlanDmpc::neighbors_ready(double now_sec) const {
-  if (!loaded_.mpc_params.enable_inter_uav_collision_constraints) return true;
-  for (int id = 1; id <= config_.fleet_count; ++id) {
-    if (id == config_.self_id) continue;
-    const auto found = neighbor_plans_.find(id);
-    if (found == neighbor_plans_.end() ||
-        now_sec - found->second.timestamp > loaded_.mpc_params.neighbor_trajectory_freshness_sec) return false;
-  }
-  return true;
-}
-
-void PlanDmpc::refresh(double now_sec, double now_wall_sec) {
-  using formation_generator_dmpc::obstacleInfoReady;
-  using formation_generator_dmpc::sceneHoldRequired;
-  const bool receipt_valid = heartbeat_wall_sec_.has_value() && std::isfinite(now_wall_sec);
-  const double age = receipt_valid ? now_wall_sec - *heartbeat_wall_sec_ : 1.0e9;
-  const bool heartbeat_fresh = receipt_valid && age >= 0.0 && age <= kHeartbeatTimeoutSec;
-  formation_generator_dmpc::PlannerLifecycleFacts facts;
-  facts.obstacle_info_ready = obstacleInfoReady(false, false, true, geometry_ready_, geometry_ready_,
-                                                heartbeat_fresh && scene_ids_match_);
-  facts.first_state_received = state_ok_ && now_sec - state_stamp_sec_ <= kStaleSec;
-  facts.vehicle_control_state = controller_ok_ ? controller_state_ : "";
-  facts.vehicle_stamp_valid = controller_ok_;
-  facts.vehicle_state_age_sec =
-      controller_ok_ && std::isfinite(now_sec) ? now_sec - controller_stamp_sec_ : 1.0e9;
-  facts.neighbors_ready = neighbors_ready(now_sec);
-  facts.last_published_position_valid = false;
-  facts.swarm_mission_clock = true;
-  lifecycle_.setFacts(facts);
-  (void)sceneHoldRequired(true, geometry_ready_, heartbeat_fresh, age, kHeartbeatTimeoutSec);
-}
-
 StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec) {
   StepTrace out;
   out.status.qp_status = -1;
   out.status.qp_iterations = -1;
   out.status.stamp_sec = trigger_sec + config_.sampling_time;
-  if (!configure_error_.empty()) {
-    std::strncpy(out.status.reject_reason, configure_error_.c_str(), sizeof(out.status.reject_reason) - 1);
-  } else {
-    refresh(now_sec, now_wall_sec);
-    lifecycle_.considerReseed(now_sec);
-    const bool rolling = commit_ok_ && commit_.request.rolling == 1;
-    lifecycle_.noteRequestedMode(rolling ? formation_generator_dmpc::OptimizationMode::ROLLING
-                                         : formation_generator_dmpc::OptimizationMode::HOLD);
-    lifecycle_.queue(rolling ? formation_generator_dmpc::LifecycleEvent::ROLLING_REQUESTED
-                             : formation_generator_dmpc::LifecycleEvent::HOLD_REQUESTED, now_sec);
-    lifecycle_.tick(now_sec);
-    if (lifecycle_.localInitializationSucceeded() && neighbors_ready(now_sec)) {
-      lifecycle_.noteFormationReady(true);
-    }
-    lifecycle_.advanceOnSyncTrigger(trigger_sec, trigger_sec == 0.0, now_sec);
-    const bool receipt_valid = heartbeat_wall_sec_.has_value() && std::isfinite(now_wall_sec);
-    const double age = receipt_valid ? now_wall_sec - *heartbeat_wall_sec_ : 1.0e9;
-    const bool heartbeat_fresh = receipt_valid && age >= 0.0 && age <= kHeartbeatTimeoutSec;
-    const char* reason = optimizer_ ? "" : "legacy optimizer is not initialized";
-    if (!state_ok_ || now_sec - state_stamp_sec_ > kStaleSec) reason = "paired state is not current";
-    if (!heartbeat_fresh) reason = "scene heartbeat is not current";
-    else if (formation_generator_dmpc::sceneHoldRequired(true, geometry_ready_, heartbeat_fresh, age,
-                                                        kHeartbeatTimeoutSec)) {
-      reason = "scene geometry is not loaded";
-    }
-    if (leader_ && commit_ok_) leader_->advanceTo(static_cast<double>(commit_.mission_ns) * 1e-9);
-    std::strncpy(out.status.reject_reason, reason, sizeof(out.status.reject_reason) - 1);
+  const bool receipt_valid = heartbeat_wall_sec_.has_value() && std::isfinite(now_wall_sec);
+  const double age = receipt_valid ? now_wall_sec - *heartbeat_wall_sec_ : 1.0e9;
+  const bool heartbeat_fresh = receipt_valid && age >= 0.0 && age <= kHeartbeatTimeoutSec;
+  const char* reason = "";
+  if (!state_ok_ || now_sec - state_stamp_sec_ > kStaleSec) reason = "paired state is not current";
+  if (!heartbeat_fresh) reason = "scene heartbeat is not current";
+  else if (formation_generator_dmpc::sceneHoldRequired(true, geometry_ready_, heartbeat_fresh, age,
+                                                      kHeartbeatTimeoutSec)) {
+    reason = "scene geometry is not loaded";
   }
-  std::strncpy(out.status.lifecycle, lifecycle_.stateName(), sizeof(out.status.lifecycle) - 1);
+  std::strncpy(out.status.reject_reason, reason, sizeof(out.status.reject_reason) - 1);
   if (commit_ok_) {
     out.timeline.committed_revision = commit_.request.revision;
     std::memcpy(out.timeline.committed_digest, commit_digest_, 32);
@@ -538,13 +491,12 @@ StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec
                      applied_revision_ != commit_.request.revision;
     if (due && commit_.request.kind == 6) {
       try {
-        if (patterns_ == nullptr ||
-            !patterns_->switchPattern(static_cast<uint8_t>(commit_.request.pattern_id))) {
+        if (!agent_->switchPattern(static_cast<uint8_t>(commit_.request.pattern_id))) {
           throw std::invalid_argument("pattern id is not in the loaded formation_patterns");
         }
-        pattern_ = formation_patterns::FormationPatternBase::getCurrentPattern();
+        const auto pattern = formation_patterns::FormationPatternBase::getCurrentPattern();
         pattern_offset_ =
-            pattern_->computeOffset(static_cast<double>(commit_.mission_ns) * 1e-9, config_.self_id).position;
+            pattern->computeOffset(static_cast<double>(commit_.mission_ns) * 1e-9, config_.self_id).position;
         applied_revision_ = commit_.request.revision;
         applied_mission_ns_ = commit_.mission_ns;
         out.timeline.applied_revision = applied_revision_;
@@ -571,6 +523,7 @@ StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec
   }
   const double mission_sec = commit_ok_ ? static_cast<double>(commit_.mission_ns) * 1e-9 : 0.0;
   run_round(trigger_sec, now_sec, mission_sec, out);
+  if (agent_) std::strncpy(out.status.lifecycle, agent_->lifecycle().stateName(), sizeof(out.status.lifecycle) - 1);
   return out;
 }
 
@@ -639,13 +592,7 @@ std::string PlanDmpc::push_neighbor_plan(const uint8_t* bytes, size_t size) {
   if (message.num_timesteps < static_cast<uint32_t>(config_.horizon + 1)) {
     return "neighbor trajectory is shorter than the loaded horizon";
   }
-  StateTrajectory trajectory;
-  if (!formation_generator_dmpc::assumedTrajectoryToStateTrajectory(message, config_.state_dim,
-                                                                   config_.sampling_time, trajectory)) {
-    return formation_generator_dmpc::describe(
-        formation_generator_dmpc::checkAssumedTrajectory(message, config_.state_dim));
-  }
-  neighbor_plans_[message.uav_id] = std::move(trajectory);
+  if (!agent_->receiveNeighborPlan(message)) return "neighbor plan was not accepted";
   return {};
 }
 
@@ -662,177 +609,77 @@ std::string PlanDmpc::push_neighbor_position(const xgc_dmpc_measured_position_v1
   return {};
 }
 
-bool PlanDmpc::initialize_optimizer(std::string& fault) {
-  if (!geometry_ready_) {
-    fault = "scene geometry is not loaded";
-    return false;
-  }
-  try {
-    loaded_.num_static_obstacles = static_cast<int>(statics_.size());
-    optimizer_ = formation_generator_dmpc::createDmpcOptimizer(loaded_.params, loaded_);
-    config_.chain_n = loaded_.chain_n;
-    config_.state_dim = loaded_.assumed_state_dim;
-    optimizer_->configureConvexFeasibleRegionSnapshots(false, {});
-    optimizer_->setGeometryTemplates(templates_);
-    optimizer_->setUavGeometries(loaded_.default_uav_geometry, loaded_.uav_geometries);
-    optimizer_->updateStaticObstacles(statics_);
-    relative_state_ = formation_generator_dmpc::initializeDmpcTrajectory(
-        *optimizer_, *leader_, measured_, loaded_.local_takeoff_altitude);
-  } catch (const std::exception& error) {
-    optimizer_.reset();
-    fault = error.what();
-    return false;
-  }
-  return true;
-}
-
-void PlanDmpc::write_own_plan(double valid_sec, StepTrace& out) const {
-  bool available = false;
-  const auto& predicted = optimizer_->getPredictedStates(available);
-  if (!available) return;
-  formation_generator_dmpc::PlanMessage plan;
-  formation_generator_dmpc::planFromPredictedStates(predicted, config_.horizon, available, plan);
-  plan.stamp = valid_sec;
-  plan.uav_id = static_cast<uint8_t>(config_.self_id);
-  out.own_plan = formation_generator_dmpc::encodePlanPayload(plan);
-}
-
 void PlanDmpc::run_round(double trigger_sec, double now_sec, double mission_sec, StepTrace& out) {
-  using formation_generator_dmpc::GoalApplyRequest;
-  using formation_generator_dmpc::GoalBootstrapInitializer;
-  using formation_generator_dmpc::GoalSeedStatus;
-  using formation_generator_dmpc::GoalTake;
-  const bool hold = std::strstr(out.status.reject_reason, "scene geometry") != nullptr ||
-                    std::strstr(out.status.reject_reason, "heartbeat") != nullptr;
-  auto publish_hold = [&]() {
-    if (!state_ok_) return;
-    formation_generator_dmpc::PositionTargetPayload payload;
-    formation_generator_dmpc::writeSceneHoldPositionTarget(
-        trigger_sec + config_.sampling_time, measured_.head<3>(), 0.0, payload);
-    static_assert(sizeof payload == sizeof(out.position_target), "position target layout");
-    std::memcpy(&out.position_target, &payload, sizeof payload);
-    out.have_position_target = true;
-    out.status.tracking = 0;
-  };
-  if (!state_ok_ || now_sec - state_stamp_sec_ > kStaleSec) return;
-  if (!optimizer_ || !leader_ || hold) {
-    if (hold) publish_hold();
+  if (!agent_ || !state_ok_ || now_sec - state_stamp_sec_ > kStaleSec) return;
+  if (!geometry_ready_ || !heartbeat_wall_sec_.has_value() ||
+      out.status.reject_reason[0] != '\0') {
+    formation_generator_dmpc::DmpcTickOutput hold;
+    double activation_time = trigger_sec;
+    if (!formation_generator_dmpc::rosTimePlus(trigger_sec, config_.sampling_time, activation_time)) return;
+    agent_->sceneHold(activation_time, hold);
+    out.have_position_target = hold.has_setpoint;
+    out.have_planar_target = hold.has_planar;
+    std::memcpy(&out.position_target, &hold.setpoint, sizeof out.position_target);
+    std::memcpy(&out.planar_target, &hold.planar, sizeof out.planar_target);
     return;
   }
-  if (!lifecycle_.isOptimizing()) {
-    // Every peer can learn the seeded rest trajectory before anyone solves.
-    write_own_plan(trigger_sec, out);
-    return;
-  }
+  agent_->observeSceneHeartbeat(trigger_sec);
   formation_generator_dmpc::QueuedGoal pending;
-  const GoalTake take =
-      goals_.peek(true, trigger_sec, trigger_sec == 0.0, mission_sec, pending);
-  goal_waiting_ = take != GoalTake::Ready;
-  if (take == GoalTake::Ready) {
-    leader_->advanceTo(mission_sec);
-    GoalApplyRequest request;
-    request.measured_state = measured_;
-    request.takeoff_altitude = loaded_.takeoff_altitude;
-    // Loader value. The previous plugin literal was 1.0 even when the
-    // scenario takeoff_altitude was 2.0.
-    request.local_takeoff_altitude = loaded_.local_takeoff_altitude;
-    request.optimizing = lifecycle_.isRolling();
-    request.goal_x = pending.x;
-    request.goal_y = pending.y;
-    auto preview = formation_generator_dmpc::previewAppliedGoal(*leader_, request);
-    leader_ = std::move(preview.trajectory);
-    relative_state_ = preview.relative_state;
-    leader_->getPredictedTrajectory();
-    optimizer_->setLeaderReferenceTrajectory(leader_->getPredictedTrajectory());
-    formation_generator_dmpc::GoalBootstrapInput seed;
-    seed.uav_id = config_.self_id;
-    seed.num_uavs = config_.fleet_count;
-    seed.now_sec = now_sec;
-    seed.acceleration = acceleration_;
-    seed.mpc_params.horizon = loaded_.mpc_params.horizon;
-    seed.mpc_params.sampling_time = loaded_.mpc_params.sampling_time;
-    seed.mpc_params.uav_safety_inflation_radius = loaded_.mpc_params.uav_safety_inflation_radius;
-    seed.mpc_params.enable_inter_uav_collision_constraints =
-        loaded_.mpc_params.enable_inter_uav_collision_constraints;
-    seed.mpc_params.enable_static_obstacle_collision_constraints =
-        loaded_.mpc_params.enable_static_obstacle_collision_constraints;
-    seed.mpc_params.separation_query_mode = loaded_.mpc_params.separation_query_mode;
-    seed.mpc_params.gjk_min_distance = loaded_.mpc_params.gjk_min_distance;
-    seed.mpc_params.constraint_min_distance = loaded_.mpc_params.constraint_min_distance;
-    seed.mpc_params.gjk_tolerance = loaded_.mpc_params.gjk_tolerance;
-    seed.mpc_params.gjk_max_iterations = loaded_.mpc_params.gjk_max_iterations;
-    seed.geometry_templates = templates_;
-    seed.static_bodies_available = true;
-    seed.static_obstacles = statics_;
-    seed.num_static_obstacles = static_cast<int>(statics_.size());
-    seed.default_uav_geometry = loaded_.default_uav_geometry;
-    seed.uav_geometries = loaded_.uav_geometries;
+  const auto take = goals_.peek(true, trigger_sec,
+                                trigger_sec == 0.0, mission_sec, pending);
+  goal_waiting_ = take != formation_generator_dmpc::GoalTake::Ready;
+  formation_generator_dmpc::DmpcGoal goal;
+  if (take == formation_generator_dmpc::GoalTake::Ready) {
+    goal.x = pending.x;
+    goal.y = pending.y;
     for (const auto& [id, position] : neighbor_positions_) {
       if (now_sec - position.stamp_sec <= kStaleSec) {
-        seed.neighbor_positions[static_cast<uint8_t>(id)] =
+        goal.neighbor_positions[static_cast<uint8_t>(id)] =
             Eigen::Vector3d(position.position[0], position.position[1], position.position[2]);
       }
     }
-    const auto bootstrap = GoalBootstrapInitializer().build(seed, preview.relative_state, preview.leader_position);
-    const auto committed = formation_generator_dmpc::commitGoalSeed(*optimizer_, bootstrap);
+  }
+  const auto result = agent_->tick({commit_.round_k, mission_sec,
+                                    commit_ok_ && commit_.request.rolling == 1, trigger_sec},
+                                   take == formation_generator_dmpc::GoalTake::Ready ? &goal : nullptr);
+  if (result.goal_applied) {
     goals_.pop();
-    // The leader and local reference now use this goal. This receipt reports
-    // command application; solver_ok separately reports the following QP.
     applied_revision_ = queued_revision_;
     applied_mission_ns_ = commit_.mission_ns;
     out.timeline.applied_revision = applied_revision_;
     out.timeline.applied_mission_ns = applied_mission_ns_;
-    if (committed.status != GoalSeedStatus::Seeded && !committed.reason.empty()) {
-      std::strncpy(out.status.reject_reason, committed.reason.c_str(), sizeof(out.status.reject_reason) - 1);
+    if (!result.goal_failure.empty()) {
+      std::strncpy(out.status.reject_reason, result.goal_failure.c_str(), sizeof(out.status.reject_reason) - 1);
     }
   }
-  if (lifecycle_.isRolling()) leader_->advanceTo(mission_sec);
-  formation_generator_dmpc::DmpcRoundPreparation round;
-  round.mission_time = mission_sec;
-  round.advance_reference_clock = lifecycle_.isRolling();
-  round.leader_trajectory = &leader_->getPredictedTrajectory();
-  round.roll_local_state = lifecycle_.isRolling();
-  round.uav_id = config_.self_id;
-  round.num_uavs = config_.fleet_count;
-  formation_generator_dmpc::prepareDmpcRound(*optimizer_, round);
-  std::vector<StateTrajectory> neighbors;
-  neighbors.reserve(neighbor_plans_.size());
-  for (const auto& item : neighbor_plans_) {
-    if (now_sec - item.second.timestamp <= loaded_.mpc_params.neighbor_trajectory_freshness_sec) {
-      neighbors.push_back(item.second);
-    }
+  out.status.solver_called = result.solver_called;
+  out.status.solver_ok = result.solved;
+  out.status.qp_status = result.qp_status;
+  out.status.qp_iterations = result.qp_iterations;
+  out.status.tracking = agent_->lifecycle().isRolling() && result.solved;
+  if (result.solver_called && !result.solved) {
+    std::strncpy(out.status.reject_reason, agent_->lastFailure().c_str(), sizeof(out.status.reject_reason) - 1);
   }
-  out.status.solver_called = 1;
-  const bool solved = formation_generator_dmpc::solveDmpcRound(
-      *optimizer_, relative_state_, acceleration_, std::move(neighbors), now_sec);
-  const auto diagnostics = optimizer_->getLastSolverDiagnostics();
-  out.status.qp_status = diagnostics.qp_status;
-  out.status.qp_iterations = diagnostics.qp_iterations;
-  out.status.solver_ok = solved ? 1 : 0;
-  if (!solved) {
-    const std::string& reason = optimizer_->getLastFailureReason();
-    if (!reason.empty()) {
-      std::strncpy(out.status.reject_reason, reason.c_str(), sizeof(out.status.reject_reason) - 1);
-    }
-    return;
-  }
-  bool states_ok = false;
-  bool controls_ok = false;
-  const auto& states = optimizer_->getOptimalStates(states_ok);
-  const auto& controls = optimizer_->getOptimalControls(controls_ok);
-  formation_generator_dmpc::PositionTargetPayload payload;
-  if (formation_generator_dmpc::writeCommandPositionTarget(
-          states, states_ok, controls, controls_ok, true, config_.chain_n, leader_->getCurrentPosition(),
-          leader_->getCurrentVelocity(), leader_->getPredictedTrajectory(), lifecycle_.isRolling(),
-          trigger_sec + config_.sampling_time, 0.0, payload)) {
-    std::memcpy(&out.position_target, &payload, sizeof payload);
+  if (result.has_setpoint) {
+    std::memcpy(&out.position_target, &result.setpoint, sizeof out.position_target);
     out.have_position_target = true;
-    out.status.tracking = lifecycle_.isRolling() ? 1 : 0;
   }
-  write_own_plan(trigger_sec + config_.sampling_time, out);
-  if (lifecycle_.isRolling()) {
-    formation_generator_dmpc::advanceDmpcRound(*optimizer_, relative_state_, acceleration_);
+  if (result.has_planar) {
+    std::memcpy(&out.planar_target, &result.planar, sizeof out.planar_target);
+    out.have_planar_target = true;
   }
+  if (result.has_plan) out.own_plan = formation_generator_dmpc::encodePlanPayload(result.plan);
+}
+
+StepTrace PlanDmpc::pass_through_hold(double now_sec) {
+  StepTrace out;
+  if (!agent_) return out;
+  const auto result = agent_->passThroughHold(now_sec);
+  if (result.has_setpoint) {
+    std::memcpy(&out.position_target, &result.setpoint, sizeof out.position_target);
+    out.have_position_target = true;
+  }
+  return out;
 }
 
 }  // namespace xgc_plan_dmpc

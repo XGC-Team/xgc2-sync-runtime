@@ -13,15 +13,11 @@
 
 #include "formation_generator/core/plan_wire.h"
 #include "formation_generator/dmpc_scheduler/dmpc_configuration.h"
+#include "formation_generator/dmpc_scheduler/dmpc_agent.h"
 #include "formation_generator/dmpc_scheduler/pattern_manager.h"
 #include "formation_generator/lifecycle/goal_queue.h"
-#include "formation_generator/lifecycle/leader_reference_factory.h"
 #include "formation_generator/lifecycle/plain_scene_adapter.h"
-#include "formation_generator/lifecycle/planner_lifecycle.h"
 #include "formation_generator/lifecycle/scene_admission.h"
-#include "formation_generator/mpc/idmpc_optimizer.h"
-#include "formation_generator/scene/dmpc_scene.h"
-#include "reference_trajectory/leader_reference.h"
 
 namespace xgc_plan_dmpc {
 
@@ -30,6 +26,8 @@ struct StepTrace {
   xgc_dmpc_timeline_status_v1 timeline{};
   bool have_position_target = false;
   xgc_position_target_v1 position_target{};
+  bool have_planar_target = false;
+  xgc_planar_pva_v1 planar_target{};
   std::vector<uint8_t> own_plan;
 };
 
@@ -56,8 +54,7 @@ class PlanDmpc {
   static std::unique_ptr<PlanDmpc> open(const PlanDmpcOpen& request, std::string* error);
 
   const xgc_dmpc_planner_config_v1& config() const { return config_; }
-  const formation_generator_dmpc::DmpcConfiguration& loaded() const { return loaded_; }
-  std::string configure_error() const { return configure_error_; }
+  const formation_generator_dmpc::DmpcConfiguration& loaded() const { return agent_->configuration(); }
   std::string push_state(const xgc_dmpc_paired_state_v1& state, double now_sec);
   std::string push_controller(const xgc_dmpc_controller_status_v1& status, double now_sec);
   std::string push_scene(const xgc_dmpc_scene_ids_v1& snapshot, const xgc_dmpc_scene_ids_v1& state);
@@ -74,8 +71,8 @@ class PlanDmpc {
                                 bool* have_state) const;
   std::string push_neighbor_plan(const uint8_t* bytes, size_t size);
   std::string push_neighbor_position(const xgc_dmpc_measured_position_v1& position);
-  size_t static_obstacle_count() const { return scene_.staticObstacles().size(); }
-  const std::vector<convex_geometry::BodyInstance>& static_bodies() const { return statics_; }
+  size_t static_obstacle_count() const { return agent_ ? agent_->staticBodies().size() : 0; }
+  const std::vector<convex_geometry::BodyInstance>& static_bodies() const { return agent_->staticBodies(); }
   const std::string& scene_epoch() const { return scene_epoch_; }
   int leader_rows() const;
   int leader_cols() const;
@@ -86,12 +83,11 @@ class PlanDmpc {
                                       const uint8_t digest[32], uint16_t envelope_origin) const;
   std::string push_commit(const xgc_dmpc_mission_commit_v1& commit, const uint8_t digest[32]);
   StepTrace step(double trigger_sec, double now_sec, double now_wall_sec);
+  StepTrace pass_through_hold(double now_sec);
 
  private:
   PlanDmpc(const xgc_dmpc_planner_config_v1& config,
-           formation_generator_dmpc::DmpcConfiguration loaded);
-  void refresh(double now_sec, double now_wall_sec);
-  bool initialize_optimizer(std::string& fault);
+           std::unique_ptr<formation_generator_dmpc::DmpcAgent> agent);
   std::string decode_records(const xgc_dmpc_scene_header_v1& header,
                              const xgc_dmpc_scene_obstacle_v1* obstacles,
                              const xgc_dmpc_scene_part_v1* parts,
@@ -100,35 +96,16 @@ class PlanDmpc {
                              formation_generator_dmpc::PlainSceneDynamicState* state,
                              bool* have_state) const;
   void replace_goal(const formation_generator_dmpc::QueuedGoal& goal);
-  bool neighbors_ready(double now_sec) const;
-  void write_own_plan(double valid_sec, StepTrace& out) const;
   void run_round(double trigger_sec, double now_sec, double mission_sec, StepTrace& out);
-  formation_generator_dmpc::PlannerLifecycle lifecycle_;
   xgc_dmpc_planner_config_v1 config_{};
-  formation_generator_dmpc::DmpcConfiguration loaded_{};
-  std::unique_ptr<formation_generator_dmpc::PatternManager> patterns_;
-  std::string configure_error_;
+  std::unique_ptr<formation_generator_dmpc::DmpcAgent> agent_;
   bool state_ok_ = false;
   double state_stamp_sec_ = 0.0;
-  bool controller_ok_ = false;
-  double controller_stamp_sec_ = 0.0;
-  char controller_state_[48] = {};
-  bool scene_ids_match_ = false;
   bool geometry_ready_ = false;
   std::string scene_epoch_;
   Eigen::Matrix<double, 6, 1> measured_ = Eigen::Matrix<double, 6, 1>::Zero();
-  Eigen::Matrix<double, 6, 1> relative_state_ = Eigen::Matrix<double, 6, 1>::Zero();
-  Eigen::Vector3d acceleration_ = Eigen::Vector3d::Zero();
-  std::map<std::string, convex_geometry::BodyTemplate> templates_;
-  std::vector<convex_geometry::BodyInstance> statics_;
-  std::map<uint32_t, StateTrajectory> neighbor_plans_;
   std::map<uint32_t, xgc_dmpc_measured_position_v1> neighbor_positions_;
-  std::unique_ptr<IDmpcOptimizer> optimizer_;
-  DmpcScene scene_;
-  formation_generator_dmpc::PlainSceneAdapter scene_adapter_;
   formation_generator_dmpc::GoalQueue goals_;
-  std::unique_ptr<reference_trajectory::LeaderReference> leader_;
-  std::shared_ptr<formation_patterns::FormationPatternBase> pattern_;
   Eigen::Vector3d pattern_offset_ = Eigen::Vector3d::Zero();
   bool goal_waiting_ = false;
   std::optional<double> heartbeat_wall_sec_;

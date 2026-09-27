@@ -26,6 +26,9 @@
 //   out fcu_request     xgc.fcu_request/1           (optional; arming, set_mode)
 //   out status          xgc.controller_status/1     (optional; control state name)
 //   out trace           xgc.text/1                  (optional; replay trace lines)
+//   out tick_done       xgc.clock/1                 (optional; time_source "input": each
+//                                                    controller tick's time, after its outputs,
+//                                                    so a simulator can run in lockstep)
 //
 // Every input sample's receive time is its envelope t_produce. The module
 // fills SensorData and posts the input events exactly as the node's input
@@ -93,7 +96,7 @@ namespace sm = state_machine;
 enum Port : uint32_t {
   kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
   kSetpoint, kAttitudeRate, kFcuRequest, kStatus, kTrace, kAlgSetpoint, kHoverThrust,
-  kRefActiveAnalytic, kRefActivePolynomial, kRefActiveSampled, kRefRequest, kPortCount
+  kRefActiveAnalytic, kRefActivePolynomial, kRefActiveSampled, kRefRequest, kTickDone, kPortCount
 };
 constexpr uint32_t kFirstStatsPort = kEstimate;
 constexpr uint32_t kStatsPorts = 7;  // estimate .. vrpn_pose, in port order
@@ -323,7 +326,8 @@ struct CtlPx4 {
           }
           break;
         }
-        controller.mpcTrajectoryBuffer().cachePending(traj);
+        pmc::cacheTrajectorySample(controller.mpcTrajectoryBuffer(), traj,
+                                   ingress.receipt_time, cfg);
         post(pmc::event_type::INPUT_MPC_TRAJECTORY_UPDATED, now, "alg/setpoint_raw/local");
         break;
       }
@@ -552,6 +556,10 @@ struct CtlPx4 {
     }
     for (auto& track : tracks) track.stats->is_new = false;
     ++k;
+    if (input_time) {
+      const xgc_clock_v1 done{t};
+      publish(kTickDone, round, &done, sizeof done);
+    }
     return true;
   }
 
@@ -706,6 +714,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"ref_active_polynomial", XGC_PORT_IN_OPTIONAL, "xgc.ref.polynomial/1", XGC_QOS_STATE},
     {"ref_active_sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
     {"ref_request", XGC_PORT_OUT_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_EVENT},
+    {"tick_done", XGC_PORT_OUT_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

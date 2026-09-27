@@ -78,9 +78,9 @@ void test_arch() {
   expect(std::strlen(kEpoch) == 36, "scene epoch is a uuid4");
   expect(std::strlen(kEpoch) >= sizeof(xgc_dmpc_scene_header_v1::scene_id), "uuid epoch does not fit in scene_id");
   expect(std::strlen(kArchUuid) == 36, "knot Arch id is a uuid4");
-  expect(std::strlen(kArchUuid) >= sizeof(xgc_dmpc_scene_obstacle_v1::id), "Arch uuid does not fit in id[16]");
-  expect(kSceneWireHeaderBytes == 136 && kSceneWireObstacleBytes == 192 && kSceneWirePartBytes == 120 &&
-             kSceneWireVertexBytes == 24 && kSceneWireEpochOffset == 72 && kSceneWireMotionOffset == 176 &&
+  expect(std::strlen(kArchUuid) < sizeof(xgc_dmpc_scene_obstacle_v1::id), "Arch uuid fits without truncation");
+  expect(kSceneWireHeaderBytes == 144 && kSceneWireObstacleBytes == 240 && kSceneWirePartBytes == 120 &&
+             kSceneWireVertexBytes == 24 && kSceneWireEpochOffset == 72 && kSceneWireMotionOffset == 224 &&
              kSceneWirePartPoseOffset == 64,
          "wire constants drifted from the approved sizes");
   expect(sizeof(xgc_dmpc_paired_state_v1) == 96 && sizeof(xgc_dmpc_controller_status_v1) == 56 &&
@@ -94,7 +94,7 @@ void test_arch() {
   snapshot.revision = 42;
 
   xgc2_geometry_msgs::SceneObstacle arch;
-  arch.id = "arch";
+  arch.id = kArchUuid;
   arch.name = "Arch";
   arch.dynamic = false;
   arch.motion_type = "hold";
@@ -130,10 +130,11 @@ void test_arch() {
 
   xgc2_geometry_msgs::SceneState state;
   state.header.frame_id = "world";
+  state.header.stamp = ros::Time(1000, 200000000);
   state.epoch = kEpoch;
   state.revision = 42;
   xgc2_geometry_msgs::SceneObstacleState arch_state;
-  arch_state.id = "arch";
+  arch_state.id = kArchUuid;
   arch_state.pose.position.x = kArchX;
   arch_state.pose.position.y = kArchY;
   arch_state.pose.orientation.z = kArchQz;
@@ -151,8 +152,8 @@ void test_arch() {
   std::vector<uint8_t> blob{0xAB};
   std::string error = "unset";
   expect(xgc_dmpc_pack_scene_blob(snapshot, state, &blob, &error), error);
-  constexpr size_t kHeader = 136;
-  constexpr size_t kObstacle = 192;
+  constexpr size_t kHeader = 144;
+  constexpr size_t kObstacle = 240;
   constexpr size_t kPart = 120;
   const size_t need = kHeader + 2 * kObstacle + 4 * kPart;
   expect(blob.size() == need, "blob length " + std::to_string(blob.size()));
@@ -165,6 +166,9 @@ void test_arch() {
   uint64_t revision = 0;
   read_bytes(blob, 16, &revision, sizeof revision);
   expect(revision == 42, "revision");
+  double stamp = 0;
+  read_bytes(blob, 136, &stamp, sizeof stamp);
+  expect(same_double(stamp, state.header.stamp.toSec()), "source state timestamp");
   expect(read_c_string(blob, 24, 32) == "knot_fs150", "scene_id");
   expect(read_c_string(blob, 24, 32) != kEpoch, "scene_id is not the epoch");
   expect(read_c_string(blob, 56, 16) == "world", "frame");
@@ -173,27 +177,27 @@ void test_arch() {
   std::cout << "scene_id " << read_c_string(blob, 24, 32) << "\n";
 
   auto obstacle_at = [&](size_t index) { return kHeader + index * kObstacle; };
-  expect(read_c_string(blob, obstacle_at(0), 16) == "arch", "arch id");
-  expect(read_c_string(blob, obstacle_at(0) + 176, 16) == "hold", "arch motion");
-  expect(read_c_string(blob, obstacle_at(1) + 176, 16) == "constant_twist", "mover motion");
+  expect(read_c_string(blob, obstacle_at(0), 64) == kArchUuid, "arch id");
+  expect(read_c_string(blob, obstacle_at(0) + 224, 16) == "hold", "arch motion");
+  expect(read_c_string(blob, obstacle_at(1) + 224, 16) == "constant_twist", "mover motion");
   uint32_t dynamic = 99;
-  read_bytes(blob, obstacle_at(0) + 64, &dynamic, sizeof dynamic);
+  read_bytes(blob, obstacle_at(0) + 112, &dynamic, sizeof dynamic);
   expect(dynamic == 0, "arch dynamic flag");
-  read_bytes(blob, obstacle_at(1) + 64, &dynamic, sizeof dynamic);
+  read_bytes(blob, obstacle_at(1) + 112, &dynamic, sizeof dynamic);
   expect(dynamic == 1, "mover dynamic flag");
   double body[3];
-  read_bytes(blob, obstacle_at(0) + 72, body, sizeof body);
+  read_bytes(blob, obstacle_at(0) + 120, body, sizeof body);
   expect(same_double(body[0], kArchX) && same_double(body[1], kArchY) && same_double(body[2], 0), "arch state position");
   expect(!(same_double(body[0], 9) && same_double(body[1], 9)), "arch body is not the definition pose");
   double body_quat[4];
-  read_bytes(blob, obstacle_at(0) + 96, body_quat, sizeof body_quat);
+  read_bytes(blob, obstacle_at(0) + 144, body_quat, sizeof body_quat);
   expect(same_double(body_quat[0], 0) && same_double(body_quat[1], 0) && same_double(body_quat[2], kArchQz) &&
              same_double(body_quat[3], kArchQw),
          "arch state orientation");
-  read_bytes(blob, obstacle_at(1) + 128, body, sizeof body);
+  read_bytes(blob, obstacle_at(1) + 176, body, sizeof body);
   expect(same_double(body[0], 0.3) && same_double(body[1], -0.1) && same_double(body[2], 0), "mover linear twist");
-  std::cout << "motion arch " << read_c_string(blob, obstacle_at(0) + 176, 16) << "\n";
-  std::cout << "motion mover " << read_c_string(blob, obstacle_at(1) + 176, 16) << "\n";
+  std::cout << "motion arch " << read_c_string(blob, obstacle_at(0) + 224, 16) << "\n";
+  std::cout << "motion mover " << read_c_string(blob, obstacle_at(1) + 224, 16) << "\n";
 
   auto part_at = [&](size_t index) { return kHeader + 2 * kObstacle + index * kPart; };
   expect(read_c_string(blob, part_at(0) + 8, 16) == "left", "left id");
@@ -210,9 +214,9 @@ void test_arch() {
   double param[4];
   read_bytes(blob, part_at(2) + 24, param, sizeof param);
   expect(same_double(param[0], 2.4) && same_double(param[1], 0.6) && same_double(param[2], 0.4), "lintel size");
-  char arch_id[16];
+  char arch_id[64];
   read_bytes(blob, obstacle_at(0), arch_id, sizeof arch_id);
-  expect(std::strncmp(arch_id, kArchUuid, sizeof arch_id - 1) != 0, "packed arch id is not a truncated uuid");
+  expect(std::strcmp(arch_id, kArchUuid) == 0, "packed arch id preserves the source uuid");
 }
 
 void expect_rejected(const xgc2_geometry_msgs::SceneSnapshot& snapshot, const xgc2_geometry_msgs::SceneState& state,
@@ -259,13 +263,13 @@ void expect_motion(const xgc2_geometry_msgs::SceneSnapshot& snapshot, const std:
   std::vector<uint8_t> blob;
   std::string error;
   expect(xgc_dmpc_pack_scene_blob(snapshot, matching_state(snapshot), &blob, &error), error);
-  if (blob.size() < 136 + 192) {
+  if (blob.size() < 144 + 240) {
     expect(false, "motion blob is shorter than one obstacle");
     return;
   }
-  expect(read_c_string(blob, 136 + 176, 16) == motion, "motion changed to " + read_c_string(blob, 136 + 176, 16));
+  expect(read_c_string(blob, 144 + 224, 16) == motion, "motion changed to " + read_c_string(blob, 144 + 224, 16));
   uint32_t flag = 99;
-  read_bytes(blob, 136 + 64, &flag, sizeof flag);
+  read_bytes(blob, 144 + 112, &flag, sizeof flag);
   expect(flag == dynamic, "dynamic flag changed");
   std::cout << "kept motion " << motion << " dynamic " << dynamic << "\n";
 }
@@ -296,8 +300,8 @@ void test_rejections() {
   std::vector<uint8_t> blob;
   std::string error;
   expect(xgc_dmpc_pack_scene_blob(packed_static, matching_state(packed_static), &blob, &error), error);
-  if (blob.size() >= 136 + 192) {
-    expect(read_c_string(blob, 136 + 176, 16) == "static", "static motion preserved");
+  if (blob.size() >= 144 + 240) {
+    expect(read_c_string(blob, 144 + 224, 16) == "static", "static motion preserved");
   } else {
     expect(false, "static blob is shorter than one obstacle");
   }
@@ -305,21 +309,25 @@ void test_rejections() {
   expect(xgc_dmpc_pack_scene_blob(packed_empty, matching_state(packed_empty), &blob, &error), error);
   char motion[16];
   std::memset(motion, 1, sizeof motion);
-  if (blob.size() >= 136 + 192) read_bytes(blob, 136 + 176, motion, sizeof motion);
+  if (blob.size() >= 144 + 240) read_bytes(blob, 144 + 224, motion, sizeof motion);
   const char zeros[16] = {};
-  expect(blob.size() >= 136 + 192 && std::memcmp(motion, zeros, sizeof motion) == 0, "empty static motion stays empty");
+  expect(blob.size() >= 144 + 240 && std::memcmp(motion, zeros, sizeof motion) == 0, "empty static motion stays empty");
 
   auto arch_uuid = one_obstacle("hold", false);
   arch_uuid.obstacles[0].id = kArchUuid;
   arch_uuid.obstacles[0].name = "Arch";
-  expect_rejected(arch_uuid, matching_state(arch_uuid), "does not fit");
+  expect(xgc_dmpc_pack_scene_blob(arch_uuid, matching_state(arch_uuid), &blob, &error), error);
+  expect(read_c_string(blob, 144, 64) == kArchUuid, "source UUID survived packing");
+  auto too_long_id = arch_uuid;
+  too_long_id.obstacles[0].id = std::string(64, 'i');
+  expect_rejected(too_long_id, matching_state(too_long_id), "does not fit");
   auto long_name = one_obstacle("hold", false);
   long_name.obstacles[0].name = std::string(48, 'n');
   expect_rejected(long_name, matching_state(long_name), "does not fit");
   auto fitted_name = one_obstacle("hold", false);
   fitted_name.obstacles[0].name = std::string(37, 'n');
   expect(xgc_dmpc_pack_scene_blob(fitted_name, matching_state(fitted_name), &blob, &error), error);
-  expect(blob.size() >= 136 + 192 && read_c_string(blob, 136 + 16, 48) == std::string(37, 'n'), "37-character name was truncated");
+  expect(blob.size() >= 144 + 240 && read_c_string(blob, 144 + 64, 48) == std::string(37, 'n'), "37-character name was truncated");
   auto missing_scene = one_obstacle("hold", false);
   missing_scene.scene_id.clear();
   expect_rejected(missing_scene, matching_state(missing_scene), "scene_id");

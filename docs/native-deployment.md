@@ -309,3 +309,8 @@ against ABI `xgc_dmpc_planner_v1.h`
 (scene wire header 136, obstacle 192, part 120, vertex 24). The older bundle
 copy `55c3005f04c97ef574a714dfeb09f541b84cfb3b7e11290ce99d7abd65f34ecc` is not
 that ABI. This change does not launch those ELFs.
+
+The scene replay integration now retains full obstacle UUIDs and the source
+scene-state timestamp: header 144, obstacle 240, part 120, vertex 24.
+Rebuild ros-io and plan-dmpc together for this wire layout; the historical
+ELFs above do not implement it. The host ABI remains minor 2.

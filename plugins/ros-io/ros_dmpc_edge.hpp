@@ -1,7 +1,7 @@
 #pragma once
 // One SceneSnapshot+SceneState sample on scene_snapshot.
 // The wire record appends epoch, motion_type, and part-local pose onto the
-// existing prefix: header 136, obstacle 192, part 120, vertex 24.
+// existing prefix: header 144, obstacle 240, part 120, vertex 24.
 #include "xgc_dmpc_planner_v1.h"
 
 #include <cstddef>
@@ -9,11 +9,11 @@
 #include <string>
 #include <vector>
 
-inline constexpr std::size_t kSceneWireHeaderBytes = 136;
+inline constexpr std::size_t kSceneWireHeaderBytes = 144;
 inline constexpr std::size_t kSceneWireEpochOffset = 72;
 inline constexpr std::size_t kSceneWireEpochBytes = 64;
-inline constexpr std::size_t kSceneWireObstacleBytes = 192;
-inline constexpr std::size_t kSceneWireMotionOffset = 176;
+inline constexpr std::size_t kSceneWireObstacleBytes = 240;
+inline constexpr std::size_t kSceneWireMotionOffset = 224;
 inline constexpr std::size_t kSceneWireMotionBytes = 16;
 inline constexpr std::size_t kSceneWirePartBytes = 120;
 inline constexpr std::size_t kSceneWirePartPoseOffset = 64;

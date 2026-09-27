@@ -268,7 +268,34 @@ int measured_position_rate(const xgc_plugin_descriptor* descriptor) {
   if (v->step(plugin.get(), &ctx) != XGC_OK || host.sent != 2 || host.last.uav_id != 1 ||
       host.last.stamp_sec != 10.0 || std::memcmp(host.last.position, paired.position, sizeof paired.position))
     return fail("measurement changed actual pose or header time");
+  trigger.sequence_id = 1;  // A late round must not rewind and solve again.
+  feed(host.trigger, trigger);
+  if (v->step(plugin.get(), &ctx) != XGC_OK || host.sent != 2) return fail("late trigger ran again");
   v->deactivate(plugin.get());
+  return 0;
+}
+
+int planar_scene_hold() {
+  auto request = comprehensive_request();
+  request.manifest_path = testdata("planar/manifest.yaml");
+  request.scene_id = "two-static";
+  std::string error;
+  auto planner = xgc_plan_dmpc::PlanDmpc::open(request, &error);
+  if (!planner) return fail(error.c_str());
+  if (planner->config().horizon != 10 || planner->leader_cols() != 11)
+    return fail("exploration reference does not follow the optimizer horizon");
+  xgc_dmpc_paired_state_v1 state{};
+  state.pose_stamp_sec = state.twist_stamp_sec = 10.0;
+  state.position[0] = 1.5;
+  state.position[1] = -2.0;
+  state.orientation_xyzw[3] = 1.0;
+  if (!planner->push_state(state, 10.0).empty()) return fail("planar measured state");
+  const auto hold = planner->step(10.0, 10.0, 100.0);
+  if (hold.have_position_target || !hold.have_planar_target || hold.status.solver_called ||
+      !near(hold.planar_target.stamp, 10.1) || !near(hold.planar_target.x, 1.5) ||
+      !near(hold.planar_target.y, -2.0) || hold.planar_target.vx != 0.0 ||
+      hold.planar_target.vy != 0.0 || hold.planar_target.ax != 0.0 || hold.planar_target.ay != 0.0)
+    return fail("planar scene loss did not produce measured-position hold");
   return 0;
 }
 
@@ -282,9 +309,9 @@ int main(int argc, char** argv) {
   auto exploration = comprehensive_request();
   exploration.manifest_path = testdata("exploration/manifest.yaml");
   exploration.scene_id = "two-static";
-  if (xgc_plan_dmpc::PlanDmpc::open(exploration, &error) ||
-      error.find("unsupported algorithm") == std::string::npos) {
-    return fail("exploration was accepted");
+  auto exploration_planner = xgc_plan_dmpc::PlanDmpc::open(exploration, &error);
+  if (!exploration_planner || std::strcmp(exploration_planner->config().algorithm, "exploration") != 0) {
+    return fail("shared exploration planner was not accepted");
   }
   auto mismatch = comprehensive_request();
   mismatch.horizon = 20;
@@ -656,8 +683,8 @@ int main(int argc, char** argv) {
   if (!arch || !arch["id"]) return fail("knot scene has no Arch");
   const std::string arch_source_id = arch["id"].as<std::string>();
   xgc_dmpc_scene_obstacle_v1 id_probe{};
-  if (arch_source_id.size() < sizeof id_probe.id || put_text(id_probe.id, sizeof id_probe.id, arch_source_id)) {
-    return fail("uuid arch id was truncated or unexpectedly fit in id[16]");
+  if (!put_text(id_probe.id, sizeof id_probe.id, arch_source_id) || arch_source_id != id_probe.id) {
+    return fail("source uuid arch id did not survive packing");
   }
   xgc_dmpc_scene_header_v1 arch_header{};
   arch_header.schema = 1;
@@ -670,10 +697,10 @@ int main(int argc, char** argv) {
     return fail("arch header does not match the source compound");
   }
   xgc_dmpc_scene_obstacle_v1 arch_body{};
-  if (!put_text(arch_body.id, sizeof arch_body.id, "arch") ||
+  if (!put_text(arch_body.id, sizeof arch_body.id, arch_source_id) ||
       !put_text(arch_body.name, sizeof arch_body.name, arch["name"].as<std::string>()) ||
       !put_text(arch_body.motion_type, sizeof arch_body.motion_type, arch["motion"]["type"].as<std::string>()) ||
-      std::strncmp(arch_body.id, arch_source_id.c_str(), sizeof arch_body.id - 1) == 0) {
+      std::strcmp(arch_body.id, arch_source_id.c_str()) != 0) {
     return fail("arch id was truncated into the wire slot");
   }
   write_xyz(arch_body.position, arch["pose"]["position"]);
@@ -713,7 +740,7 @@ int main(int argc, char** argv) {
     const Eigen::Quaterniond orientation = parent_rotation * part.pose.orientation.normalized();
     const convex_geometry::BodyInstance* body = nullptr;
     for (const auto& candidate : adapted.statics) {
-      if (candidate.name == "arch/" + part.id) body = &candidate;
+      if (candidate.name == arch_source_id + "/" + part.id) body = &candidate;
     }
     if (body == nullptr) return fail("arch part was not placed in the compound");
     const Eigen::Vector3d got(body->pose.position.x, body->pose.position.y, body->pose.position.z);
@@ -727,6 +754,7 @@ int main(int argc, char** argv) {
   header.obstacle_count = 0;
   header.part_count = 0;
   header.vertex_count = 0;
+  ++header.revision;
   const std::string empty_world = planner.push_scene_wire(header, nullptr, nullptr, nullptr);
   if (!empty_world.empty() || planner.static_obstacle_count() != 0 || planner.scene_epoch() != epoch) {
     std::cerr << empty_world << '\n';
@@ -734,7 +762,7 @@ int main(int argc, char** argv) {
   }
   using Entry = const xgc_plugin_descriptor* (*)();
   auto* entry = reinterpret_cast<Entry>(dlsym(RTLD_DEFAULT, "xgc_rt_plugin_v1"));
-  if (entry == nullptr || entry() == nullptr || std::strcmp(entry()->name, "plan-dmpc") != 0 || entry()->port_count != 13) {
+  if (entry == nullptr || entry() == nullptr || std::strcmp(entry()->name, "plan-dmpc") != 0 || entry()->port_count != 16) {
     return fail("xgc_rt_plugin_v1 descriptor was not exported");
   }
   bool stale_ack = false;
@@ -747,7 +775,7 @@ int main(int argc, char** argv) {
     const char* name = entry()->ports[index].name;
     if (std::strcmp(schema, "xgc.dmpc.mission_ack/1") == 0) stale_ack = true;
     if (std::strcmp(name, "position_target") == 0 && std::strcmp(schema, "xgc.position_target/1") == 0 &&
-        entry()->ports[index].dir == XGC_PORT_OUT) {
+        entry()->ports[index].dir == XGC_PORT_OUT_OPTIONAL) {
       position_target = true;
     }
     if (std::strcmp(name, "own_plan") == 0 && std::strcmp(schema, "xgc.dmpc.assumed_trajectory/1") == 0 &&
@@ -765,7 +793,7 @@ int main(int argc, char** argv) {
   if (stale_ack || !position_target || !own_plan || !sync_trigger || !planner_status) {
     return fail("descriptor is missing the vehicle position target or own plan");
   }
-  if (admit_two_static_scene() != 0 || measured_position_rate(entry()) != 0) return 1;
+  if (admit_two_static_scene() != 0 || measured_position_rate(entry()) != 0 || planar_scene_hold() != 0) return 1;
   std::cout << "lifecycle=" << held.status.lifecycle << " reject=" << held.status.reject_reason << '\n';
   std::cout << "obstacles=" << planner.static_obstacle_count() << " ports=" << entry()->port_count << '\n';
   return 0;

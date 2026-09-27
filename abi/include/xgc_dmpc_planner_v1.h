@@ -81,11 +81,12 @@ typedef struct xgc_dmpc_scene_header_v1 {
   uint64_t revision;
   char scene_id[32];
   char frame[16];
-  char epoch[64]; /* offset 72; total 136 */
+  char epoch[64]; /* offset 72 */
+  double stamp_sec; /* source scene state time, offset 136; total 144 */
 } xgc_dmpc_scene_header_v1;
 
 typedef struct xgc_dmpc_scene_obstacle_v1 {
-  char id[16];
+  char id[64];
   char name[48];
   uint32_t dynamic;
   uint32_t reserved0;
@@ -93,7 +94,7 @@ typedef struct xgc_dmpc_scene_obstacle_v1 {
   double orientation_xyzw[4];
   double linear[3];
   double angular[3];
-  char motion_type[16]; /* offset 176, NUL-terminated; total 192 */
+  char motion_type[16]; /* offset 224, NUL-terminated; total 240 */
 } xgc_dmpc_scene_obstacle_v1;
 
 typedef struct xgc_dmpc_scene_part_v1 {

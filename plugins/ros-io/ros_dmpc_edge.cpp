@@ -13,13 +13,13 @@ static_assert(sizeof(xgc_dmpc_controller_status_v1) == 56, "controller status st
 static_assert(sizeof(xgc_dmpc_timeline_ack_v1) == 56, "timeline ack stays 56");
 static_assert(sizeof(xgc_position_target_v1) == 104, "position target stays 104");
 static_assert(sizeof(xgc_dmpc_scene_vertex_v1) == kSceneWireVertexBytes, "scene vertex stays 24");
-static_assert(sizeof(xgc_dmpc_scene_header_v1) == kSceneWireHeaderBytes, "scene header is 136");
+static_assert(sizeof(xgc_dmpc_scene_header_v1) == kSceneWireHeaderBytes, "scene header is 144");
 static_assert(offsetof(xgc_dmpc_scene_header_v1, revision) == 16, "scene header revision");
 static_assert(offsetof(xgc_dmpc_scene_header_v1, scene_id) == 24, "scene header scene_id");
 static_assert(offsetof(xgc_dmpc_scene_header_v1, frame) == 56, "scene header frame");
 static_assert(offsetof(xgc_dmpc_scene_header_v1, epoch) == kSceneWireEpochOffset, "scene header epoch");
-static_assert(sizeof(xgc_dmpc_scene_obstacle_v1) == kSceneWireObstacleBytes, "scene obstacle is 192");
-static_assert(offsetof(xgc_dmpc_scene_obstacle_v1, angular) == 152, "scene obstacle angular");
+static_assert(sizeof(xgc_dmpc_scene_obstacle_v1) == kSceneWireObstacleBytes, "scene obstacle is 240");
+static_assert(offsetof(xgc_dmpc_scene_obstacle_v1, angular) == 200, "scene obstacle angular");
 static_assert(offsetof(xgc_dmpc_scene_obstacle_v1, motion_type) == kSceneWireMotionOffset, "scene obstacle motion");
 static_assert(sizeof(xgc_dmpc_scene_part_v1) == kSceneWirePartBytes, "scene part is 120");
 static_assert(offsetof(xgc_dmpc_scene_part_v1, vertex_begin) == 56, "scene part vertex_begin");
@@ -72,6 +72,7 @@ bool xgc_dmpc_pack_scene_blob(const xgc2_geometry_msgs::SceneSnapshot& snapshot,
   }
   xgc_dmpc_scene_header_v1 header{};
   header.schema = 1;
+  header.stamp_sec = state.header.stamp.toSec();
   header.revision = snapshot.revision;
   if (!put_text(header.scene_id, sizeof header.scene_id, snapshot.scene_id)) {
     *error = "scene_id does not fit";
