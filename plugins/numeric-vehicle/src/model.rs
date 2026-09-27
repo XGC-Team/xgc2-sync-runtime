@@ -2,6 +2,10 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 pub const PERIOD_NS: i64 = 100_000_000;
+// Ideal inner-loop approximation for planning HIL, in rad/s. This is not
+// the flight controller: independent p/v track the header-timed PVA with
+// critically damped error dynamics e'' + 2*w*e' + w*w*e = 0.
+pub const TRACKING_RATE: f64 = 4.0;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -32,6 +36,8 @@ impl State {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Segment {
     pub start: i64,
+    pub position: [f64; 3],
+    pub velocity: [f64; 3],
     pub acceleration: [f64; 3],
     wire: [u8; 104],
 }
@@ -50,14 +56,16 @@ impl Segment {
             return Err("invalid effective timestamp".into());
         }
         let mask = u16::from_le_bytes(wire[96..98].try_into().unwrap());
-        if wire[98] != 1 || mask & (64 | 128 | 256 | 512) != 0 {
-            return Err("requires world ENU frame 1 and all acceleration axes, not force".into());
+        if wire[98] != 1 || mask & 1023 != 0 {
+            return Err("requires world ENU frame 1 and all PVA axes, not force".into());
         }
         if wire[99..].iter().any(|b| *b != 0) {
             return Err("nonzero reserved bytes".into());
         }
         Ok(Self {
             start: stamp.round() as i64,
+            position: [number(8), number(16), number(24)],
+            velocity: [number(32), number(40), number(48)],
             acceleration: [number(56), number(64), number(72)],
             wire,
         })
@@ -174,11 +182,32 @@ impl Model {
         }
         Ok(())
     }
-    fn integrate(&mut self, ns: i64) -> Result<(), String> {
+    fn integrate(&mut self, from: i64, ns: i64) -> Result<(), String> {
         let h = ns as f64 * 1e-9;
-        for i in 0..3 {
-            self.position[i] += h * self.velocity[i] + 0.5 * h * h * self.acceleration[i];
-            self.velocity[i] += h * self.acceleration[i];
+        if let Some(segment) = &self.active {
+            let tau = (from - segment.start) as f64 * 1e-9;
+            let w = TRACKING_RATE;
+            let decay = (-w * h).exp();
+            for i in 0..3 {
+                let a = segment.acceleration[i];
+                let reference_p =
+                    segment.position[i] + tau * segment.velocity[i] + 0.5 * tau * tau * a;
+                let reference_v = segment.velocity[i] + tau * a;
+                let e = self.position[i] - reference_p;
+                let ev = self.velocity[i] - reference_v;
+                // Exact integration over this constant-acceleration segment.
+                // Receipt never assigns the reference to the plant state.
+                self.position[i] = reference_p
+                    + h * reference_v
+                    + 0.5 * h * h * a
+                    + decay * ((1.0 + w * h) * e + h * ev);
+                self.velocity[i] =
+                    reference_v + h * a + decay * ((1.0 - w * h) * ev - w * w * h * e);
+            }
+        } else {
+            for i in 0..3 {
+                self.position[i] += h * self.velocity[i];
+            }
         }
         if self
             .position
@@ -234,7 +263,7 @@ impl Model {
                 .unwrap_or(now);
             let next_end = self.active.as_ref().map(Segment::end).unwrap_or(now);
             let until = now.min(next_start).min(next_end);
-            self.integrate(until - at)?;
+            self.integrate(at, until - at)?;
             at = until;
         }
         Ok(())

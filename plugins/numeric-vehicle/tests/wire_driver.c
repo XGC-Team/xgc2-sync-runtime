@@ -15,6 +15,7 @@ static const xgc_host_api* h;
 static FILE* out;
 static int prepared,started,stopped;
 static double effective;
+static double last_stamp,last_position,last_velocity;
 static void* create(const xgc_host_api* api){h=api;return &prepared;}
 static xgc_status configure(void* p,const char* text){(void)p;(void)text;out=fopen(OUTPUT,"w");return out?XGC_OK:XGC_ERR;}
 static xgc_status life(void* p){(void)p;return XGC_OK;}
@@ -25,6 +26,7 @@ static xgc_status step(void* p,const xgc_step_ctx* c){
   if(s.len!=sizeof(xgc_dmpc_paired_state_v1))return XGC_ERR;
   xgc_dmpc_paired_state_v1 m;memcpy(&m,s.data,sizeof m);
   if(m.pose_stamp_sec!=m.twist_stamp_sec || m.orientation_xyzw[3]!=1.0)return XGC_ERR;
+  last_stamp=m.pose_stamp_sec;last_position=m.position[0];last_velocity=m.linear_velocity[0];
   fprintf(out,"P %.17g %.17g %.17g\n",m.pose_stamp_sec,m.position[0],m.linear_velocity[0]);
  }
  while(h->next(h->host,3,&s)==XGC_OK){
@@ -36,7 +38,8 @@ static xgc_status step(void* p,const xgc_step_ctx* c){
  if(ready&&!started){
   send_command("custom1",c);
   xgc_position_target_v1 m={0};effective=(double)c->now*1e-9+0.1;m.stamp=effective;
-  m.position[0]=900;m.position[1]=800;m.position[2]=700;
+  m.position[0]=last_position+last_velocity*(effective-last_stamp);m.position[1]=2;m.position[2]=3;
+  m.velocity[0]=last_velocity;
   m.acceleration[0]=2;m.coordinate_frame=1;
   fprintf(out,"E %.17g\n",effective);
   h->publish(h->host,1,c->round,(const uint8_t*)&m,sizeof m);started=1;
