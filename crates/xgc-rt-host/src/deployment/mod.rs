@@ -3,6 +3,8 @@
 mod dmpc;
 mod files;
 mod hil;
+#[cfg(test)]
+mod target_platform_tests;
 pub use hil::{HilConfiguration, RobotMember, NodeRole};
 pub(crate) use hil::{Planner, Radio, Scene, Station};
 
@@ -29,6 +31,25 @@ pub const SMC_COMPOSITION_ID: &str = "uav-dmpc-smc/v1";
 pub const SMC_COMPOSITION: &str = include_str!("composition-dmpc-smc.toml");
 pub const BUNDLE_FILE: &str = "DEPLOYMENT-BUNDLE.json";
 pub const MAX_INPUT: usize = 64 * 1024;
+
+// Compiled target, never the Core host or an environment override. Keep this
+// mapping shared by deployment validation and the target's ELF/describe gates.
+fn native_target(os: &str, arch: &str) -> Result<(&'static str, u16)> {
+    match (os, arch) {
+        ("linux", "x86_64") => Ok(("linux-amd64", 62)),
+        ("linux", "aarch64") => Ok(("linux-arm64", 183)),
+        _ => Err(format!("unsupported native target {os}/{arch}")),
+    }
+}
+
+pub fn target_platform() -> Result<&'static str> {
+    native_target(std::env::consts::OS, std::env::consts::ARCH).map(|target| target.0)
+}
+
+/// e_machine for the same compiled target as target_platform().
+pub fn target_elf_machine() -> Result<u16> {
+    native_target(std::env::consts::OS, std::env::consts::ARCH).map(|target| target.1)
+}
 
 /// Release-owned graphs. The deployment cannot add roles or edit a graph.
 pub struct Composition {
@@ -327,9 +348,10 @@ impl Deployment {
             ros_namespace(&self.robot_namespace),
             "invalid canonical relative robot namespace",
         )?;
+        let target = target_platform()?;
         require(
-            self.platform == "linux-amd64",
-            "only linux-amd64 is supported by this composition release",
+            self.platform == target,
+            &format!("deployment platform {} does not match compiled native target {target}", self.platform),
         )?;
         require(
             self.composition_sha256 == composition(&self.composition_id)?.sha256(),

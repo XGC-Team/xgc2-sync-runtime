@@ -211,8 +211,8 @@ fn verify_elf(dir: &Dir, pin: &BundleFile) -> Result<File> {
         &header[..4] == b"\x7fELF"
             && header[4] == 2
             && header[5] == 1
-            && u16::from_le_bytes([header[18], header[19]]) == 62,
-        "artifact is not little-endian ELF64 amd64",
+            && u16::from_le_bytes([header[18], header[19]]) == super::target_elf_machine()?,
+        &format!("artifact {} is not little-endian ELF64 for {}", pin.path, super::target_platform()?),
     )?;
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
@@ -233,8 +233,8 @@ fn verify_elf(dir: &Dir, pin: &BundleFile) -> Result<File> {
 
 fn verify_bundle(root: &Path, deployment: &Deployment) -> Result<(Bundle, File)> {
     require(
-        cfg!(target_os = "linux") && cfg!(target_arch = "x86_64"),
-        "this renderer release supports Linux amd64 only",
+        deployment.platform == super::target_platform()?,
+        "deployment platform does not match compiled native target",
     )?;
     let dir = Dir::root(root, false)?;
     let bytes = dir.read(BUNDLE_FILE, 4 * 1024 * 1024)?;

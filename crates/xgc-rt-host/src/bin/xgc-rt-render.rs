@@ -22,7 +22,7 @@ fn execute() -> Result<()> {
         let composition = deployment::composition(&id)?;
         println!(
             "{}",
-            serde_json::json!({"schema_version":1,"composition_id":composition.id,"composition_sha256":composition.sha256(),"composition_bytes":composition.bytes,"platform":"linux-amd64","input_time_domain":"wall-unix","managed_launch":"run","live_readiness":false})
+            serde_json::json!({"schema_version":1,"composition_id":composition.id,"composition_sha256":composition.sha256(),"composition_bytes":composition.bytes,"platform":deployment::target_platform()?,"input_time_domain":"wall-unix","managed_launch":"run","live_readiness":false})
         );
         return Ok(());
     }
