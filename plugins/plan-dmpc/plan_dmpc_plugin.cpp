@@ -250,7 +250,6 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
   return guarded(self->host, "step", [&] {
     if (!self->plan || ctx == nullptr) return XGC_ERR;
     const double now_sec = static_cast<double>(ctx->now) * 1e-9;
-    const double wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     xgc_dmpc_paired_state_v1 paired{};
     if (take_last(self->host, kPaired, &paired) && self->plan->push_state(paired, now_sec).empty()) {
       xgc_dmpc_measured_position_v1 position{};
@@ -316,6 +315,9 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
                             sizeof(xgc_dmpc_measured_position_v1)) != XGC_OK) {
       return XGC_ERR;
     }
+    // Inputs may arrive while this step drains them. Compare receipt times
+    // against the clock after the drain, not a snapshot from step entry.
+    const double wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     const auto trace = self->plan->step(trigger_time, trigger_time, wall);
     const char* domain = trace.status.lifecycle[0] ? trace.status.lifecycle : "step";
     if (self->domain != domain) {

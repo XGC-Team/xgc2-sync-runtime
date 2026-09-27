@@ -1,12 +1,14 @@
 #include "plan_dmpc.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <map>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <dlfcn.h>
@@ -198,7 +200,9 @@ int admit_two_static_scene() {
 int measured_position_rate(const xgc_plugin_descriptor* descriptor) {
   struct Host {
     std::map<uint32_t, std::vector<uint8_t>> pending;
-    uint32_t paired = 0, trigger = 0, output = 0;
+    uint32_t paired = 0, trigger = 0, output = 0, heartbeat = 0, status_port = 0;
+    bool receive_heartbeat_during_step = false;
+    xgc_dmpc_planner_status_v1 status{};
     unsigned sent = 0;
     xgc_dmpc_measured_position_v1 last{};
   } host;
@@ -207,6 +211,8 @@ int measured_position_rate(const xgc_plugin_descriptor* descriptor) {
     if (name == "paired_state") host.paired = i;
     if (name == "sync_trigger") host.trigger = i;
     if (name == "own_position") host.output = i;
+    if (name == "scene_heartbeat") host.heartbeat = i;
+    if (name == "planner_status") host.status_port = i;
   }
   xgc_host_api api{};
   api.abi_version = XGC_RT_ABI_VERSION;
@@ -214,6 +220,16 @@ int measured_position_rate(const xgc_plugin_descriptor* descriptor) {
   api.host = &host;
   api.next = [](void* raw, uint32_t port, xgc_sample_view* view) {
     auto& h = *static_cast<Host*>(raw);
+    if (port == h.heartbeat && h.receive_heartbeat_during_step) {
+      h.receive_heartbeat_during_step = false;
+      // A callback may deliver a valid receipt after step entry but before
+      // this input drain. Its timestamp must not look like a future sample.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      xgc_dmpc_scene_heartbeat_v1 beat{
+          std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count()};
+      const auto* bytes = reinterpret_cast<const uint8_t*>(&beat);
+      h.pending[port] = std::vector<uint8_t>(bytes, bytes + sizeof beat);
+    }
     const auto found = h.pending.find(port);
     if (found == h.pending.end() || found->second.empty()) return XGC_ERR_AGAIN;
     static thread_local std::vector<uint8_t> sample;
@@ -226,6 +242,7 @@ int measured_position_rate(const xgc_plugin_descriptor* descriptor) {
   };
   api.publish = [](void* raw, uint32_t port, uint64_t, const uint8_t* data, uint32_t len) {
     auto& h = *static_cast<Host*>(raw);
+    if (port == h.status_port && len == sizeof h.status) std::memcpy(&h.status, data, len);
     if (port == h.output) {
       if (len != sizeof h.last) return XGC_ERR;
       std::memcpy(&h.last, data, len);
@@ -271,6 +288,14 @@ int measured_position_rate(const xgc_plugin_descriptor* descriptor) {
   trigger.sequence_id = 1;  // A late round must not rewind and solve again.
   feed(host.trigger, trigger);
   if (v->step(plugin.get(), &ctx) != XGC_OK || host.sent != 2) return fail("late trigger ran again");
+  trigger.sequence_id = 3;
+  trigger.trigger_time = 10.2;
+  ctx.now = 10200000000LL;
+  feed(host.trigger, trigger);
+  host.receive_heartbeat_during_step = true;
+  if (v->step(plugin.get(), &ctx) != XGC_OK ||
+      std::strstr(host.status.reject_reason, "heartbeat") != nullptr)
+    return fail("heartbeat received during step was rejected as future");
   v->deactivate(plugin.get());
   return 0;
 }
