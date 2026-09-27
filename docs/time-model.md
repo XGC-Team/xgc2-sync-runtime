@@ -3,9 +3,12 @@
 - Session time is `int64` nanoseconds from the `Clock` in `xgc-rt-core::clock`.
 - Round k starts at `E0 + k·P` on every node: `E0` is `session.epoch_ns` (or the host start plus `start_delay_ms`), `P` is `session.period_ms`. The host records `epoch_local_only` when a linked session has no `epoch_ns`.
 - `[clock]` in the manifest runs the in-host clock probe (`crates/xgc-rt-host/src/clock_service.rs`); it measures the offset bound and never adjusts time.
-- A plugin's `wake_ms` steps it again within a round (a local timer).
+- A plugin's `wake_ms` steps it again within a round on wall time. A production simulator source additionally requires a new accepted simulator timestamp for every step.
 
-The executable initially creates `WallClock::new(0)` for both transports.
+Without `[clock_source]`, the executable creates `WallClock::new(0)` for both transports.
+An explicit simulator source uses the same host with native ROS clock polling; see
+[Simulator clock source](clock-source.md). Its source, world identity and shared
+epoch are frozen per experiment, for either colocated or per-robot placement.
 `Host::new` installs the probe service when the manifest includes `[clock]`;
 this is an executable configuration path, not only a test fixture. For example,
 the client configuration is:

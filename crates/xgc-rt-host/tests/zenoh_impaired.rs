@@ -1,6 +1,8 @@
 //! Z2b calibration: the audit stays correct under impairment. uav1 → uav2
 //! over Zenoh UDP through the seeded relay; per-sample join of the audit
-//! against the relay's ground truth.
+//! against the relay's ground truth. Profile A runs twice: with the
+//! built-in Zenoh transport and with the Zenoh transport plugin
+//! (xgc_rt_transport_v1), which must account the same way.
 
 mod common;
 
@@ -11,16 +13,12 @@ use std::time::Duration;
 use xgc_rt_audit::record::{Kind, Record, RECORD_LEN};
 use xgc_rt_audit::{merge_run, FileAudit, MergeOptions, NodeMeta};
 use xgc_rt_core::clock::{Clock, WallClock};
-use xgc_rt_core::transport::{ChannelSpec, Qos, TransportContext};
+use xgc_rt_core::transport::{ChannelSpec, Qos, Transport, TransportContext};
 use xgc_rt_host::endpoint::Endpoint;
 use xgc_rt_impair::{Action, GilbertElliott, Profile, Relay};
 use xgc_rt_transport_zenoh::{ZenohOptions, ZenohTransport};
 
 const SAMPLES: u64 = 2_000;
-
-fn free_udp() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
 
 fn pct(v: &mut [i64], p: f64) -> i64 {
     v.sort_unstable();
@@ -41,11 +39,21 @@ struct Outcome {
 }
 
 fn calibrate(name: &str, profile: Profile) -> Outcome {
+    calibrate_with(name, profile, &|o| Box::new(ZenohTransport::new(o)))
+}
+
+/// The Zenoh transport plugin with the same options.
+fn plugin(o: ZenohOptions) -> Box<dyn Transport> {
+    let list = |v: &[String]| v.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
+    common::so_transport("zenoh", &format!("listen = [{}]\nconnect = [{}]\n", list(&o.listen), list(&o.connect)))
+}
+
+fn calibrate_with(name: &str, profile: Profile, transport: &dyn Fn(ZenohOptions) -> Box<dyn Transport>) -> Outcome {
     let run = common::scratch(name);
     let clock = Arc::new(WallClock::new(0));
     let roster = vec!["uav1".to_string(), "uav2".to_string()];
     let channels = vec![ChannelSpec { id: 0, name: "dmpc/plan".into(), qos: Qos::Control }];
-    let pb = free_udp();
+    let pb = common::listen_port();
     let relay = Relay::start("127.0.0.1:0".parse().unwrap(), format!("127.0.0.1:{pb}").parse().unwrap(), profile).unwrap();
     let opts = [
         ZenohOptions { listen: vec![], connect: vec![format!("udp/{}", relay.listen)] },
@@ -61,7 +69,7 @@ fn calibrate(name: &str, profile: Profile) -> Outcome {
         };
         let audit = Arc::new(FileAudit::create(&run, meta, clock.clone()).unwrap());
         let ctx = TransportContext { session: name.into(), node: roster[i].clone(), node_id: i as u16, roster: roster.clone(), channels: channels.clone() };
-        eps.push(Endpoint::open(Box::new(ZenohTransport::new(o)), &ctx, clock.clone(), audit.clone(), 1 << 16).unwrap());
+        eps.push(Endpoint::open(transport(o), &ctx, clock.clone(), audit.clone(), 1 << 16).unwrap());
         audits.push(audit);
     }
     eps[0].declare_out(0).unwrap();
@@ -148,20 +156,29 @@ fn calibrate(name: &str, profile: Profile) -> Outcome {
     }
 }
 
+fn profile_a() -> Profile {
+    Profile {
+        delay_ms: 40.0,
+        jitter_ms: 0.0,
+        loss: 0.0,
+        gilbert_elliott: Some(GilbertElliott { p_good_bad: 0.01, p_bad_good: 0.3, loss_good: 0.01, loss_bad: 0.5 }),
+        duplicate: 0.02,
+        reorder: 0.02,
+        seed: 0xA11CE,
+    }
+}
+
 #[test]
 fn audit_matches_relay_truth_under_burst_loss_duplication_and_reordering() {
-    let o = calibrate(
-        "z2b-profile-a",
-        Profile {
-            delay_ms: 40.0,
-            jitter_ms: 0.0,
-            loss: 0.0,
-            gilbert_elliott: Some(GilbertElliott { p_good_bad: 0.01, p_bad_good: 0.3, loss_good: 0.01, loss_bad: 0.5 }),
-            duplicate: 0.02,
-            reorder: 0.02,
-            seed: 0xA11CE,
-        },
-    );
+    check_profile_a(calibrate("z2b-profile-a", profile_a()));
+}
+
+#[test]
+fn audit_matches_relay_truth_through_the_zenoh_transport_plugin() {
+    check_profile_a(calibrate_with("z2e-profile-a-plugin", profile_a(), &plugin));
+}
+
+fn check_profile_a(o: Outcome) {
     assert!(o.relay_drop > 10 && o.relay_dup > 10 && o.relay_reorder > 10, "profile exercised every action");
     assert_eq!(o.received + o.lost, SAMPLES);
     // Transport finding (zenoh 1.9 best-effort over UDP): a frame that

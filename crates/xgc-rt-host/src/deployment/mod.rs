@@ -1,5 +1,5 @@
 //! Release-owned deployment, separate from the software-plant fixture.
-//! No live ROS/config discovery: all inputs describe a frozen wall-time run.
+//! No live ROS/config discovery: inputs freeze the run and its clock authority.
 mod files;
 
 use serde::{Deserialize, Serialize};
@@ -126,12 +126,38 @@ pub struct Configuration {
     pub takeoff_altitude_m: f64,
     pub topics: Topics,
     pub calibration: Calibration,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub simulation: Option<Simulation>,
+}
+
+// Missing optional blocks preserve existing inputs; explicit null is not a block.
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where D: serde::Deserializer<'de>, T: Deserialize<'de> {
+    T::deserialize(deserializer).map(Some)
+}
+
+/// The fixed ROS source uses the same authority and limits as Manifest.
+/// E0 is supplied by the experiment Run coordinator, never local arrival time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Simulation {
+    pub epoch_ns: i64,
+    pub topic: String,
+    pub expected_publisher: String,
+    pub world_instance_id: String,
+    pub startup_timeout_wall_ms: u64,
+    pub stale_after_wall_ms: u64,
+    pub max_advance_ns: i64,
+    pub poll_wall_ms: u64,
+    pub queue_capacity: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub enum TimeDomain {
     #[serde(rename = "wall-unix")]
     WallUnix,
+    #[serde(rename = "ros1-sim")]
+    Ros1Sim,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,7 +207,8 @@ impl<'de> Deserialize<'de> for TimeDomain {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "wall-unix" => Ok(Self::WallUnix),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["wall-unix"])),
+            "ros1-sim" => Ok(Self::Ros1Sim),
+            _ => Err(serde::de::Error::unknown_variant(&value, &["wall-unix", "ros1-sim"])),
         }
     }
 }
@@ -258,6 +285,11 @@ impl Deployment {
 
 impl Configuration {
     fn validate(&self, namespace: &str) -> Result<()> {
+        require(
+            matches!((&self.input_time_domain, &self.simulation),
+                (TimeDomain::WallUnix, None) | (TimeDomain::Ros1Sim, Some(_))),
+            "ros1-sim requires simulation; wall-unix forbids simulation",
+        )?;
         let ip: Ipv4Addr = self
             .ros_ip
             .parse()
@@ -418,6 +450,17 @@ pub fn render(
     value["session"]["node"] = deployment.node_id.clone().into();
     value["session"]["roster"] = toml::Value::Array(vec![deployment.node_id.clone().into()]);
     value["audit"]["dir"] = audit.to_str().ok_or("non-UTF8 audit path")?.into();
+    if let Some(sim) = &config.simulation {
+        value["session"].as_table_mut().ok_or("internal session")?
+            .insert("epoch_ns".into(), sim.epoch_ns.into());
+        let mut source = toml::Value::try_from(sim).map_err(|e| e.to_string())?;
+        let fields = source.as_table_mut().ok_or("internal clock source")?;
+        fields.remove("epoch_ns");
+        fields.insert("kind".into(), "ros1_sim".into());
+        fields.insert("plugin".into(), "ros_io".into());
+        value.as_table_mut().ok_or("internal composition table")?
+            .insert("clock_source".into(), source);
+    }
     for plugin in value["plugin"].as_array_mut().ok_or("internal plugins")? {
         let role = plugin["path"].as_str().ok_or("internal role")?.to_owned();
         let pin = bundle
