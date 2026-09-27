@@ -177,18 +177,8 @@ enum Net {
 
 impl Net {
     fn zenoh(n: usize, profile: &dyn Fn(usize, usize) -> Profile) -> Net {
-        // Listen ports below the ephemeral range (32768-60999), so no
-        // outgoing connection takes one between here and the listen.
-        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-        let free = || loop {
-            let base = 20_000 + (std::process::id() % 1_000) as u16 * 10;
-            let port = base + NEXT.fetch_add(1, Ordering::Relaxed) % 2_000;
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-                return port;
-            }
-        };
-        let udp: Vec<u16> = (0..n).map(|_| free()).collect();
-        let tcp: Vec<u16> = (0..n).map(|_| free()).collect();
+        let udp: Vec<u16> = (0..n).map(|_| common::listen_port()).collect();
+        let tcp: Vec<u16> = (0..n).map(|_| common::listen_port()).collect();
         let mut relays = HashMap::new();
         for i in 0..n {
             for j in i + 1..n {
