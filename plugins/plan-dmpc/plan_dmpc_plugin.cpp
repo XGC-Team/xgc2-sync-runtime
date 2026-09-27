@@ -26,6 +26,8 @@ enum Port : uint32_t {
   kPositionTarget,
   kOwnPlan,
   kPlannerStatus,
+  kNeighborPosition,
+  kOwnPosition,
   kPortCount
 };
 
@@ -41,6 +43,8 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"position_target", XGC_PORT_OUT, "xgc.position_target/1", XGC_QOS_CONTROL},
     {"own_plan", XGC_PORT_OUT, "xgc.dmpc.assumed_trajectory/1", XGC_QOS_CONTROL},
     {"planner_status", XGC_PORT_OUT, "xgc.dmpc.planner_status/1", XGC_QOS_STATE},
+    {"neighbor_position", XGC_PORT_IN, "xgc.dmpc.measured_position/1", XGC_QOS_STATE},
+    {"own_position", XGC_PORT_OUT, "xgc.dmpc.measured_position/1", XGC_QOS_STATE},
 };
 
 void sha256(const uint8_t* data, size_t len, uint8_t out[32]) {
@@ -96,6 +100,7 @@ struct Plugin {
   std::string domain = "unconfigured";
   bool have_planner_round = false;
   uint64_t planner_k = 0;
+  std::optional<xgc_dmpc_measured_position_v1> own_position;
 };
 
 xgc_status guarded(const xgc_host_api* host, const char* what, const std::function<xgc_status()>& body) {
@@ -199,7 +204,13 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
     const double now_sec = static_cast<double>(ctx->now) * 1e-9;
     const double wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     xgc_dmpc_paired_state_v1 paired{};
-    if (take_last(self->host, kPaired, &paired)) (void)self->plan->push_state(paired, now_sec);
+    if (take_last(self->host, kPaired, &paired) && self->plan->push_state(paired, now_sec).empty()) {
+      xgc_dmpc_measured_position_v1 position{};
+      position.uav_id = static_cast<uint32_t>(self->plan->config().self_id);
+      position.stamp_sec = paired.pose_stamp_sec;
+      std::memcpy(position.position, paired.position, sizeof position.position);
+      self->own_position = position;
+    }
     xgc_controller_status_v1 controller{};
     if (take_last(self->host, kController, &controller)) {
       xgc_dmpc_controller_status_v1 status{};
@@ -228,6 +239,12 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
       if (view.data == nullptr) continue;
       (void)self->plan->push_neighbor_plan(view.data, view.len);
     }
+    while (self->host->next(self->host->host, kNeighborPosition, &view) == XGC_OK) {
+      if (view.data == nullptr || view.len != sizeof(xgc_dmpc_measured_position_v1)) continue;
+      xgc_dmpc_measured_position_v1 position{};
+      std::memcpy(&position, view.data, sizeof position);
+      (void)self->plan->push_neighbor_position(position);
+    }
     bool planner_due = false;
     uint64_t planner_k = 0;
     double trigger_time = 0.0;
@@ -243,6 +260,12 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
     if (!planner_due) return XGC_OK;
     self->have_planner_round = true;
     self->planner_k = planner_k;
+    if (self->own_position &&
+        self->host->publish(self->host->host, kOwnPosition, planner_k,
+                            reinterpret_cast<const uint8_t*>(&*self->own_position),
+                            sizeof(xgc_dmpc_measured_position_v1)) != XGC_OK) {
+      return XGC_ERR;
+    }
     const auto trace = self->plan->step(trigger_time, trigger_time, wall);
     const char* domain = trace.status.lifecycle[0] ? trace.status.lifecycle : "step";
     if (self->domain != domain) {

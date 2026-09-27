@@ -4,6 +4,12 @@ The release-owned `xgc-rt-render` selects one of two frozen, single-robot five-m
 
 Executable: `xgc-rt-render` (same bundle/bin directory as xgc-rt-host). The existing xgc-rt-host `--manifest` CLI is unchanged.
 
+DMPC planner compositions exchange measured peer positions on `radio_position`
+for goal bootstrap. Each planner publishes the latest paired vehicle position
+once per planner round (10 Hz), using the 40-byte `xgc.dmpc.measured_position/1`
+record. This uses the same peer radio link as plans, independently of AgentLink
+and GCS telemetry. Assumed trajectories do not substitute for these measurements.
+
 ```
 xgc-rt-render describe
 xgc-rt-render describe --composition-id uav-control-px4-local-native-hover/v1

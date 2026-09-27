@@ -646,6 +646,19 @@ std::string PlanDmpc::push_neighbor_plan(const uint8_t* bytes, size_t size) {
   return {};
 }
 
+std::string PlanDmpc::push_neighbor_position(const xgc_dmpc_measured_position_v1& position) {
+  if (position.uav_id == static_cast<uint32_t>(config_.self_id) || position.uav_id < 1 ||
+      position.uav_id > static_cast<uint32_t>(config_.fleet_count) ||
+      !std::isfinite(position.stamp_sec) || !finite3(position.position)) {
+    return "neighbor position is not a finite roster measurement";
+  }
+  const auto found = neighbor_positions_.find(position.uav_id);
+  if (found == neighbor_positions_.end() || position.stamp_sec > found->second.stamp_sec) {
+    neighbor_positions_[position.uav_id] = position;
+  }
+  return {};
+}
+
 bool PlanDmpc::initialize_optimizer(std::string& fault) {
   if (!geometry_ready_) {
     fault = "scene geometry is not loaded";
@@ -731,10 +744,15 @@ void PlanDmpc::run_round(double trigger_sec, double now_sec, double mission_sec,
     formation_generator_dmpc::GoalBootstrapInput seed;
     seed.uav_id = config_.self_id;
     seed.num_uavs = config_.fleet_count;
-    seed.now_sec = mission_sec;
+    seed.now_sec = now_sec;
     seed.acceleration = acceleration_;
     seed.mpc_params.horizon = loaded_.mpc_params.horizon;
     seed.mpc_params.sampling_time = loaded_.mpc_params.sampling_time;
+    seed.mpc_params.uav_safety_inflation_radius = loaded_.mpc_params.uav_safety_inflation_radius;
+    seed.mpc_params.enable_inter_uav_collision_constraints =
+        loaded_.mpc_params.enable_inter_uav_collision_constraints;
+    seed.mpc_params.enable_static_obstacle_collision_constraints =
+        loaded_.mpc_params.enable_static_obstacle_collision_constraints;
     seed.mpc_params.separation_query_mode = loaded_.mpc_params.separation_query_mode;
     seed.mpc_params.gjk_min_distance = loaded_.mpc_params.gjk_min_distance;
     seed.mpc_params.constraint_min_distance = loaded_.mpc_params.constraint_min_distance;
@@ -745,6 +763,13 @@ void PlanDmpc::run_round(double trigger_sec, double now_sec, double mission_sec,
     seed.static_obstacles = statics_;
     seed.num_static_obstacles = static_cast<int>(statics_.size());
     seed.default_uav_geometry = loaded_.default_uav_geometry;
+    seed.uav_geometries = loaded_.uav_geometries;
+    for (const auto& [id, position] : neighbor_positions_) {
+      if (now_sec - position.stamp_sec <= kStaleSec) {
+        seed.neighbor_positions[static_cast<uint8_t>(id)] =
+            Eigen::Vector3d(position.position[0], position.position[1], position.position[2]);
+      }
+    }
     const auto bootstrap = GoalBootstrapInitializer().build(seed, preview.relative_state, preview.leader_position);
     const auto committed = formation_generator_dmpc::commitGoalSeed(*optimizer_, bootstrap);
     goals_.pop();

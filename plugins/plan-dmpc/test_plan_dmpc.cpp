@@ -1,6 +1,7 @@
 #include "plan_dmpc.hpp"
 
 #include <cmath>
+#include <map>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -189,6 +190,85 @@ int admit_two_static_scene() {
   }
   std::cout << "two-static obstacles=" << opened->static_obstacle_count()
             << " horizon=" << opened->config().horizon << " fleet=" << opened->config().fleet_count << '\n';
+  return 0;
+}
+
+// Exercise the actual plugin ABI: measured peer telemetry follows planner
+// triggers rather than the host's 1 kHz step frequency.
+int measured_position_rate(const xgc_plugin_descriptor* descriptor) {
+  struct Host {
+    std::map<uint32_t, std::vector<uint8_t>> pending;
+    uint32_t paired = 0, trigger = 0, output = 0;
+    unsigned sent = 0;
+    xgc_dmpc_measured_position_v1 last{};
+  } host;
+  for (uint32_t i = 0; i < descriptor->port_count; ++i) {
+    const std::string name = descriptor->ports[i].name;
+    if (name == "paired_state") host.paired = i;
+    if (name == "sync_trigger") host.trigger = i;
+    if (name == "own_position") host.output = i;
+  }
+  xgc_host_api api{};
+  api.abi_version = XGC_RT_ABI_VERSION;
+  api.abi_minor = XGC_RT_ABI_MINOR;
+  api.host = &host;
+  api.next = [](void* raw, uint32_t port, xgc_sample_view* view) {
+    auto& h = *static_cast<Host*>(raw);
+    const auto found = h.pending.find(port);
+    if (found == h.pending.end() || found->second.empty()) return XGC_ERR_AGAIN;
+    static thread_local std::vector<uint8_t> sample;
+    sample.swap(found->second);
+    h.pending.erase(found);
+    *view = {};
+    view->data = sample.data();
+    view->len = static_cast<uint32_t>(sample.size());
+    return XGC_OK;
+  };
+  api.publish = [](void* raw, uint32_t port, uint64_t, const uint8_t* data, uint32_t len) {
+    auto& h = *static_cast<Host*>(raw);
+    if (port == h.output) {
+      if (len != sizeof h.last) return XGC_ERR;
+      std::memcpy(&h.last, data, len);
+      ++h.sent;
+    }
+    return XGC_OK;
+  };
+  const auto* v = descriptor->vtbl;
+  std::unique_ptr<void, void (*)(void*)> plugin(v->create(&api), v->destroy);
+  const std::string config = "self_id = 1\ntimeline_authority = 4\nscene_id = \"dmpc-uav8_comprehensive\"\nmanifest = \"" + comprehensive_manifest() + "\"\n";
+  if (v->configure(plugin.get(), config.c_str()) != XGC_OK || v->activate(plugin.get()) != XGC_OK)
+    return fail("measurement plugin configuration");
+  auto feed = [&](uint32_t port, const auto& sample) {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&sample);
+    host.pending[port] = std::vector<uint8_t>(bytes, bytes + sizeof sample);
+  };
+  xgc_dmpc_paired_state_v1 paired{};
+  paired.pose_stamp_sec = paired.twist_stamp_sec = 10.0;
+  paired.position[0] = 1.25;
+  paired.position[1] = -3.5;
+  paired.position[2] = 2.0;
+  feed(host.paired, paired);
+  xgc_step_ctx ctx{};
+  ctx.now = 10000000000LL;
+  if (v->step(plugin.get(), &ctx) != XGC_OK || host.sent != 0) return fail("measurement before trigger");
+  xgc_dmpc_sync_trigger_v1 trigger{};
+  trigger.sequence_id = 1;
+  trigger.trigger_time = 10.0;
+  feed(host.trigger, trigger);
+  if (v->step(plugin.get(), &ctx) != XGC_OK || host.sent != 1) return fail("measurement trigger");
+  for (int tick = 1; tick <= 99; ++tick) {
+    ctx.now += 1000000;
+    if (v->step(plugin.get(), &ctx) != XGC_OK) return fail("measurement idle step");
+  }
+  feed(host.trigger, trigger);  // Duplicate trigger must not transmit twice.
+  if (v->step(plugin.get(), &ctx) != XGC_OK || host.sent != 1) return fail("measurement exceeds planner rate");
+  trigger.sequence_id = 2;
+  trigger.trigger_time = 10.1;
+  feed(host.trigger, trigger);
+  if (v->step(plugin.get(), &ctx) != XGC_OK || host.sent != 2 || host.last.uav_id != 1 ||
+      host.last.stamp_sec != 10.0 || std::memcmp(host.last.position, paired.position, sizeof paired.position))
+    return fail("measurement changed actual pose or header time");
+  v->deactivate(plugin.get());
   return 0;
 }
 
@@ -520,6 +600,13 @@ int main(int argc, char** argv) {
       neighbor.states[k * neighbor.num_states] += 2.0;
     }
     if (!feed_neighbor(neighbor).empty()) return fail("valid neighbor trajectory was rejected");
+    xgc_dmpc_measured_position_v1 position{};
+    position.uav_id = static_cast<uint32_t>(id);
+    position.stamp_sec = 10.2;
+    position.position[0] = 2.0 * id;
+    position.position[1] = -16.0;
+    position.position[2] = 2.0;
+    if (!planner.push_neighbor_position(position).empty()) return fail("measured neighbor position was rejected");
   }
   bool saw_solve = false;
   for (int attempt = 0; attempt < 6 && !saw_solve; ++attempt) {
@@ -529,6 +616,9 @@ int main(int argc, char** argv) {
     if (trace.timeline.applied_revision != 3 ||
         trace.timeline.applied_mission_ns != rewind.mission_ns || planner.goal_waiting()) {
       return fail("consumed goal did not report its applied revision and mission time");
+    }
+    if (std::strstr(trace.status.reject_reason, "missing cached pose") != nullptr) {
+      return fail("goal bootstrap did not receive the measured neighbor positions");
     }
     if (!trace.status.solver_ok) {
       if (trace.have_position_target || !trace.own_plan.empty()) {
@@ -627,7 +717,7 @@ int main(int argc, char** argv) {
   }
   using Entry = const xgc_plugin_descriptor* (*)();
   auto* entry = reinterpret_cast<Entry>(dlsym(RTLD_DEFAULT, "xgc_rt_plugin_v1"));
-  if (entry == nullptr || entry() == nullptr || std::strcmp(entry()->name, "plan-dmpc") != 0 || entry()->port_count != 11) {
+  if (entry == nullptr || entry() == nullptr || std::strcmp(entry()->name, "plan-dmpc") != 0 || entry()->port_count != 13) {
     return fail("xgc_rt_plugin_v1 descriptor was not exported");
   }
   bool stale_ack = false;
@@ -658,7 +748,7 @@ int main(int argc, char** argv) {
   if (stale_ack || !position_target || !own_plan || !sync_trigger || !planner_status) {
     return fail("descriptor is missing the vehicle position target or own plan");
   }
-  if (admit_two_static_scene() != 0) return 1;
+  if (admit_two_static_scene() != 0 || measured_position_rate(entry()) != 0) return 1;
   std::cout << "lifecycle=" << held.status.lifecycle << " reject=" << held.status.reject_reason << '\n';
   std::cout << "obstacles=" << planner.static_obstacle_count() << " ports=" << entry()->port_count << '\n';
   return 0;

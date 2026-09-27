@@ -71,6 +71,10 @@ qos = "control"
 name = "radio_plan"
 qos = "control"
 [[channel]]
+name = "radio_position"
+qos = "state"
+
+[[channel]]
 name = "neighbor_plan"
 qos = "control"
 [[channel]]
@@ -120,7 +124,7 @@ path = "plan_dmpc"
 trigger = "on_round"
 config = {}
 step_budget_ms = 80
-bind = {paired_state={channel="paired_state",from=["SELF"]},controller_state={channel="controller_state",from=["CONTROL"]},scene_snapshot={channel="scene_snapshot",from=["SELF"]},scene_heartbeat={channel="scene_heartbeat",from=["SELF"]},timeline_commit={channel="timeline_commit",from=["SELF"]},neighbor_plan={channel="neighbor_plan",from=["SELF"]},sync_trigger={channel="sync_trigger",from=["SELF"]},timeline_status={channel="planner_timeline_status"},position_target={channel="position_target"},own_plan={channel="own_plan"},planner_status={channel="planner_status"}}
+bind = {paired_state={channel="paired_state",from=["SELF"]},controller_state={channel="controller_state",from=["CONTROL"]},scene_snapshot={channel="scene_snapshot",from=["SELF"]},scene_heartbeat={channel="scene_heartbeat",from=["SELF"]},timeline_commit={channel="timeline_commit",from=["SELF"]},neighbor_plan={channel="neighbor_plan",from=["SELF"]},sync_trigger={channel="sync_trigger",from=["SELF"]},timeline_status={channel="planner_timeline_status"},position_target={channel="position_target"},own_plan={channel="own_plan"},planner_status={channel="planner_status"},own_position={channel="radio_position"},neighbor_position={channel="radio_position",from=["PEERS"]}}
 
 [[plugin]]
 name = "station-io"

@@ -45,6 +45,15 @@ typedef struct xgc_dmpc_paired_state_v1 {
   double linear_velocity[3];
 } xgc_dmpc_paired_state_v1;
 
+/* xgc.dmpc.measured_position/1. Measured peer position for goal bootstrap,
+ * published at the planner cadence, independently of the assumed trajectory. */
+typedef struct xgc_dmpc_measured_position_v1 {
+  uint32_t uav_id;
+  uint32_t reserved;
+  double stamp_sec;
+  double position[3];
+} xgc_dmpc_measured_position_v1;
+
 /* Controller status is a different message from the pose. Its stamp is not
  * the pose stamp and is not a readiness boolean. */
 typedef struct xgc_dmpc_controller_status_v1 {

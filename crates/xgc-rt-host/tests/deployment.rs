@@ -1106,7 +1106,17 @@ fn dmpc_case(kind: &str) -> Case {
 fn dmpc_graphs_use_ros_paired_state_and_omit_ekf_hover_and_attitude_rate() {
     assert_eq!(composition_sha256(), "e9589ea20818504ab2e698ac0ffd8db21e0410581c41c70147e4ebe06b37b985");
     assert_eq!(composition(PX4_LOCAL_COMPOSITION_ID).unwrap().sha256(), "8017449b0396217aae10b9de9548fafcf22bc5bb8e628760c86ad4efaaf6b9f4");
-    assert_eq!(composition(HIL_COMPOSITION_ID).unwrap().sha256(), "319edff2bffe20072d45f9a237a686ffe5ad1f82cdb36ef62e7a336ef1f747d2");
+    for case in [hil_case(false), dmpc_case("native"), dmpc_case("planner")] {
+        let prepared = case.prepare().unwrap();
+        let rendered = manifest(&prepared);
+        let planner = plugin(&rendered, "plan-dmpc");
+        assert_eq!(planner["bind"]["own_position"]["channel"].as_str(), Some("radio_position"));
+        assert_eq!(planner["bind"]["neighbor_position"]["channel"].as_str(), Some("radio_position"));
+        let node = rendered["session"]["node"].as_str().unwrap();
+        let peers = planner["bind"]["neighbor_position"]["from"].as_array().unwrap();
+        assert!(!peers.is_empty());
+        assert!(peers.iter().all(|peer| peer.as_str() != Some(node)));
+    }
 
     let native = dmpc_case("native");
     let prepared = native.prepare().unwrap();

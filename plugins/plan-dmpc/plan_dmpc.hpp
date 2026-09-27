@@ -73,6 +73,7 @@ class PlanDmpc {
                                 formation_generator_dmpc::PlainSceneDynamicState* state,
                                 bool* have_state) const;
   std::string push_neighbor_plan(const uint8_t* bytes, size_t size);
+  std::string push_neighbor_position(const xgc_dmpc_measured_position_v1& position);
   size_t static_obstacle_count() const { return scene_.staticObstacles().size(); }
   const std::vector<convex_geometry::BodyInstance>& static_bodies() const { return statics_; }
   const std::string& scene_epoch() const { return scene_epoch_; }
@@ -121,6 +122,7 @@ class PlanDmpc {
   std::map<std::string, convex_geometry::BodyTemplate> templates_;
   std::vector<convex_geometry::BodyInstance> statics_;
   std::map<uint32_t, StateTrajectory> neighbor_plans_;
+  std::map<uint32_t, xgc_dmpc_measured_position_v1> neighbor_positions_;
   std::unique_ptr<IDmpcOptimizer> optimizer_;
   DmpcScene scene_;
   formation_generator_dmpc::PlainSceneAdapter scene_adapter_;
