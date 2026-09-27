@@ -98,6 +98,8 @@ pub struct StreamReport {
     /// Per-sample clock-error bound (sender + receiver), in ns. An OWD figure
     /// is only as good as `owd_bound_ns.max`.
     pub owd_bound_ns: Dist,
+    /// Samples with unknown sender/receiver bounds; excluded from the bound distribution.
+    pub owd_bound_unknown_samples: u64,
     /// `t_consume − t_produce` for samples a module read.
     pub age_at_use_ns: Dist,
     /// Span of expected `t_tx`, extended by one mean send interval:
@@ -142,6 +144,8 @@ pub struct NodeReport {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Report {
+    pub clock_domain: String,
+    pub clock_source: Option<serde_json::Value>,
     pub definitions: &'static str,
     pub session: String,
     pub roster: Vec<String>,
@@ -174,6 +178,7 @@ struct Tx {
 }
 
 struct NodeData {
+    clock_source: Option<serde_json::Value>,
     meta: NodeMeta,
     records: Vec<Record>,
 }
@@ -198,7 +203,11 @@ fn load_run(run_dir: &Path) -> Result<Vec<NodeData>, MergeError> {
         for chunk in bytes.chunks_exact(RECORD_LEN) {
             records.push(Record::decode(chunk).ok_or_else(|| err(format!("{}: bad record", dir.display())))?);
         }
-        nodes.push(NodeData { meta, records });
+        let source_path = dir.join("clock_source.json");
+        let clock_source = if source_path.exists() {
+            Some(serde_json::from_slice(&fs::read(&source_path).map_err(|e| err(e.to_string()))?).map_err(|e| err(format!("{}: {e}", source_path.display())))?)
+        } else { None };
+        nodes.push(NodeData { meta, records, clock_source });
     }
     if nodes.is_empty() {
         return Err(err(format!("{}: no node records", run_dir.display())));
@@ -210,7 +219,16 @@ pub fn merge_run(run_dir: &Path, opts: MergeOptions) -> Result<Report, MergeErro
     let nodes = load_run(run_dir)?;
     let first = &nodes[0].meta;
     let mut invalid = Vec::new();
+    if !matches!(first.clock_domain.as_str(), "wall" | "sim") {
+        return Err(MergeError("unknown audit clock domain".into()));
+    }
     for n in &nodes {
+        if n.meta.clock_domain != first.clock_domain || n.clock_source != nodes[0].clock_source {
+            return Err(MergeError(format!("node {} has a different clock domain/authority/epoch", n.meta.node)));
+        }
+        if first.clock_domain == "wall" && n.clock_source.is_some() {
+            return Err(MergeError("wall audit cannot declare a simulator authority".into()));
+        }
         if n.meta.session != first.session || n.meta.roster != first.roster || n.meta.channels != first.channels {
             return Err(MergeError(format!("node {} belongs to a different session layout", n.meta.node)));
         }
@@ -308,6 +326,7 @@ pub fn merge_run(run_dir: &Path, opts: MergeOptions) -> Result<Report, MergeErro
             let mut received_ok: HashMap<u64, ()> = HashMap::with_capacity(expected.len());
             let mut max_seen: Option<u64> = None;
             let (mut owd, mut bound, mut extents) = (Vec::new(), Vec::new(), Vec::new());
+            let mut bound_unknown = 0;
             let mut phantom = 0u64;
             for r in arrivals.get(&(channel, origin)).map(Vec::as_slice).unwrap_or(&[]) {
                 let Some(t) = tx.get(&r.seq) else {
@@ -337,7 +356,8 @@ pub fn merge_run(run_dir: &Path, opts: MergeOptions) -> Result<Report, MergeErro
                 win.0.payload_bytes_received += r.len as u64;
                 win.1.push(d);
                 owd.push(d);
-                bound.push(r.bound_a as i64 + r.bound_b as i64);
+                if r.bound_a == u32::MAX || r.bound_b == u32::MAX { bound_unknown += 1; }
+                else { bound.push(r.bound_a as i64 + r.bound_b as i64); }
                 match max_seen {
                     Some(m) if r.seq < m => {
                         let extent = m - r.seq;
@@ -383,6 +403,7 @@ pub fn merge_run(run_dir: &Path, opts: MergeOptions) -> Result<Report, MergeErro
                 reorder_extent: Dist::of(&mut extents),
                 owd_ns: Dist::of(&mut owd),
                 owd_bound_ns: Dist::of(&mut bound),
+                owd_bound_unknown_samples: bound_unknown,
                 age_at_use_ns: Dist::of(&mut ages),
                 duration_s,
                 rate_hz: per_s(total.received as f64),
@@ -413,6 +434,8 @@ pub fn merge_run(run_dir: &Path, opts: MergeOptions) -> Result<Report, MergeErro
     invalid.sort();
     invalid.dedup();
     Ok(Report {
+        clock_domain: first.clock_domain.clone(),
+        clock_source: nodes[0].clock_source.clone(),
         definitions: DEFINITIONS,
         session: first.session.clone(),
         roster,
@@ -459,6 +482,10 @@ pub fn markdown(r: &Report) -> String {
         ms(r.window_ns),
         if r.valid { "valid" } else { "INVALID" }
     );
+    s.push_str(&format!("Clock domain: `{}`. Delay and rate timestamps use this domain.\n", r.clock_domain));
+    if r.clock_domain == "sim" {
+        s.push_str("Simulator timestamp differences do not measure wall-time network latency.\n");
+    }
     for reason in &r.invalid_reasons {
         s.push_str(&format!("- invalid: {reason}\n"));
     }
@@ -479,7 +506,7 @@ pub fn markdown(r: &Report) -> String {
             ms(st.owd_ns.p50),
             ms(st.owd_ns.p99),
             ms(st.owd_ns.max),
-            ms(st.owd_bound_ns.max),
+            if st.owd_bound_unknown_samples > 0 { format!("unknown ({} samples)", st.owd_bound_unknown_samples) } else { ms(st.owd_bound_ns.max) },
             ms(st.age_at_use_ns.p50),
             ms(st.age_at_use_ns.p99),
             st.rate_hz,
@@ -494,4 +521,98 @@ pub fn markdown(r: &Report) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod clock_contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn fixture() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "xgc-clock-audit-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        for (id, node) in ["a", "b"].iter().enumerate() {
+            let dir = p.join(node);
+            fs::create_dir_all(&dir).unwrap();
+            let meta = NodeMeta {
+                format: crate::record::FORMAT.into(),
+                session: "session".into(),
+                node: (*node).into(),
+                node_id: id as u16,
+                roster: vec!["a".into(), "b".into()],
+                channels: vec!["plan".into()],
+                clock_domain: "wall".into(),
+                audit_queue_drops: 0,
+                records_written: if id == 0 { 1 } else { 2 },
+                complete: true,
+            };
+            fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            let mut rec = Record::new(if id == 0 { Kind::Tx } else { Kind::Rx }, id as u16);
+            rec.origin = 0;
+            rec.channel = 0;
+            rec.seq = 1;
+            rec.t_a = 10;
+            rec.t_b = if id == 0 { 10 } else { 20 };
+            rec.len = 1;
+            rec.bound_a = u32::MAX;
+            rec.bound_b = 3;
+            let mut records = Vec::new();
+            if id == 1 {
+                let mut sub = Record::new(Kind::Subscribe, 1);
+                sub.origin = 0;
+                sub.channel = 0;
+                sub.t_b = 0;
+                records.extend(sub.encode());
+            }
+            records.extend(rec.encode());
+            fs::write(dir.join("records.bin"), records).unwrap();
+        }
+        p
+    }
+    fn set_domain(p: &Path, node: &str, domain: &str) {
+        let file = p.join(node).join("meta.json");
+        let mut meta: NodeMeta = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        meta.clock_domain = domain.into();
+        fs::write(file, serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+    #[test]
+    fn unknown_bound_is_not_a_numeric_error_bound() {
+        let p = fixture();
+        let report = merge_run(&p, MergeOptions::default()).unwrap();
+        let s = &report.streams[0];
+        assert_eq!(s.owd_ns.count, 1);
+        assert_eq!(s.owd_bound_ns.count, 0);
+        assert_eq!(s.owd_bound_unknown_samples, 1);
+        assert!(markdown(&report).contains("unknown (1 samples)"));
+        fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn reject_cross_domain_and_different_simulator_instance() {
+        let p = fixture();
+        set_domain(&p, "b", "sim");
+        assert!(merge_run(&p, MergeOptions::default())
+            .unwrap_err()
+            .0
+            .contains("clock domain"));
+        set_domain(&p, "a", "sim");
+        fs::write(
+            p.join("a/clock_source.json"),
+            r#"{"world_instance_id":"one","epoch_ns":5}"#,
+        )
+        .unwrap();
+        fs::write(
+            p.join("b/clock_source.json"),
+            r#"{"world_instance_id":"two","epoch_ns":5}"#,
+        )
+        .unwrap();
+        assert!(merge_run(&p, MergeOptions::default()).is_err());
+        fs::copy(p.join("a/clock_source.json"), p.join("b/clock_source.json")).unwrap();
+        let report = merge_run(&p, MergeOptions::default()).unwrap();
+        assert_eq!(report.clock_domain, "sim");
+        assert!(markdown(&report).contains("do not measure wall-time network latency"));
+        fs::remove_dir_all(p).unwrap();
+    }
 }

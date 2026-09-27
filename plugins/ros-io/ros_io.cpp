@@ -53,13 +53,13 @@
 //   (E0 + k*P on the aligned OS clock). Publish them on the robot's own topic;
 //   they are never a timing authority for another robot.
 //
-// Threading: ROS callbacks run on this plugin's own thread. Each step first
-// publishes what the modules wrote since the last step, then services this
-// plugin's ROS callback queue until the round's deadline, so a callback
-// writes module outputs as soon as its message arrives. ros::init is called
-// once per process (node name `node_name`, default xgc_ros_io), with
-// ROS_MASTER_URI from the environment. Times: ROS time in seconds is the
-// Session time (both are the host clock in wall-clock runs).
+// Threading: ROS callbacks run on this plugin's own queue. Each step first
+// publishes what the modules wrote since the last step, then services that
+// queue for a steady-time budget. The budget is fixed at step entry, so a
+// paused Session clock cannot keep the step waiting. ros::init is once per
+// process and is shared with the clock-source service (same node name and
+// the process ROS master). A clock source that has not been started leaves
+// the output gate unclaimed, which is the existing wall path.
 //
 // Config: `<port>_topic` (string), `node_name`, `frame_id` (default "world"),
 // `queue_size` (default 10), `slice_ms` (default 0: service ROS until the
@@ -109,9 +109,12 @@
 
 #include "../common/flat_config.hpp"
 #include "../common/reference_wire.hpp"
+#include "ros_edge.hpp"
 #include "scene_wire.hpp"
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
+
+#include <chrono>
 
 namespace {
 
@@ -412,7 +415,9 @@ struct RosIo {
         calls.pop_front();
       }
       std::string result;
-      if (r.kind == 1) {
+      if (!xgc_ros_edge::output_allowed()) {
+        result = "fcu_request discarded while the output gate is closed";
+      } else if (r.kind == 1) {
         // A persistent client drops its connection on a failed call; reconnect.
         if (!command.isValid()) command = nh->serviceClient<mavros_msgs::CommandLong>(ns + "/cmd/command", true);
         mavros_msgs::CommandLong srv;
@@ -444,9 +449,23 @@ struct RosIo {
     caller.join();
   }
 
+  void discard_pending_output() {
+    xgc_sample_view v;
+    for (uint32_t port = 0; port < kPortCount; ++port) {
+      while (host->next(host->host, port, &v) == XGC_OK) {
+      }
+    }
+    std::lock_guard<std::mutex> lock(calls_mutex);
+    calls.clear();
+  }
+
   // --- module inputs -> ROS -------------------------------------------------
 
   void forward_inputs() {
+    if (!xgc_ros_edge::output_allowed()) {
+      discard_pending_output();
+      return;
+    }
     xgc_sample_view v;
     while (host->next(host->host, kVisionPose, &v) == XGC_OK) {
       if (v.len != sizeof(xgc_pose_v1)) continue;
@@ -674,9 +693,10 @@ struct RosIo {
   }
 
   xgc_status activate() {
-    if (!ros::isInitialized()) {
-      ros::M_string remappings;
-      ros::init(remappings, node_name, ros::init_options::NoSigintHandler | ros::init_options::NoRosout);
+    const xgc_ros_edge::RosInit ros_init = xgc_ros_edge::ensure_ros(node_name);
+    if (!ros_init.ok) {
+      log(XGC_LOG_ERROR, std::string("ros_io: ") + ros_init.error);
+      return XGC_ERR;
     }
     nh = std::make_unique<ros::NodeHandle>();
     nh->setCallbackQueue(&queue);
@@ -740,16 +760,28 @@ struct RosIo {
 
   xgc_status step(const xgc_step_ctx* ctx) {
     round = ctx->round;
-    forward_inputs();
-    // Service ROS callbacks until the round's deadline (minus 1 ms), so a
-    // message becomes a module output as soon as it arrives; at least once per
-    // round, so short (1 ms) rounds still take what has arrived.
+    if (!xgc_ros_edge::output_allowed() || xgc_ros_edge::take_suppress_backlog()) {
+      discard_pending_output();
+    } else {
+      forward_inputs();
+    }
+    // One non-blocking pass, then a budget fixed in steady time. Session time
+    // is not read again: a frozen simulation clock must not extend the wait.
     queue.callAvailable(ros::WallDuration(0));
+    const int64_t session_now = host->now(host->host);
     int64_t until = ctx->deadline - 1000000;
-    if (slice_ms > 0.0) until = std::min<int64_t>(until, host->now(host->host) + static_cast<int64_t>(slice_ms * 1e6));
+    if (slice_ms > 0.0) {
+      until = std::min<int64_t>(until, session_now + static_cast<int64_t>(slice_ms * 1e6));
+    }
+    int64_t budget_ns = until - session_now;
+    if (budget_ns < 0) budget_ns = 0;
+    const auto started = std::chrono::steady_clock::now();
     while (ros::ok()) {
-      const int64_t left = until - host->now(host->host);
-      if (left <= 0) break;
+      const int64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count();
+      if (elapsed >= budget_ns) break;
+      const int64_t left = budget_ns - elapsed;
       queue.callAvailable(ros::WallDuration(std::min<int64_t>(left, 1000000) * 1e-9));
     }
     if (write_failed) {

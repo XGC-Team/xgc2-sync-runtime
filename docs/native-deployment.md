@@ -53,7 +53,7 @@ Deployment JSON, deny unknown/duplicate fields, nulls and coercion. The envelope
 }
 ```
 
-Configuration (all fields required; no default calibration or ROS addresses):
+Configuration (the fields shown are required; `simulation` is present only for `ros1-sim`; no default calibration or ROS addresses):
 
 ```json
 {
@@ -119,7 +119,7 @@ Packaging writes a separate **DEPLOYMENT-BUNDLE.json** (exact bytes SHA binds it
 
 Host/plugins/libraries are indexed actual regular ELF files. Bundle links are separately indexed, constrained to the same directory, and resolve to an indexed real file; source/target cannot escape the bundle. Every indexed byte is verified before generation/exec. External ROS and system dependencies remain installed OS dependencies, not forged vendored files. The runtime launch sets LD_LIBRARY_PATH to bundle/lib plus /opt/ros/noetic/lib.
 
-`describe` supplies the selected canonical composition document and SHA. Each composition is built into the renderer, sets a 1 ms period and a controller 10 ms step budget, self-only roster, five actual module roles and the fixed backend settings plus explicit takeoff/calibration values. No observer, run_for_ms, fixed ROS namespace or automatic extrinsic verification. No Sim clock, distributed synchronization, DMPC or UGV claim.
+`describe` supplies the selected canonical composition document and SHA. Each composition is built into the renderer, sets a 1 ms period and a controller 10 ms step budget, self-only roster, five actual module roles and the fixed backend settings plus explicit takeoff/calibration values. No observer, run_for_ms, fixed ROS namespace or automatic extrinsic verification. The optional simulator clock changes Session time without changing either graph. These control-only profiles do not include distributed synchronization, DMPC or UGV control.
 
 State contract: same Session/node identity with different frozen deployment JSON is refused (including bundle/config/composition changes). Same identity/input creates a fresh audit generation; an active `run` blocks a second writer. Identity and generation writes are atomic under a no-symlink directory descriptor lock. Receipt includes deployment/manifest/bundle/config/composition hashes, generation and exact manifest/audit paths; prepare success is not live-module readiness.
 
@@ -137,11 +137,29 @@ Only the declared library links may be symlinks; each points directly to an inde
 
 ## Time, readiness and acceptance boundaries
 
-The caller explicitly declares `input_time_domain: wall-unix`. The ESKF, hover-thrust estimator, controller and reference generator use the host Session clock. This release does not inspect /use_sim_time or translate Gazebo /clock, and accepting the declaration does not prove a live upstream publisher actually obeys it. Bring-up must check its actual timestamp domain independently before control use.
+The caller declares `input_time_domain: wall-unix` for physical wall-time inputs, with no `simulation` field. For simulator-stamped inputs it declares `ros1-sim` and supplies the following frozen block inside the same configuration JSON:
+
+```json
+"simulation": {
+  "epoch_ns": 2000000000,
+  "topic": "/clock",
+  "expected_publisher": "/experiment_world",
+  "world_instance_id": "selected-world-generation",
+  "startup_timeout_wall_ms": 5000,
+  "stale_after_wall_ms": 100,
+  "max_advance_ns": 50000000,
+  "poll_wall_ms": 5,
+  "queue_capacity": 256
+}
+```
+
+`epoch_ns` is the same future simulator time frozen by the experiment's Run coordinator for every participant. It is never derived from each node's message arrival. The remaining fields map directly to the host [clock source](clock-source.md); its kind is fixed to `ros1_sim` and its pinned plugin is `ros_io`. Manifest validation applies the existing authority and timing limits. Explicit null, a missing block for `ros1-sim`, or a simulation block for `wall-unix` is rejected. The generation receipt reports the selected domain. The unchanged `describe` result still describes the default wall-time profile.
+
+The ESKF, hover estimator, controller and reference generator use the selected Session clock. The ROS source requires `/use_sim_time=true` and preserves sensor stamps. Pause prevents domain steps and outputs while Stop/liveness use steady time; a reset or authority fault ends the Session. A separate experiment ROS master/world and common clock authority work for both colocated and per-robot placements. Keep clock/plant traffic separate from impaired neighbor-radio traffic when evaluating neighbor communication. Accepting configuration does not independently verify that every live publisher uses the selected time domain.
 
 `prepare` validates schema, files and the real Manifest resolver; its `live_readiness` is always false. A `run` receipt is also not module readiness: host module lifecycle/health (under `<audit_path>/<node_id>/health.jsonl`) and actual output/input evidence must be checked by the managing workflow. The process remains alive until the ordinary managed-process stop signal or an actual host failure; there is no fixture observer or 180-second deadline.
 
-Both compositions are self-only, with native ESKF, native hover-thrust, the selected controller backend, reference generation and ROS I/O. Native hover-thrust owns its internal channel; the ROS adapter is not a second hover-thrust producer. Neither profile includes DMPC rounds/planning, multi-robot synchronization, UGV control, physical-flight acceptance, or simulation time. The surrounding catalog must claim the robot namespace exclusively across Sessions, not claim only the Session/node identity.
+Both compositions are self-only, with native ESKF, native hover-thrust, the selected controller backend, reference generation and ROS I/O. Native hover-thrust owns its internal channel; the ROS adapter is not a second hover-thrust producer. Neither profile includes DMPC rounds/planning, multi-robot synchronization, UGV control or physical-flight acceptance. The surrounding catalog must claim the robot namespace exclusively across Sessions, not claim only the Session/node identity.
 
 ## Build and boundary tests
 

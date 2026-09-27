@@ -15,6 +15,8 @@ members = [
   "plugins/stub-control",
   "plugins/dmpc-exchange-demo",
   "plugins/dmpc-rounds",
+  "plugins/transport-loopback",
+  "plugins/transport-zenoh",
 ]
 
 [workspace.package]
