@@ -16,6 +16,8 @@
 //   in  clock           xgc.clock/1                     (optional; pass_through_clock = "input")
 //   out round_done      xgc.clock/1                     (optional; each tick's trigger time, after
 //                                                        its outputs, for a lockstep simulator)
+//   out neighbors       xgc.dmpc.neighbor_snapshot/1    (optional; each tick's NeighborExchange
+//                                                        snapshot, before round_done)
 //   in  scene_snapshot  xgc.scene.snapshot/1            (optional; the shared scene's definition)
 //   in  scene_state     xgc.scene.state/1               (optional; its obstacles' current state)
 //
@@ -24,7 +26,11 @@
 // agent every measured state of rounds <= k and every neighbor plan of
 // rounds <= k - 1 (the sample's round, never its arrival time), in round
 // order: a neighbor's round-k plan is used at round k + 1 even when it
-// arrives before the tick of round k. Scene samples of rounds <= k go to the
+// arrives before the tick of round k. The plans given to the agent at round
+// k are offered to a NeighborExchange (abi/include/xgc_rt_nx.h) at planner
+// round k, and its snapshot of round k (each neighbor Fresh, Stale(n) or
+// Missing, with the round and age of its newest plan) goes out on
+// `neighbors`: what the round used, as the Rust planners report it. Scene samples of rounds <= k go to the
 // agent after the measured states and before the plans, by round and, within
 // a round, definitions before states; a state's receive time is its stamp.
 // The agent's clock is the tick's trigger time, so a run is a function of
@@ -55,6 +61,8 @@
 // Config: param_manifest (required): the robot's param manifest, the
 // scenario YAML files its launch block loads (rosparam_yaml.h,
 // ParamManifest); relative paths resolve against the manifest's directory.
+// stale_rounds (default 3): the snapshot's stale window s_max; it changes
+// only the report, never what the agent is given.
 //
 // Domain state: the agent's phase (wait_obstacle_info, wait_self_state,
 // wait_neighbors, hold, rolling, fault), or "unconfigured".
@@ -67,6 +75,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -81,6 +90,7 @@
 #include "formation_generator/dmpc_scheduler/dmpc_agent.h"
 #include "formation_generator/params/rosparam_yaml.h"
 #include "xgc_rt.h"
+#include "xgc_rt_nx.h"
 #include "xgc_schemas_v1.h"
 
 namespace {
@@ -89,7 +99,7 @@ namespace fg = formation_generator_dmpc;
 
 enum Port : uint32_t {
   kFormationTick, kPlanIn, kPlanOut, kOwnState, kSetpoint, kSceneSnapshot, kSceneState, kPlanarSetpoint,
-  kClock, kRoundDone, kPortCount
+  kClock, kRoundDone, kNeighbors, kPortCount
 };
 
 static_assert(sizeof(fg::PositionTargetPayload) == sizeof(xgc_position_target_v1),
@@ -139,12 +149,27 @@ struct SceneInput {
   fg::SceneStateData state;
 };
 
+// A neighbor plan not yet given to the agent, with its envelope.
+struct NeighborPlan {
+  uint64_t round;
+  uint16_t origin;
+  uint64_t seq;
+  int64_t t_produce;
+  std::vector<uint8_t> bytes;
+  fg::PlanMessage plan;
+};
+
 struct PlanDmpc {
   const xgc_host_api* host{nullptr};
   std::unique_ptr<fg::DmpcAgent> agent;
   // Inputs not yet given to the agent, in arrival order.
   std::vector<std::pair<uint64_t, xgc_rigid_state_v1>> states;
-  std::vector<std::pair<uint64_t, fg::PlanMessage>> plans;
+  std::vector<NeighborPlan> plans;
+  // What the agent was given, per neighbor (closed when the host has no
+  // port_origins, abi_minor 0: then no snapshot is published).
+  xgc_nx nx{};
+  bool nx_open{false};
+  uint64_t stale_rounds{3};
   std::vector<SceneInput> scene;
   std::map<uint64_t, fg::DmpcTick> ticks;
   bool ticked{false};
@@ -171,12 +196,12 @@ struct PlanDmpc {
       states.emplace_back(s.round, state);
     }
     while (host->next(host->host, kPlanIn, &s) == XGC_OK) {
-      fg::PlanMessage plan;
-      if (!fg::decodePlanPayload(s.data, s.len, plan)) {
+      NeighborPlan in{s.round, s.origin, s.seq, s.t_produce, std::vector<uint8_t>(s.data, s.data + s.len), {}};
+      if (!fg::decodePlanPayload(s.data, s.len, in.plan)) {
         log(XGC_LOG_WARN, "plan-dmpc: malformed neighbor plan dropped");
         continue;
       }
-      plans.emplace_back(s.round, std::move(plan));
+      plans.push_back(std::move(in));
     }
     while (host->next(host->host, kSceneSnapshot, &s) == XGC_OK) {
       SceneInput in{s.round, true, {}, {}};
@@ -239,11 +264,17 @@ struct PlanDmpc {
       else agent->receiveSceneState(in.state, in.state.stamp);
     }
     scene = std::move(later_scene);
-    std::vector<std::pair<uint64_t, fg::PlanMessage>> usable, later_plans;
-    for (auto& entry : plans) (entry.first + 1 <= k ? usable : later_plans).push_back(std::move(entry));
+    std::vector<NeighborPlan> usable, later_plans;
+    for (auto& entry : plans) (entry.round + 1 <= k ? usable : later_plans).push_back(std::move(entry));
     std::stable_sort(usable.begin(), usable.end(),
-                     [](const auto& a, const auto& b) { return a.first < b.first; });
-    for (const auto& entry : usable) agent->receiveNeighborPlan(entry.second);
+                     [](const NeighborPlan& a, const NeighborPlan& b) { return a.round < b.round; });
+    for (const auto& entry : usable) {
+      if (nx_open && xgc_nx_offer(&nx, k, entry.origin, entry.round, entry.seq, entry.t_produce, entry.bytes.data(),
+                                  static_cast<uint32_t>(entry.bytes.size())) < 0) {
+        throw std::bad_alloc();
+      }
+      agent->receiveNeighborPlan(entry.plan);
+    }
     plans = std::move(later_plans);
   }
 
@@ -290,6 +321,11 @@ struct PlanDmpc {
       ticked = true;
       last_tick = tick.round;
       if (publishOutputs(tick.round, out) != XGC_OK) return XGC_ERR;
+      if (nx_open) {
+        std::vector<uint8_t> snapshot(xgc_nx_snapshot_size(&nx));
+        xgc_nx_snapshot_encode(&nx, tick.round, ctx->now, snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+        host->publish(host->host, kNeighbors, tick.round, snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+      }
       const double done = tick.trigger_time;
       host->publish(host->host, kRoundDone, tick.round, reinterpret_cast<const uint8_t*>(&done), sizeof done);
     }
@@ -342,6 +378,12 @@ xgc_status configure(void* p, const char* config) {
       return XGC_ERR;
     }
     self->input_clock = clock == "input";
+    int stale = 3;
+    if (xgc_rt_config::integer(text, "stale_rounds", &stale) && stale < 0) {
+      self->log(XGC_LOG_ERROR, "plan-dmpc: stale_rounds must be >= 0");
+      return XGC_ERR;
+    }
+    self->stale_rounds = static_cast<uint64_t>(stale);
     if (manifest.empty()) {
       self->log(XGC_LOG_ERROR, "plan-dmpc: param_manifest is required");
       return XGC_ERR;
@@ -353,7 +395,15 @@ xgc_status configure(void* p, const char* config) {
 
 xgc_status activate(void* p) {
   auto* self = static_cast<PlanDmpc*>(p);
-  return self->agent ? XGC_OK : XGC_ERR;
+  if (!self->agent) return XGC_ERR;
+  if (!self->nx_open) {
+    if (xgc_nx_open(&self->nx, self->host, kPlanIn, kPlanOut, self->stale_rounds) == XGC_OK) {
+      self->nx_open = true;
+    } else {
+      self->log(XGC_LOG_WARN, "plan-dmpc: host has no port_origins (abi_minor 0): no neighbor snapshots");
+    }
+  }
+  return XGC_OK;
 }
 
 xgc_status step(void* p, const xgc_step_ctx* ctx) {
@@ -363,7 +413,11 @@ xgc_status step(void* p, const xgc_step_ctx* ctx) {
 
 xgc_status deactivate(void*) { return XGC_OK; }
 
-void destroy(void* p) { delete static_cast<PlanDmpc*>(p); }
+void destroy(void* p) {
+  auto* self = static_cast<PlanDmpc*>(p);
+  if (self->nx_open) xgc_nx_close(&self->nx);
+  delete self;
+}
 
 const char* domain_state(void* p) {
   const auto* self = static_cast<PlanDmpc*>(p);
@@ -381,6 +435,7 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"planar_setpoint", XGC_PORT_OUT_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
     {"clock", XGC_PORT_IN_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
     {"round_done", XGC_PORT_OUT_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
+    {"neighbors", XGC_PORT_OUT_OPTIONAL, "xgc.dmpc.neighbor_snapshot/1", XGC_QOS_EVENT},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};

@@ -65,7 +65,10 @@
 //!   early plans did not enter round k: peers' plans of round <= k - 1;
 //! - Fresh / Stale / Missing per robot, round and peer (the newest peer plan
 //!   of round <= k - 1 the module had at tick k: of round k - 1, older,
-//!   none), with the peer rounds that were late or never arrived;
+//!   none), with the peer rounds that were late or never arrived; and
+//!   plan-dmpc's own NeighborExchange snapshot (xgc_rt_nx.h, published on
+//!   its `neighbors` port each round) must say exactly that for every
+//!   robot, round and peer (status, stale rounds, round of the plan);
 //! - the H product gate: Custom1 before the rolling rounds, held; every
 //!   robot tracks its rolling setpoints and travels.
 //! Relay profiles: clean (pass-through) and C4-like (40 ms, Gilbert-Elliott
@@ -103,7 +106,7 @@ const PERIOD_MS: i64 = 100;
 const ROUNDS: i64 = 80;
 const HOLD: u64 = 10;
 
-const CHANNELS: [(&str, Qos); 21] = [
+const CHANNELS: [(&str, Qos); 22] = [
     ("formation_tick", Qos::Control),  // 0  feeder -> plan-dmpc
     ("plan", Qos::Control),            // 1  plan-dmpc <-> plan-dmpc (link)
     ("own_state", Qos::State),         // 2  feeder -> plan-dmpc
@@ -125,9 +128,10 @@ const CHANNELS: [(&str, Qos); 21] = [
     ("status", Qos::State),            // 18
     ("tick_done", Qos::Event),         // 19
     ("planar_setpoint", Qos::Control), // 20 plan-dmpc (Scout) -> feeder
+    ("neighbors", Qos::Event),         // 21 plan-dmpc -> feeder: its NeighborExchange snapshots
 ];
 const FEEDER_OUT: [u32; 13] = [0, 2, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-const FEEDER_IN: [u32; 8] = [1, 3, 6, 16, 17, 18, 19, 20];
+const FEEDER_IN: [u32; 9] = [1, 3, 6, 16, 17, 18, 19, 20, 21];
 
 // One fleet at a time (one heavy process).
 static FLIGHT: Mutex<()> = Mutex::new(());
@@ -294,7 +298,7 @@ fn robot_host(net: &Net, clock: &Arc<ManualClock>, dir: &Path, n: usize, i: usiz
         feed("formation_tick"),
         format!("plan_in = {{ channel = \"plan\", from = [{}] }}", peers.join(", ")),
         feed("own_state"), feed("scene_snapshot"), feed("scene_state"),
-        out("plan_out", "plan"), out("round_done", "round_done"),
+        out("plan_out", "plan"), out("round_done", "round_done"), out("neighbors", "neighbors"),
     ];
     let mut controller = String::new();
     if member.kind == Kind::Uav {
@@ -370,6 +374,7 @@ struct Robot {
     // scene_snapshot, scene_state ((channel, seq) -> (round, payload)).
     plan_by_seq: BTreeMap<u64, (u64, Vec<u8>)>,
     fed: BTreeMap<(u32, u64), (u64, Vec<u8>)>,
+    neighbors: Vec<(u64, Vec<u8>)>, // plan-dmpc's NeighborExchange snapshot per round
 }
 
 enum Body {
@@ -535,6 +540,7 @@ fn fly(name: &str, plan_dmpc: &Path, ctl_px4: &Path, members: &[Member], scene: 
                         robot.plan_by_seq.insert(seq, (round, payload.clone()));
                         robot.plans.push((round, payload));
                     }
+                    (21, _) => robot.neighbors.push((round, payload)),
                     (3, _) => {
                         commanded[i] = true;
                         robot.setpoints.push((round, payload));
@@ -588,6 +594,7 @@ fn fly(name: &str, plan_dmpc: &Path, ctl_px4: &Path, members: &[Member], scene: 
                     robots[i].plan_by_seq.insert(seq, (round, payload));
                 }
                 3 | 20 => robots[i].setpoints.push((round, payload)),
+                21 => robots[i].neighbors.push((round, payload)),
                 _ => {}
             }
         }
@@ -990,6 +997,7 @@ struct Freshness {
     never: u64,   // a peer plan of round k - 1 never read
     early: u64,   // peer plans of round >= k already read at tick k
     state_behind: u64, // ticks k read before the own_state of round k
+    module: [u64; 3],  // plan-dmpc's own snapshots: Fresh, Stale, Missing
 }
 
 impl std::ops::AddAssign for Freshness {
@@ -1002,7 +1010,34 @@ impl std::ops::AddAssign for Freshness {
         self.never += o.never;
         self.early += o.early;
         self.state_behind += o.state_behind;
+        for (a, b) in self.module.iter_mut().zip(o.module) {
+            *a += b;
+        }
     }
+}
+
+const NX_FRESH: u8 = 0;
+const NX_STALE: u8 = 1;
+const NX_MISSING: u8 = 2;
+/// plan-dmpc's default `stale_rounds`.
+const NX_STALE_ROUNDS: u64 = 3;
+
+/// The snapshot of round k (xgc_rt_nx.h, xgc.dmpc.neighbor_snapshot/1):
+/// (origin, status, stale rounds, round, age ns) per neighbor.
+fn decode_snapshot(records: &[(u64, Vec<u8>)], k: u64) -> Option<Vec<(u16, u8, u64, u64, i64)>> {
+    let (_, b) = records.iter().find(|r| r.0 == k)?;
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    assert_eq!(u64_at(0), k, "snapshot round");
+    let count = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+    assert_eq!(b.len(), 16 + 32 * count, "snapshot size");
+    Some(
+        (0..count)
+            .map(|e| {
+                let o = 16 + 32 * e;
+                (u16::from_le_bytes([b[o], b[o + 1]]), b[o + 2], u64_at(o + 8), u64_at(o + 16), u64_at(o + 24) as i64)
+            })
+            .collect(),
+    )
 }
 
 /// Robot i's closed-loop reads as replay batches, peer plans of round >= k
@@ -1059,8 +1094,21 @@ fn consumed(flight: &Flight, n: usize, i: usize) -> (Vec<Vec<Input>>, Freshness)
         if k == 0 {
             continue;
         }
+        let snapshot = decode_snapshot(&me.neighbors, k).unwrap_or_else(|| panic!("r{i}: no neighbor snapshot of round {k}"));
         for (j, peer) in flight.robots.iter().enumerate().filter(|(j, _)| *j != i - 1) {
             let newest = read_at[j].iter().filter(|(round, at)| **round < k && **at <= k).map(|(round, _)| *round).max();
+            // What plan-dmpc's NeighborExchange must report: the newest plan of
+            // round <= k - 1 it had by tick k.
+            let want = match newest {
+                Some(r) if r + 1 >= k => (NX_FRESH, 0, r),
+                Some(r) if k - 1 - r <= NX_STALE_ROUNDS => (NX_STALE, k - 1 - r, r),
+                Some(r) => (NX_MISSING, 0, r),
+                None => (NX_MISSING, 0, u64::MAX),
+            };
+            let got = snapshot.iter().find(|e| e.0 == j as u16).unwrap_or_else(|| panic!("r{i} round {k}: r{} not in the snapshot", j + 1));
+            assert_eq!((got.1, got.2, got.3), want, "r{i} round {k}: plan-dmpc's snapshot of r{} (status, stale rounds, round)", j + 1);
+            assert!(got.3 == u64::MAX || got.4 >= 0, "r{i} round {k}: negative age");
+            f.module[usize::from(got.1)] += 1;
             match newest {
                 Some(r) if r == k - 1 => f.fresh += 1,
                 _ if !peer.plan_by_seq.values().any(|p| p.0 == k - 1) => f.unsent += 1,
