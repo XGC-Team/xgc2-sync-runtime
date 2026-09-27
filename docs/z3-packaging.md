@@ -25,8 +25,9 @@ in the image:
 | `bin/xgc-rt-render` | same (native deployment renderer, [native-deployment.md](native-deployment.md)) |
 | `bin/xgc-rt-audit` | same (`xgc-rt-audit merge` for the Session's SyncAudit run) |
 | `plugins/libtransport_zenoh.so` | same (transport plugin, `xgc_rt_transport_v1`) |
-| `lib/libformation_generator_dmpc_{core,params,config}.so` | academic at AREV, `ros1_ws/src/planner/formation_generator/standalone` |
-| `plugins/libplan_dmpc.so` | `scripts/build-plan-dmpc.sh` against those libraries |
+| `plugins/libdmpc_rounds.so` | same (rounds and peer admission) |
+| `lib/libformation_generator_dmpc_{core,params,config}.so` | academic at AREV (`ros1_ws/src/planner`, `src/common`, `tests`), `formation_generator/standalone`, installed to a private prefix |
+| `plugins/libplan_dmpc.so` | `scripts/build-plan-dmpc.sh --core-prefix` that prefix |
 | `plugins/libctl_px4.so` (`--with-ctl-px4`) | `scripts/build-ctl-px4.sh`, see gaps |
 | `SHA256SUMS` | `sha256sum` of every file above |
 | `SOURCE-PINS.json` | the revisions, toolchains, every external library a staged ELF loads (with sha256), and every staged file's sha256 |
@@ -70,20 +71,24 @@ image build script gains a step that:
 ## Sandbox evidence (2026-09-27)
 
 Command:
-`stage-robot-bundle.sh --revision 84b9e53 --academic-revision c9013421 --with-ctl-px4`
-(runtime #20 head; academic main, the DMPC core the Block I fleet tests use).
+`stage-robot-bundle.sh --revision 6eab902 --academic-revision 895d453b --with-ctl-px4`
+(runtime main tip, academic main tip).
 
-- It staged 10 files in 3 min 50 s. Every library resolved: the DMPC and PX4
-  cores from `lib/`, everything else external (acados, yaml-cpp, jsoncpp and
-  the C++ runtime, each recorded with its sha256).
+- It staged 11 files in 4 min 47 s. Every library resolved on the launch
+  search path (bundle `lib/`, acados `lib/`, system): the DMPC and PX4 cores
+  from `lib/`, and 19 external libraries recorded with their sha256.
 - `libctl_px4.so` built from the pinned export is byte-identical (sha256
-  `6bcbde5d…`) to the one the Block I fleet hosts loaded. The export
-  reproduces the working-tree build.
+  `e5840f49…`) to the one the fleet tests build from the working tree.
+  `libplan_dmpc.so` differs only by the install-prefix rpath.
 - The staged `bin/xgc-rt-host` ran with an empty environment and only
-  `LD_LIBRARY_PATH=bundle/lib:acados:toolchain`. It loaded the sha256-pinned
-  `libplan_dmpc.so` and `libtransport_zenoh.so` from its manifest (Zenoh
-  listening on TCP), configured and activated plan-dmpc with a knot_fs150
-  parameter manifest, ran, and exited 0.
+  `LD_LIBRARY_PATH=bundle/lib:acados/lib:toolchain`. It loaded the
+  sha256-pinned `libtransport_zenoh.so`, `libdmpc_rounds.so` and
+  `libplan_dmpc.so` from its manifest (Zenoh on TCP). plan-dmpc configured
+  from a knot_fs150 manifest, dmpc-rounds ran 15 beats, and the host
+  exited 0.
+- The DMPC core's state-machine logger writes to stdout, after the host's
+  JSON summary, which is also on stdout. An Agent that parses the summary
+  must read one JSON value, or the core must log to stderr.
 
 ## Gaps before a station build (Z3 Phase B)
 
@@ -99,12 +104,17 @@ Command:
    `/opt/acados`) is not decided yet.
 3. **PX4 controller core.** `ctl-px4` links `libpx4_multirotor_controller_core.so`,
    which this script copies from `PX4_CORE_LIB_DIR` and records under
-   `not_source_pinned`. To be source-pinned, the script needs the controller
-   repository and revision as a third pin, built from its ROS-free core
-   CMake.
+   `not_source_pinned`. The current controller (`xgc2-multirotor-controller`
+   noetic) also needs `xgc2_math >= 0.5.9` (SMC tracking),
+   `xgc2_state_machine`, an `xgc2_acados` CMake package and, when its
+   generated NMPC solver is absent, `casadi` plus `acados_template` to
+   regenerate it. To be source-pinned, the script needs the controller and
+   xgc2-math revisions as further pins, built from their ROS-free CMake in the
+   builder stage. An `XGC2_MATH_INCLUDE_OVERRIDE` used for `ctl-px4` is also
+   recorded under `not_source_pinned`.
 4. **Composition.** `xgc-rt-render` knows only the two single-robot control
    compositions. The DMPC fleet robot needs a third frozen composition:
-   `ros-io`, estimators, `ctl-px4`, `plan-dmpc`, and the Zenoh transport on
+   `ros-io`, estimators, `ctl-px4`, `plan-dmpc`, `dmpc-rounds`, and the Zenoh transport on
    the radio address. Its roster, peers, `(E0, P)` and link come from the
    Session (see [z3-session-artifacts.md](z3-session-artifacts.md)), so Core
    renders one deployment JSON per robot instead of hand-written manifests.

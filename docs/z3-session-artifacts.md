@@ -92,9 +92,9 @@ Shared/SyncAudit/<run>/
   profiles B and C) is `merged/streams.jsonl` filtered to `dmpc/plan`: an
   n·(n−1) matrix with each stream's loss, duplicates, reordering, OWD with
   its clock bound, and age. For a run that must show round selection, each
-  planner's `neighbors` records (plan-dmpc's NeighborExchange snapshots,
-  [neighbor-exchange.md](neighbor-exchange.md)) sit on a `dmpc/neighbors`
-  channel in the same audit. `steps.jsonl` records which plan each round
+  robot's `neighbors` records (dmpc-rounds' NeighborExchange snapshot per
+  beat, [neighbor-exchange.md](neighbor-exchange.md), proposed in a separate
+  change) sit on a `dmpc/neighbors` channel in the same audit. `steps.jsonl` records which plan each round
   read.
 - **Ground truth.** Netem has no per-sample truth. On the station, a link's
   loss is the audit's own count, set against the frozen profile and the
