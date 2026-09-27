@@ -8,6 +8,15 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 #[test]
 fn real_host_consumes_header_timed_pva_and_emits_command_driven_state() {
+    check_host(false);
+}
+
+#[test]
+fn timed_model_keeps_pva_timing_without_publishing_on_every_host_round() {
+    check_host(true);
+}
+
+fn check_host(timed: bool) {
     let plugin = PathBuf::from(
         std::env::var("NUMERIC_VEHICLE_ELF")
             .expect("run plugins/numeric-vehicle/test.sh; no optional native skip"),
@@ -75,7 +84,12 @@ qos="state"
         ),
     ] {
         let sha = xgc_rt_host::plugin::sha256_hex(&std::fs::read(&path).unwrap());
-        text+=&format!("\n[[plugin]]\nname={name:?}\npath={:?}\nsha256={sha:?}\ntrigger=\"on_round\"\nstep_budget_ms=10\nconfig={config}\nbind={bind}\n",path.to_str().unwrap());
+        let trigger = if timed && name == "numeric-vehicle" {
+            "trigger=\"on_dirty\"\nwake_ms=10"
+        } else {
+            "trigger=\"on_round\""
+        };
+        text+=&format!("\n[[plugin]]\nname={name:?}\npath={:?}\nsha256={sha:?}\n{trigger}\nstep_budget_ms=10\nconfig={config}\nbind={bind}\n",path.to_str().unwrap());
     }
     std::fs::write(dir.join("node.toml"), &text).unwrap();
     let host = Host::new(
@@ -93,10 +107,14 @@ qos="state"
     )
     .unwrap();
     assert!(summary.aborted.is_none(), "{:?}", summary.aborted);
-    assert!(summary
-        .plugins
-        .iter()
-        .all(|p| p.steps > 100 && p.last_error.is_none() && p.state == "inactive"));
+    for p in &summary.plugins {
+        assert!(p.last_error.is_none() && p.state == "inactive", "{p:?}");
+        if timed && p.name == "numeric-vehicle" {
+            assert!((30..65).contains(&p.steps), "model steps: {}", p.steps);
+        } else {
+            assert!(p.steps > 100, "{} steps: {}", p.name, p.steps);
+        }
+    }
     let lines = std::fs::read_to_string(&out).unwrap();
     let mut positions = Vec::new();
     let mut states = Vec::new();
@@ -140,7 +158,7 @@ qos="state"
         );
     }
     let frozen: Vec<_> = positions.iter().filter(|p| p.0 >= stop + 0.005).collect();
-    assert!(frozen.len() > 30);
+    assert!(frozen.len() > if timed { 10 } else { 30 });
     assert!(frozen
         .iter()
         .all(|p| p.1 == frozen[0].1 && p.2 == frozen[0].2));

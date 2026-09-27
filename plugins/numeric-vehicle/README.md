@@ -41,4 +41,6 @@ When a segment expires without a successor, acceleration becomes zero and the mo
 
 Paired pose/twist carry the same current Session stamp. Orientation is identity, because this model has no attitude dynamics. Clock pauses cause no integration; backward time is rejected. Segment receipt logs include effective time, host arrival time, actual processing time/age and rejection reason. There is no separate event ledger.
 
+The numerical HIL composition uses the host's existing `on_dirty` trigger and a 10 ms wake timer. Commands and PVA wake the model immediately; otherwise it advances and publishes at 100 Hz. Exact segment integration preserves the reference timing without 1 kHz state traffic. The host period and step budget are unchanged.
+
 Build and test with `plugins/numeric-vehicle/test.sh` in the runtime build environment. The suite builds the actual cdylib, then loads it through the actual host alongside a controlled C producer/observer using the production C headers. The C compilation checks wire sizes and offsets; the observer checks numerical outputs and command transitions. Passing is not evidence of full DMPC, physical FS150 deployment or an eight-robot experiment.

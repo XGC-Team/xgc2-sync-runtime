@@ -99,7 +99,10 @@ bind = {paired_state={channel="paired_state",from=["SELF"]},controller_status={c
 [[plugin]]
 name = "numeric-vehicle"
 path = "numeric_vehicle"
-trigger = "on_round"
+# Integrate at 100 Hz and immediately on commands/PVA. The exact segment
+# integrator does not need a state publication on every 1 ms host round.
+trigger = "on_dirty"
+wake_ms = 10
 config = {}
 bind = {command={channel="command",from=["AUTHORITY"]},position_target={channel="position_target",from=["SELF"]},paired_state={channel="paired_state"},controller_state={channel="controller_state"}}
 
