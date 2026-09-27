@@ -531,7 +531,10 @@ StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec
     out.timeline.mission_ns = commit_.mission_ns;
     out.timeline.applied_revision = applied_revision_;
     out.timeline.applied_mission_ns = applied_mission_ns_;
-    const bool due = commit_.round_k == commit_.request.effective_round &&
+    // Commits are drained before a planner trigger. If more than one beat
+    // arrived, the effective beat may already have passed; apply it once at
+    // the current mission phase and report that actual application time.
+    const bool due = commit_.round_k >= commit_.request.effective_round &&
                      applied_revision_ != commit_.request.revision;
     if (due && commit_.request.kind == 6) {
       try {

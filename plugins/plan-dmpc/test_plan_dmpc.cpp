@@ -386,11 +386,25 @@ int main(int argc, char** argv) {
   commit.mission_ns = commit.request.anchor_ns;
   digest[0] = 3;
   if (!planner.push_commit(commit, digest).empty()) return fail("pattern commit was rejected");
+  // A host step can drain more than one commit before processing a trigger.
+  // Missing the effective beat must not lose the already committed command.
+  ++commit.round_k;
+  commit.mission_ns += 100000000;
+  if (!planner.push_commit(commit, digest).empty()) return fail("next pattern beat was rejected");
   auto pattern = planner.step(10.2, 10.2, 100.2);
   if (pattern.timeline.applied_revision != 2 || pattern.timeline.fault != 0 || !std::isfinite(planner.pattern_offset().x())) {
     return fail("pattern 5 was not applied from the installed factory");
   }
-  if (pattern.timeline.mission_ns != 5 * 100000000LL) return fail("pattern commit did not keep the rolling phase");
+  if (pattern.timeline.mission_ns != 6 * 100000000LL ||
+      pattern.timeline.applied_mission_ns != 6 * 100000000LL) {
+    return fail("late pattern did not report the actual application phase");
+  }
+  ++commit.round_k;
+  commit.mission_ns += 100000000;
+  if (!planner.push_commit(commit, digest).empty()) return fail("repeated pattern beat was rejected");
+  if (planner.step(10.2, 10.2, 100.2).timeline.applied_mission_ns != 6 * 100000000LL) {
+    return fail("repeated beat reapplied the pattern");
+  }
   auto ack = planner.acknowledge(commit.request, digest, 4);
   if (ack.accepted != 1 || sizeof(ack) != 56 || planner.step(10.2, 10.2, 100.2).timeline.applied_revision != 2) {
     return fail("ack changed applied phase or rejected the frozen envelope origin");
@@ -417,6 +431,9 @@ int main(int argc, char** argv) {
   rewind.request.anchor_ns = 10 * 100000000LL;
   rewind.mission_ns = rewind.request.anchor_ns;
   if (!planner.push_commit(rewind, rewind_digest).empty()) return fail("continuous rolling anchor was rejected");
+  ++rewind.round_k;
+  rewind.mission_ns += 100000000;
+  if (!planner.push_commit(rewind, rewind_digest).empty()) return fail("next goal beat was rejected");
   rewind.request.rolling = 0;
   rewind.mission_ns = rewind.request.anchor_ns;
   rewind_digest[0] = 5;
