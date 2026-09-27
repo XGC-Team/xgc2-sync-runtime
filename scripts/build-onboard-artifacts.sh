@@ -15,7 +15,7 @@ SRC_DIR is the reviewed ROS workspace's src directory. It must contain
 planner/formation_generator/standalone/CMakeLists.txt and common/.
 LOCAL_IMAGE must already exist in the local Docker daemon, for the requested
 architecture, with Ubuntu 20.04, ROS Noetic, Rust/Cargo, CMake, C++, Python 3,
-readelf and the matching acados install. No image is pulled or published.
+readelf, patchelf and the matching acados install. No image is pulled or published.
 
 Output is DIR/PLATFORM/{bin,lib,plugins}, plus local logs/target/timing evidence.
 This is W09 packager input, NOT an installed bundle or a runtime-load verdict.

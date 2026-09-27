@@ -28,7 +28,7 @@ Pass a real local image using `--builder-image` (or
 `XGC2_ONBOARD_BUILDER_IMAGE`). There is intentionally **no fictional default tag**.
 The W06 runtime base is not automatically a compiler image. Root must prepare
 and admit a local development image containing Ubuntu 20.04, target ROS Noetic
-headers/libraries and gencpp, CMake, C++, Python 3, binutils, Eigen, yaml-cpp, and
+headers/libraries and gencpp, CMake, C++, Python 3, binutils, patchelf, Eigen, yaml-cpp, and
 Rust/Cargo capable of reading the checked-in workspace/lock file. Rustup/toolchain
 files must be accessible to the invoking UID independently of `CARGO_HOME`;
 the driver uses persistent writable Cargo/home caches. Populate the target cache
@@ -105,6 +105,9 @@ static archives or CMake exports are exported here.
 
 `dependencies.txt` records native `ldd` resolution inside the admitted target
 builder. Missing dependencies and same-name byte conflicts fail the export.
+Exported copies have build-time RPATH/RUNPATH removed with `patchelf`; the
+existing deployment launcher supplies the bundle library directory. Source
+installations and cached build objects are unchanged.
 The existing W09 packager/verifier remains responsible for static dependency
 closure, ABI ceilings and target validation; the build driver creates no new
 package manifest or dependency registry.

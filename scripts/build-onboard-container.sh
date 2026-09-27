@@ -5,7 +5,7 @@ runtime=/workspace/runtime; project=/workspace/project
 cache=/workspace/cache; output=/workspace/output
 : "${XGC2_TARGET_PLATFORM:?}" "${XGC2_RUST_TARGET:?}" "${XGC2_ACADOS_PREFIX:?}" "${XGC2_BUILD_JOBS:?}"
 check=(python3 "$runtime/scripts/verify-onboard-elf.py" --platform "$XGC2_TARGET_PLATFORM")
-for tool in cargo rustc cmake c++ python3 readelf dpkg install ldd cmp awk sort; do
+for tool in cargo rustc cmake c++ python3 readelf dpkg install ldd cmp awk sort patchelf; do
   command -v "$tool" >/dev/null || { echo "builder is missing $tool" >&2; exit 3; }
 done
 # The Docker image tag is not proof of its userland/toolchain identity.
@@ -18,6 +18,7 @@ rust_host="$(rustc -vV | sed -n 's/^host: //p')"
 [[ -f /opt/ros/noetic/include/ros/ros.h ]] || { echo 'builder is missing ROS Noetic headers' >&2; exit 3; }
 # Tool versions are local evidence, not a substitute for target loading.
 { rustc -vV; cargo --version; cmake --version; c++ --version;
+  patchelf --version;
   printf 'os=%s architecture=%s\n' "$PRETTY_NAME" "$arch";
 } > "$output/toolchain.txt"
 acados="$XGC2_ACADOS_PREFIX"
@@ -103,5 +104,10 @@ while read -r name source; do
   fi
 done < <(awk '$2 == "=>" && $3 ~ /^\// { print $1, $3 }' "$output/dependencies.txt" | sort -u)
 
+# Existing builders use absolute build/ROS runpaths. The deployment launcher
+# supplies the bundle lib directory; never leak private build paths into it.
+for artifact in "$output/bin/"* "$output/plugins/"*.so "$output/lib/"*.so*; do
+  patchelf --remove-rpath "$artifact"
+done
 "${check[@]}" "$output/bin/"* "$output/plugins/"*.so "$output/lib/"*.so* > "$output/ELF.txt"
 echo 'Target ELF export complete; this is not a W09 bundle/load or robot-motion test.'
