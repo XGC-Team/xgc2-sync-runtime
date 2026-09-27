@@ -748,6 +748,12 @@ void PlanDmpc::run_round(double trigger_sec, double now_sec, double mission_sec,
     const auto bootstrap = GoalBootstrapInitializer().build(seed, preview.relative_state, preview.leader_position);
     const auto committed = formation_generator_dmpc::commitGoalSeed(*optimizer_, bootstrap);
     goals_.pop();
+    // The leader and local reference now use this goal. This receipt reports
+    // command application; solver_ok separately reports the following QP.
+    applied_revision_ = queued_revision_;
+    applied_mission_ns_ = commit_.mission_ns;
+    out.timeline.applied_revision = applied_revision_;
+    out.timeline.applied_mission_ns = applied_mission_ns_;
     if (committed.status != GoalSeedStatus::Seeded && !committed.reason.empty()) {
       std::strncpy(out.status.reject_reason, committed.reason.c_str(), sizeof(out.status.reject_reason) - 1);
     }

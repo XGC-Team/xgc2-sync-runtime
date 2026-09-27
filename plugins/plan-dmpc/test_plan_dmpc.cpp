@@ -526,6 +526,10 @@ int main(int argc, char** argv) {
     const auto trace = planner.step(10.2, 10.2, 100.2);
     if (!trace.status.solver_called) continue;
     saw_solve = true;
+    if (trace.timeline.applied_revision != 3 ||
+        trace.timeline.applied_mission_ns != rewind.mission_ns || planner.goal_waiting()) {
+      return fail("consumed goal did not report its applied revision and mission time");
+    }
     if (!trace.status.solver_ok) {
       if (trace.have_position_target || !trace.own_plan.empty()) {
         return fail("unsolved round published a position target");
