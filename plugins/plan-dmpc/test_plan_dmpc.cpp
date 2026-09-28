@@ -444,7 +444,9 @@ int main(int argc, char** argv) {
   commit.mission_ns += 100000000;
   if (!planner.push_commit(commit, digest).empty()) return fail("next pattern beat was rejected");
   auto pattern = planner.step(10.2, 10.2, 100.2);
-  if (pattern.timeline.applied_revision != 2 || pattern.timeline.fault != 0 || !std::isfinite(planner.pattern_offset().x())) {
+  if (pattern.timeline.applied_revision != 2 || pattern.timeline.fault != 0 ||
+      !near(planner.pattern_offset().x(), 0.75) || !near(planner.pattern_offset().y(), 0.75) ||
+      !near(planner.pattern_offset().z(), 0.0)) {
     return fail("pattern 5 was not applied from the installed factory");
   }
   if (pattern.timeline.mission_ns != 6 * 100000000LL ||

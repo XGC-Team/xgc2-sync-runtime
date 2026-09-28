@@ -13,7 +13,6 @@
 
 #include "formation_generator/core/plan_wire.h"
 #include "formation_generator/dmpc_scheduler/dmpc_agent.h"
-#include "formation_generator/dmpc_scheduler/pattern_manager.h"
 #include "formation_generator/lifecycle/goal_queue.h"
 #include "formation_generator/lifecycle/plain_scene_adapter.h"
 #include "formation_generator/lifecycle/scene_admission.h"

@@ -491,12 +491,12 @@ StepTrace PlanDmpc::step(double trigger_sec, double now_sec, double now_wall_sec
                      applied_revision_ != commit_.request.revision;
     if (due && commit_.request.kind == 6) {
       try {
-        if (!agent_->switchPattern(static_cast<uint8_t>(commit_.request.pattern_id))) {
+        const auto pattern = agent_->switchPattern(static_cast<uint8_t>(commit_.request.pattern_id),
+                                                   static_cast<double>(commit_.mission_ns) * 1e-9);
+        if (!pattern.applied) {
           throw std::invalid_argument("pattern id is not in the loaded formation_patterns");
         }
-        const auto pattern = formation_patterns::FormationPatternBase::getCurrentPattern();
-        pattern_offset_ =
-            pattern->computeOffset(static_cast<double>(commit_.mission_ns) * 1e-9, config_.self_id).position;
+        pattern_offset_ = pattern.offset;
         applied_revision_ = commit_.request.revision;
         applied_mission_ns_ = commit_.mission_ns;
         out.timeline.applied_revision = applied_revision_;
