@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Drive the real ctl-px4 SMC plugin against the lightweight FS150 plant."""
+"""Drive ctl-px4 SMC against a lightweight FS150 plant in two Zenoh hosts."""
 
 import argparse
 import json
 from pathlib import Path
+import re
 import signal
 import subprocess
 import threading
@@ -19,35 +20,7 @@ STEP_NS = 100_000_000
 TRAJECTORY_NS = 6_000_000_000
 TRACKING_NS = 10_000_000_000
 RUN_LIMIT_S = 60.0
-
-
-def absolute_file(parser, option, value):
-    try:
-        path = value.expanduser().resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        parser.error(f"{option} does not resolve to an existing file: {error}")
-    if not path.is_file():
-        parser.error(f"{option} must name a file: {path}")
-    return path
-
-
-def make_manifest(plant_path, controller_path, ros_io_path, audit_dir, epoch_ns):
-    quoted = lambda value: json.dumps(str(value))
-    return f'''[session]
-id = "private-lightweight-controller-live"
-node = "uav1"
-roster = ["uav1"]
-period_ms = 1
-epoch_ns = {epoch_ns}
-run_for_ms = 60000
-
-[transport]
-kind = "loopback"
-
-[audit]
-dir = {quoted(audit_dir)}
-
-[[channel]]
+CHANNELS = '''[[channel]]
 name = "pose"
 qos = "state"
 [[channel]]
@@ -74,27 +47,88 @@ qos = "control"
 [[channel]]
 name = "status"
 qos = "state"
+'''
 
+
+def absolute_file(parser, option, value):
+    try:
+        path = value.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        parser.error(f"{option} does not resolve to an existing file: {error}")
+    if not path.is_file():
+        parser.error(f"{option} must name a file: {path}")
+    return path
+
+
+def zenoh_loopback_endpoint(value):
+    match = re.fullmatch(r"tcp/127\.0\.0\.1:([1-9][0-9]{0,4})", value)
+    if match is None or not 1 <= int(match.group(1)) <= 65535:
+        raise argparse.ArgumentTypeError(
+            "must be a loopback Zenoh endpoint in the form tcp/127.0.0.1:PORT"
+        )
+    return value
+
+
+def make_plant_manifest(plant_path, audit_dir, epoch_ns, plant_endpoint, controller_endpoint):
+    quoted = lambda value: json.dumps(str(value))
+    return f'''[session]
+id = "private-lightweight-controller-live"
+node = "plant"
+roster = ["plant", "uav1"]
+period_ms = 1
+epoch_ns = {epoch_ns}
+run_for_ms = 60000
+
+[transport]
+kind = "zenoh"
+listen = [{quoted(plant_endpoint)}]
+connect = [{quoted(controller_endpoint)}]
+
+[audit]
+dir = {quoted(audit_dir)}
+
+{CHANNELS}
 [[plugin]]
 name = "plant"
 path = {quoted(plant_path)}
 trigger = "on_round"
 config = {{ model = "fs150", epoch_ns = {epoch_ns}, step_ms = 1, output_ms = 10, initial_pose = [0.0, 0.0, 0.0, 0.0] }}
 bind = {{ pose = {{ channel = "pose" }}, velocity = {{ channel = "velocity" }}, imu = {{ channel = "imu" }}, fcu_state = {{ channel = "fcu_state" }}, setpoint = {{ channel = "setpoint", from = ["uav1"] }}, fcu_request = {{ channel = "fcu_request", from = ["uav1"] }} }}
+'''
 
+
+def make_controller_manifest(controller_path, ros_io_path, audit_dir, epoch_ns, plant_endpoint, controller_endpoint):
+    quoted = lambda value: json.dumps(str(value))
+    return f'''[session]
+id = "private-lightweight-controller-live"
+node = "uav1"
+roster = ["plant", "uav1"]
+period_ms = 1
+epoch_ns = {epoch_ns}
+run_for_ms = 60000
+
+[transport]
+kind = "zenoh"
+listen = [{quoted(controller_endpoint)}]
+connect = [{quoted(plant_endpoint)}]
+
+[audit]
+dir = {quoted(audit_dir)}
+
+{CHANNELS}
 [[plugin]]
 name = "controller"
 path = {quoted(controller_path)}
 trigger = "on_round"
 config = {{ time_source = "session", tracking_backend = "smc", takeoff_altitude = 1, planning_period = 0.1 }}
-bind = {{ local_pose = {{ channel = "pose", from = ["uav1"] }}, vrpn_pose = {{ channel = "pose", from = ["uav1"] }}, local_velocity = {{ channel = "velocity", from = ["uav1"] }}, imu = {{ channel = "imu", from = ["uav1"] }}, fcu_state = {{ channel = "fcu_state", from = ["uav1"] }}, command = {{ channel = "command", from = ["uav1"] }}, alg_setpoint = {{ channel = "alg_setpoint", from = ["uav1"] }}, setpoint = {{ channel = "setpoint" }}, fcu_request = {{ channel = "fcu_request" }}, status = {{ channel = "status" }} }}
+bind = {{ local_pose = {{ channel = "pose", from = ["plant"] }}, vrpn_pose = {{ channel = "pose", from = ["plant"] }}, local_velocity = {{ channel = "velocity", from = ["plant"] }}, imu = {{ channel = "imu", from = ["plant"] }}, fcu_state = {{ channel = "fcu_state", from = ["plant"] }}, command = {{ channel = "command", from = ["uav1"] }}, alg_setpoint = {{ channel = "alg_setpoint", from = ["uav1"] }}, setpoint = {{ channel = "setpoint" }}, fcu_request = {{ channel = "fcu_request" }}, status = {{ channel = "status" }} }}
 
 [[plugin]]
 name = "ros-io"
 path = {quoted(ros_io_path)}
 trigger = "on_round"
 config = {{ node_name = "xgc_ros_io_uav1", frame_id = "world", sim_pose_topic = "/uav1/mavros/local_position/pose", sim_velocity_topic = "/uav1/mavros/local_position/velocity_local", sim_fcu_state_topic = "/uav1/mavros/state", command_topic = "/command", alg_setpoint_topic = "/uav1/alg/setpoint_raw/local", status_topic = "/uav1/custom/statustext" }}
-bind = {{ sim_pose = {{ channel = "pose", from = ["uav1"] }}, sim_velocity = {{ channel = "velocity", from = ["uav1"] }}, sim_fcu_state = {{ channel = "fcu_state", from = ["uav1"] }}, command = {{ channel = "command" }}, alg_setpoint = {{ channel = "alg_setpoint" }}, status = {{ channel = "status", from = ["uav1"] }} }}
+bind = {{ sim_pose = {{ channel = "pose", from = ["plant"] }}, sim_velocity = {{ channel = "velocity", from = ["plant"] }}, sim_fcu_state = {{ channel = "fcu_state", from = ["plant"] }}, command = {{ channel = "command" }}, alg_setpoint = {{ channel = "alg_setpoint" }}, status = {{ channel = "status", from = ["uav1"] }} }}
 '''
 
 
@@ -116,30 +150,58 @@ def position_target(elapsed_ns, stamp_ns):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Exercise ctl-px4 SMC with the lightweight FS150 plant through real ROS topics."
+        description="Exercise ctl-px4 SMC with a lightweight FS150 plant in two Zenoh-connected Hosts."
     )
     parser.add_argument("--host", required=True, type=Path, help="path to xgc-rt-host")
     parser.add_argument("--plant", required=True, type=Path, help="path to liblightweight_vehicle.so")
     parser.add_argument("--controller", required=True, type=Path, help="path to libctl_px4.so")
     parser.add_argument("--ros-io", required=True, type=Path, help="path to libros_io.so")
-    parser.add_argument("--output-dir", required=True, type=Path, help="directory for manifest, logs, and result JSON")
+    parser.add_argument("--plant-endpoint", required=True, type=zenoh_loopback_endpoint)
+    parser.add_argument("--controller-endpoint", required=True, type=zenoh_loopback_endpoint)
+    parser.add_argument(
+        "--output-dir", required=True, type=Path, help="directory for manifests, logs, audits, and result JSON"
+    )
     args = parser.parse_args()
+    if args.plant_endpoint == args.controller_endpoint:
+        parser.error("--plant-endpoint and --controller-endpoint must use different ports")
 
     host_path = absolute_file(parser, "--host", args.host)
     plant_path = absolute_file(parser, "--plant", args.plant)
     controller_path = absolute_file(parser, "--controller", args.controller)
     ros_io_path = absolute_file(parser, "--ros-io", args.ros_io)
     work = args.output_dir.expanduser().resolve()
-    work.mkdir(parents=True, exist_ok=True)
-    audit_dir = work / "audit"
-    audit_dir.mkdir(parents=True, exist_ok=True)
 
     started_wall_ns = time.time_ns()
     epoch_ns = started_wall_ns + 3_000_000_000
     deadline = time.monotonic() + RUN_LIMIT_S
-    manifest_path = work / "controller-live.toml"
-    manifest_path.write_text(
-        make_manifest(plant_path, controller_path, ros_io_path, audit_dir, epoch_ns),
+    host_dirs = {role: work / role for role in ("plant", "uav1")}
+    for host_dir in host_dirs.values():
+        (host_dir / "audit").mkdir(parents=True, exist_ok=True)
+    manifest_paths = {
+        "plant": host_dirs["plant"] / "manifest.toml",
+        "uav1": host_dirs["uav1"] / "manifest.toml",
+    }
+    audit_paths = {role: host_dirs[role] / "audit" for role in host_dirs}
+    log_paths = {role: host_dirs[role] / "host.log" for role in host_dirs}
+    manifest_paths["plant"].write_text(
+        make_plant_manifest(
+            plant_path,
+            audit_paths["plant"],
+            epoch_ns,
+            args.plant_endpoint,
+            args.controller_endpoint,
+        ),
+        encoding="utf-8",
+    )
+    manifest_paths["uav1"].write_text(
+        make_controller_manifest(
+            controller_path,
+            ros_io_path,
+            audit_paths["uav1"],
+            epoch_ns,
+            args.plant_endpoint,
+            args.controller_endpoint,
+        ),
         encoding="utf-8",
     )
 
@@ -203,21 +265,18 @@ def main():
         with capture_lock:
             capture["velocities"].append(item)
 
-    host_log_path = work / "controller-live-host.log"
-    host_log = host_log_path.open("w", encoding="utf-8")
-    host = subprocess.Popen(
-        [str(host_path), "--manifest", str(manifest_path)],
-        stdout=host_log,
-        stderr=subprocess.STDOUT,
-    )
-    host_shutdown_escalation = None
+    hosts = {"plant": None, "uav1": None}
+    host_pids = {"plant": None, "uav1": None}
+    host_logs = {}
+    host_shutdown_escalation = {"plant": None, "uav1": None}
     endpoint = None
     endpoint_error = None
     failure = None
 
     def check_deadline(wait_description=None):
-        if host.poll() is not None:
-            raise RuntimeError(f"xgc-rt-host exited with status {host.returncode}")
+        for role, host in hosts.items():
+            if host is not None and host.poll() is not None:
+                raise RuntimeError(f"{role} xgc-rt-host exited with status {host.returncode}")
         if rospy.is_shutdown():
             raise RuntimeError("ROS node shut down before the flight sequence completed")
         if time.monotonic() >= deadline:
@@ -253,17 +312,33 @@ def main():
             velocities = list(capture["velocities"])
             actions = list(capture["actions"])
             final_fcu_state = capture["fcu_state"]
+        host_processes = {
+            role: {
+                "pid": host_pids[role],
+                "exit_code": hosts[role].returncode if hosts[role] is not None else None,
+                "manifest": str(manifest_paths[role]),
+                "audit_dir": str(audit_paths[role]),
+                "log": str(log_paths[role]),
+                "shutdown_escalation": host_shutdown_escalation[role],
+            }
+            for role in hosts
+        }
         return {
-            "scope": "lightweight FS150 plant + existing ctl-px4 SMC + ros_io; no DMPC/planner/SITL/Gazebo validation",
+            "scope": "two xgc-rt-host processes: lightweight FS150 plant + existing ctl-px4 SMC + ros_io; no DMPC/planner/SITL/Gazebo validation",
             "passed": failure is None and endpoint_error is not None and endpoint_error < 0.03,
             "failure": failure,
             "epoch_ns": epoch_ns,
+            "endpoints": {
+                "plant": args.plant_endpoint,
+                "uav1": args.controller_endpoint,
+            },
             "input_paths": {
                 "host": str(host_path),
                 "plant": str(plant_path),
                 "controller": str(controller_path),
                 "ros_io": str(ros_io_path),
             },
+            "host_processes": host_processes,
             "controller_state_sequence": controller_states,
             "fcu_state_changes": fcu_state_changes,
             "final_fcu_state": final_fcu_state,
@@ -274,8 +349,6 @@ def main():
             "pose_outputs": poses,
             "velocity_outputs": velocities,
             "actions": actions,
-            "host_exit_code": host.returncode,
-            "host_shutdown_escalation": host_shutdown_escalation,
         }
 
     def print_summary(result):
@@ -289,10 +362,7 @@ def main():
                         "controller": result["controller_state_sequence"],
                         "fcu": result["fcu_state_changes"],
                     },
-                    "exit_summary": {
-                        "host_exit_code": result["host_exit_code"],
-                        "host_shutdown_escalation": result["host_shutdown_escalation"],
-                    },
+                    "host_processes": result["host_processes"],
                 },
                 indent=2,
                 sort_keys=True,
@@ -300,6 +370,15 @@ def main():
         )
 
     try:
+        for role in ("plant", "uav1"):
+            host_logs[role] = log_paths[role].open("w", encoding="utf-8")
+            hosts[role] = subprocess.Popen(
+                [str(host_path), "--manifest", str(manifest_paths[role])],
+                stdout=host_logs[role],
+                stderr=subprocess.STDOUT,
+            )
+            host_pids[role] = hosts[role].pid
+
         rospy.init_node("private_lightweight_controller_live", anonymous=False)
         rospy.Subscriber("/uav1/custom/statustext", String, on_controller_state, queue_size=100)
         rospy.Subscriber("/uav1/mavros/state", State, on_fcu_state, queue_size=100)
@@ -374,28 +453,37 @@ def main():
             "plant ground state and armed=false",
         )
         record_action("landed_from_plant_feedback")
+        check_deadline()
     except BaseException as error:
         failure = f"{type(error).__name__}: {error}"
         raise
     finally:
-        if host.poll() is None:
+        for role, host in hosts.items():
+            if host is not None and host.poll() is not None and failure is None:
+                failure = f"{role} xgc-rt-host exited before fixture shutdown with status {host.returncode}"
+        for role in ("uav1", "plant"):
+            host = hosts[role]
+            if host is None or host.poll() is not None:
+                continue
             try:
                 host.send_signal(signal.SIGINT)
             except ProcessLookupError:
-                pass
+                if host.poll() is not None and failure is None:
+                    failure = f"{role} xgc-rt-host exited before fixture shutdown with status {host.returncode}"
             if host.poll() is None:
                 try:
                     host.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    host_shutdown_escalation = "terminate"
+                    host_shutdown_escalation[role] = "terminate"
                     host.terminate()
                     try:
                         host.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        host_shutdown_escalation = "kill"
+                        host_shutdown_escalation[role] = "kill"
                         host.kill()
                         host.wait()
-        host_log.close()
+        for host_log in host_logs.values():
+            host_log.close()
         result = result_payload()
         (work / "controller-live-result.json").write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n",
