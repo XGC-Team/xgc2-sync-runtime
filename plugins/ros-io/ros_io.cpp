@@ -25,6 +25,7 @@
 //     ref_reset        std_msgs/Empty                        -> xgc.ref.reset/1
 //     hover_thrust     hover_thrust_estimator_msgs/HoverThrustEstimate -> xgc.hover_thrust/1
 //     controller_state std_msgs/String (custom/statustext) -> xgc.controller_status/1 (stamp = receipt)
+//     cmd_vel          geometry_msgs/Twist                   -> xgc.twist/1 (stamp = receipt)
 //   module inputs -> ROS
 //     vision_pose      xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
 //     neighbor_plans   xgc.dmpc.assumed_trajectory/1 -> formation_generator/AssumedTrajectory
@@ -45,6 +46,14 @@
 //   (the ref_* outputs are latched, as the reference trajectory node's are)
 //     formation_tick   xgc.dmpc.formation_tick/1    -> formation_generator/FormationTick
 //     planar_pva       xgc.planar_pva/1             -> unicycle_reference_trajectory_msgs/PlanarPvaReference
+//     sim_pose         xgc.pose/1                   -> geometry_msgs/PoseStamped (frame `frame_id`)
+//     sim_velocity     xgc.twist/1                  -> geometry_msgs/TwistStamped (frame `frame_id`)
+//     sim_imu          xgc.imu/1                     -> sensor_msgs/Imu (orientation unknown)
+//     sim_fcu_state    xgc.fcu_state/1               -> mavros_msgs/State
+//   virtual MAVROS service facade -> module output
+//     sim_fcu_request  xgc.fcu_request/1; `_topic` is a virtual MAVROS namespace.
+//                      Local CommandLong (command 400) and SetMode services publish requests to the host;
+//                      responses report only host-publish success, and FCU state comes back through sim_fcu_state.
 //   sync_trigger and formation_tick are local facades for the unchanged DMPC
 //   planner: dmpc-rounds writes them on this robot's own round boundaries
 //   (E0 + k*P on the aligned OS clock). Publish them on the robot's own topic;
@@ -80,6 +89,7 @@
 #include <formation_generator/AssumedTrajectory.h>
 #include <formation_generator/FormationTick.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <hover_thrust_estimator_msgs/HoverThrustEstimate.h>
 #include <mavros_msgs/AttitudeTarget.h>
@@ -156,6 +166,12 @@ enum Port : uint32_t {
   kTimelineAck,
   kTimelineStatus,
   kPlanarPva,
+  kSimPose,
+  kSimVelocity,
+  kSimImu,
+  kSimFcuState,
+  kCmdVel,
+  kSimFcuRequest,
   kPortCount
 };
 
@@ -165,7 +181,8 @@ const char* const kPortNames[kPortCount] = {
     "alg_setpoint", "setpoint",  "attitude_rate", "status", "fcu_request", "ref_analytic", "ref_waypoint",
     "ref_sampled", "ref_reset", "ref_status", "ref_active_analytic", "ref_active_polynomial", "ref_active_sampled",
     "hover_thrust", "controller_state", "formation_tick", "paired_state", "scene_snapshot",
-    "scene_heartbeat", "mission_request", "timeline_ack", "timeline_status", "planar_pva"};
+    "scene_heartbeat", "mission_request", "timeline_ack", "timeline_status", "planar_pva", "sim_pose",
+    "sim_velocity", "sim_imu", "sim_fcu_state", "cmd_vel", "sim_fcu_request"};
 
 double stamp_or_now(const ros::Time& t) { return (t.isZero() ? ros::Time::now() : t).toSec(); }
 
@@ -180,6 +197,12 @@ void vec3(double* out, const geometry_msgs::Vector3& v) {
   out[0] = v.x;
   out[1] = v.y;
   out[2] = v.z;
+}
+
+void vec3(geometry_msgs::Vector3& out, const double* in) {
+  out.x = in[0];
+  out.y = in[1];
+  out.z = in[2];
 }
 
 // Copies a std::string into a fixed char field, always NUL-terminated.
@@ -214,6 +237,8 @@ struct RosIo {
   std::unique_ptr<ros::NodeHandle> nh;
   std::vector<ros::Subscriber> subs;
   ros::Publisher pubs[kPortCount];
+  ros::ServiceServer sim_command_service;
+  ros::ServiceServer sim_set_mode_service;
   uint64_t round{0};
   uint64_t from_ros{0};
   uint64_t to_ros{0};
@@ -279,13 +304,15 @@ struct RosIo {
   bool enabled(Port p) const { return !topics[p].empty(); }
 
   template <typename T>
-  void write(Port p, const T& payload) {
-    write_bytes(p, reinterpret_cast<const uint8_t*>(&payload), sizeof payload);
+  bool write(Port p, const T& payload) {
+    return write_bytes(p, reinterpret_cast<const uint8_t*>(&payload), sizeof payload);
   }
 
-  void write_bytes(Port p, const uint8_t* data, size_t len) {
-    if (host->publish(host->host, p, round, data, static_cast<uint32_t>(len)) != XGC_OK) write_failed = true;
+  bool write_bytes(Port p, const uint8_t* data, size_t len) {
+    const bool ok = host->publish(host->host, p, round, data, static_cast<uint32_t>(len)) == XGC_OK;
+    if (!ok) write_failed = true;
     ++from_ros;
+    return ok;
   }
 
   // --- ROS -> module outputs ------------------------------------------------
@@ -410,6 +437,14 @@ struct RosIo {
     write(kCommand, s);
   }
 
+  void on_cmd_vel(const geometry_msgs::Twist::ConstPtr& m) {
+    xgc_twist_v1 s{};
+    s.stamp = ros::Time::now().toSec();
+    vec3(s.linear, m->linear);
+    vec3(s.angular, m->angular);
+    write(kCmdVel, s);
+  }
+
   void on_alg_setpoint(const mavros_msgs::PositionTarget::ConstPtr& m) {
     xgc_position_target_v1 s{};
     s.stamp = stamp_or_now(m->header.stamp);
@@ -512,6 +547,35 @@ struct RosIo {
     caller.join();
   }
 
+  bool on_sim_command(mavros_msgs::CommandLong::Request& request, mavros_msgs::CommandLong::Response& response) {
+    response.success = false;
+    response.result = 4;
+    if (request.command != 400) {
+      response.result = 3;
+      return true;
+    }
+    if (request.param1 != 0.0f && request.param1 != 1.0f) {
+      response.result = 2;
+      return true;
+    }
+    xgc_fcu_request_v1 r{};
+    r.stamp = ros::Time::now().toSec();
+    r.kind = 1;
+    r.arm = request.param1 == 1.0f ? 1u : 0u;
+    response.success = write(kSimFcuRequest, r);
+    response.result = response.success ? 0 : 4;
+    return true;
+  }
+
+  bool on_sim_set_mode(mavros_msgs::SetMode::Request& request, mavros_msgs::SetMode::Response& response) {
+    xgc_fcu_request_v1 r{};
+    r.stamp = ros::Time::now().toSec();
+    r.kind = 2;
+    text(r.mode, request.custom_mode);
+    response.mode_sent = write(kSimFcuRequest, r);
+    return true;
+  }
+
   void discard_pending_output() {
     xgc_sample_view v;
     for (uint32_t port = 0; port < kPortCount; ++port) {
@@ -545,6 +609,62 @@ struct RosIo {
       m.pose.orientation.y = s.q_wxyz[2];
       m.pose.orientation.z = s.q_wxyz[3];
       pubs[kVisionPose].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kSimPose, &v) == XGC_OK) {
+      if (v.len != sizeof(xgc_pose_v1)) continue;
+      xgc_pose_v1 s;
+      std::memcpy(&s, v.data, sizeof s);
+      geometry_msgs::PoseStamped m;
+      m.header.stamp.fromSec(s.stamp);
+      m.header.frame_id = frame_id;
+      m.pose.position.x = s.position[0];
+      m.pose.position.y = s.position[1];
+      m.pose.position.z = s.position[2];
+      m.pose.orientation.w = s.q_wxyz[0];
+      m.pose.orientation.x = s.q_wxyz[1];
+      m.pose.orientation.y = s.q_wxyz[2];
+      m.pose.orientation.z = s.q_wxyz[3];
+      pubs[kSimPose].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kSimVelocity, &v) == XGC_OK) {
+      if (v.len != sizeof(xgc_twist_v1)) continue;
+      xgc_twist_v1 s;
+      std::memcpy(&s, v.data, sizeof s);
+      geometry_msgs::TwistStamped m;
+      m.header.stamp.fromSec(s.stamp);
+      m.header.frame_id = frame_id;
+      vec3(m.twist.linear, s.linear);
+      vec3(m.twist.angular, s.angular);
+      pubs[kSimVelocity].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kSimImu, &v) == XGC_OK) {
+      if (v.len != sizeof(xgc_imu_v1)) continue;
+      xgc_imu_v1 s;
+      std::memcpy(&s, v.data, sizeof s);
+      sensor_msgs::Imu m;
+      m.header.stamp.fromSec(s.stamp);
+      m.orientation_covariance[0] = -1.0;
+      vec3(m.linear_acceleration, s.accel);
+      vec3(m.angular_velocity, s.gyro);
+      pubs[kSimImu].publish(m);
+      ++to_ros;
+    }
+    while (host->next(host->host, kSimFcuState, &v) == XGC_OK) {
+      if (v.len != sizeof(xgc_fcu_state_v1)) continue;
+      xgc_fcu_state_v1 s;
+      std::memcpy(&s, v.data, sizeof s);
+      mavros_msgs::State m;
+      m.header.stamp.fromSec(s.stamp);
+      m.connected = s.connected != 0;
+      m.armed = s.armed != 0;
+      m.guided = s.guided != 0;
+      m.manual_input = s.manual_input != 0;
+      m.system_status = s.system_status;
+      m.mode = text(s.mode);
+      pubs[kSimFcuState].publish(m);
       ++to_ros;
     }
     while (host->next(host->host, kNeighborPlans, &v) == XGC_OK) {
@@ -780,6 +900,11 @@ struct RosIo {
       subs.push_back(nh->subscribe(topics[kAttitudeTarget], queue_size, &RosIo::on_attitude_target, this));
     if (enabled(kOwnPlan)) subs.push_back(nh->subscribe(topics[kOwnPlan], queue_size, &RosIo::on_plan, this));
     if (enabled(kVisionPose)) pubs[kVisionPose] = nh->advertise<geometry_msgs::PoseStamped>(topics[kVisionPose], queue_size);
+    if (enabled(kSimPose)) pubs[kSimPose] = nh->advertise<geometry_msgs::PoseStamped>(topics[kSimPose], queue_size);
+    if (enabled(kSimVelocity))
+      pubs[kSimVelocity] = nh->advertise<geometry_msgs::TwistStamped>(topics[kSimVelocity], queue_size);
+    if (enabled(kSimImu)) pubs[kSimImu] = nh->advertise<sensor_msgs::Imu>(topics[kSimImu], queue_size);
+    if (enabled(kSimFcuState)) pubs[kSimFcuState] = nh->advertise<mavros_msgs::State>(topics[kSimFcuState], queue_size);
     if (enabled(kNeighborPlans))
       pubs[kNeighborPlans] = nh->advertise<formation_generator::AssumedTrajectory>(topics[kNeighborPlans], queue_size);
     if (enabled(kSyncTrigger))
@@ -794,6 +919,7 @@ struct RosIo {
     if (enabled(kFcuImu)) subs.push_back(nh->subscribe(topics[kFcuImu], queue_size, &RosIo::on_fcu_imu, this));
     if (enabled(kBattery)) subs.push_back(nh->subscribe(topics[kBattery], queue_size, &RosIo::on_battery, this));
     if (enabled(kCommand)) subs.push_back(nh->subscribe(topics[kCommand], queue_size, &RosIo::on_command, this));
+    if (enabled(kCmdVel)) subs.push_back(nh->subscribe(topics[kCmdVel], queue_size, &RosIo::on_cmd_vel, this));
     if (enabled(kAlgSetpoint))
       subs.push_back(nh->subscribe(topics[kAlgSetpoint], queue_size, &RosIo::on_alg_setpoint, this));
     if (enabled(kSetpoint)) pubs[kSetpoint] = nh->advertise<mavros_msgs::PositionTarget>(topics[kSetpoint], queue_size);
@@ -801,6 +927,11 @@ struct RosIo {
       pubs[kAttitudeRate] = nh->advertise<mavros_msgs::AttitudeTarget>(topics[kAttitudeRate], queue_size);
     if (enabled(kStatus)) pubs[kStatus] = nh->advertise<std_msgs::String>(topics[kStatus], queue_size);
     if (enabled(kFcuRequest)) caller = std::thread([this] { call_loop(); });
+    if (enabled(kSimFcuRequest)) {
+      const std::string ns = topics[kSimFcuRequest];
+      sim_command_service = nh->advertiseService(ns + "/cmd/command", &RosIo::on_sim_command, this);
+      sim_set_mode_service = nh->advertiseService(ns + "/set_mode", &RosIo::on_sim_set_mode, this);
+    }
     if (enabled(kRefAnalytic))
       subs.push_back(nh->subscribe(topics[kRefAnalytic], queue_size, &RosIo::on_ref_analytic, this));
     if (enabled(kRefWaypoint))
@@ -874,6 +1005,8 @@ struct RosIo {
 
   void shutdown() {
     stop_calls();
+    sim_command_service.shutdown();
+    sim_set_mode_service.shutdown();
     subs.clear();
     for (auto& p : pubs) p.shutdown();
     nh.reset();
@@ -995,6 +1128,12 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"timeline_ack", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.timeline_ack/1", XGC_QOS_EVENT},
     {"timeline_status", XGC_PORT_IN_OPTIONAL, "xgc.dmpc.timeline_status/1", XGC_QOS_STATE},
     {"planar_pva", XGC_PORT_IN_OPTIONAL, "xgc.planar_pva/1", XGC_QOS_CONTROL},
+    {"sim_pose", XGC_PORT_IN_OPTIONAL, "xgc.pose/1", XGC_QOS_STATE},
+    {"sim_velocity", XGC_PORT_IN_OPTIONAL, "xgc.twist/1", XGC_QOS_STATE},
+    {"sim_imu", XGC_PORT_IN_OPTIONAL, "xgc.imu/1", XGC_QOS_STATE},
+    {"sim_fcu_state", XGC_PORT_IN_OPTIONAL, "xgc.fcu_state/1", XGC_QOS_STATE},
+    {"cmd_vel", XGC_PORT_OUT_OPTIONAL, "xgc.twist/1", XGC_QOS_CONTROL},
+    {"sim_fcu_request", XGC_PORT_OUT_OPTIONAL, "xgc.fcu_request/1", XGC_QOS_EVENT},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
