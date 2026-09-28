@@ -7,19 +7,62 @@ mod common;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use xgc_rt_core::clock::WallClock;
 use xgc_rt_core::manifest::Manifest;
+use xgc_rt_core::transport::{RxSink, Transport, TransportContext, TransportError};
+use xgc_rt_core::{ChannelId, OriginId};
 use xgc_rt_host::{Host, HostOptions, RunSummary};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
+struct PanicOnWaitReady(LoopbackTransport);
+
+impl Transport for PanicOnWaitReady {
+    fn kind(&self) -> &str {
+        self.0.kind()
+    }
+
+    fn open(&mut self, ctx: &TransportContext, sink: RxSink) -> Result<(), TransportError> {
+        self.0.open(ctx, sink)
+    }
+
+    fn declare_out(&mut self, channel: ChannelId) -> Result<(), TransportError> {
+        self.0.declare_out(channel)
+    }
+
+    fn declare_in(&mut self, channel: ChannelId, origins: &[OriginId]) -> Result<(), TransportError> {
+        self.0.declare_in(channel, origins)
+    }
+
+    fn send(&mut self, channel: ChannelId, frame: &[u8]) -> Result<(), TransportError> {
+        self.0.send(channel, frame)
+    }
+
+    fn wait_ready(&mut self, _timeout: Duration) -> bool {
+        panic!("production Host::run must not wait for remote peer readiness")
+    }
+
+    fn close(&mut self) {
+        self.0.close();
+    }
+}
+
 fn run(dir: &Path, manifest: &str) -> RunSummary {
+    run_with_transport(
+        dir,
+        manifest,
+        Box::new(LoopbackTransport::new(LoopbackBus::new())),
+    )
+}
+
+fn run_with_transport(dir: &Path, manifest: &str, transport: Box<dyn Transport>) -> RunSummary {
     std::fs::write(dir.join("node.toml"), manifest).unwrap();
     let manifest = Manifest::from_toml_str(manifest).unwrap();
     let host = Host::new(
         manifest,
         dir,
-        Box::new(LoopbackTransport::new(LoopbackBus::new())),
+        transport,
         Arc::new(WallClock::new(0)),
         HostOptions::default(),
     )
@@ -163,6 +206,23 @@ fn five_plugins_in_rust_and_c_hand_off_in_memory_on_their_own_threads() {
         .collect();
     seqs.sort_unstable();
     assert_eq!(seqs, (1..=estimation.consumed).collect::<Vec<_>>(), "in order, each once");
+}
+
+#[test]
+fn linked_host_runs_local_outputs_without_waiting_for_remote_subscribers() {
+    let dir = common::scratch("local-output-without-peers");
+    let manifest = pipeline("local-output-without-peers", 20, 500, "", false)
+        .replace("roster = [\"uav1\"]", "roster = [\"uav1\", \"uav2\"]");
+    assert!(manifest.contains("roster = [\"uav1\", \"uav2\"]"));
+
+    // There is no uav2 host or remote subscriber. The panic wrapper makes any
+    // production call to Transport::wait_ready fail this real Host run.
+    let transport = Box::new(PanicOnWaitReady(LoopbackTransport::new(LoopbackBus::new())));
+    let summary = run_with_transport(&dir, &manifest, transport);
+    let perception = plugin(&summary, "perception");
+    let estimation = plugin(&summary, "estimation");
+    assert!(perception.published > 0, "local producer did not publish: {perception:?}");
+    assert!(estimation.consumed > 0, "local consumer did not receive input: {estimation:?}");
 }
 
 #[test]

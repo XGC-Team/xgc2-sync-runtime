@@ -99,7 +99,6 @@ node = "{node}"
 roster = ["vehicle-a", "vehicle-b", "feeder"]
 period_ms = 10
 epoch_ns = {EPOCH_NS}
-peer_timeout_ms = 100
 
 [transport]
 kind = "loopback"

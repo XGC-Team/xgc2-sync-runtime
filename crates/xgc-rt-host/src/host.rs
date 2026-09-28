@@ -933,7 +933,6 @@ pub struct StartupTimings {
     /// Every plugin created and configured (each on its own thread).
     pub configured_ms: f64,
     pub clock_ok_ms: f64,
-    pub peers_ready_ms: f64,
     pub first_round_ms: f64,
 }
 
@@ -1394,23 +1393,6 @@ impl Host {
             }
         }
         self.timings.clock_ok_ms = ms_since(self.started);
-        // Peers: every out-channel has a matching subscriber, or the timeout
-        // passes. The aggregator then runs Degraded-by-evidence: the audit
-        // shows the loss.
-        let peer_timeout = Duration::from_millis(self.manifest.session.peer_timeout_ms);
-        let ready = if !rt.link { true } else if let Some(source) = self.clock_source.as_ref() {
-            let began = Instant::now();
-            loop {
-                if stop.load(Ordering::Relaxed) || source.clock.snapshot().fault.is_some() { break false; }
-                let remaining = peer_timeout.saturating_sub(began.elapsed());
-                if remaining.is_zero() { break false; }
-                if rt.endpoint.wait_ready(remaining.min(MAX_WAIT)) { break true; }
-            }
-        } else { rt.endpoint.wait_ready(peer_timeout) };
-        self.timings.peers_ready_ms = ms_since(self.started);
-        if !ready {
-            rt.health.event(serde_json::json!({ "event": "peers_timeout", "after_ms": self.timings.peers_ready_ms }));
-        }
         rt.health.event(serde_json::json!({ "event": "startup", "timings": self.timings }));
 
         let s = &self.manifest.session;

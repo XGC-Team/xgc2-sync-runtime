@@ -52,7 +52,6 @@ id = "beat"
 node = "uav1"
 roster = ["uav1", "uav2"]
 period_ms = {period_ms}
-peer_timeout_ms = 300
 epoch_ns = {e0}
 run_for_ms = 20000
 

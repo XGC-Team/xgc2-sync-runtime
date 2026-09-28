@@ -87,17 +87,10 @@ pub struct SessionSpec {
     pub start_delay_ms: u64,
     /// Stop after this long past E0. None means run until signalled.
     pub run_for_ms: Option<u64>,
-    /// How long startup waits for remote subscribers on every out-channel.
-    #[serde(default = "default_peer_timeout_ms")]
-    pub peer_timeout_ms: u64,
     /// The aggregator stops after this many hung modules were abandoned, so
     /// the Agent restarts the whole process.
     #[serde(default = "default_max_abandoned")]
     pub max_abandoned: u32,
-}
-
-fn default_peer_timeout_ms() -> u64 {
-    5_000
 }
 
 fn default_max_abandoned() -> u32 {

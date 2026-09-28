@@ -178,11 +178,7 @@ fn the_z1_pipeline_split_over_two_host_processes_runs_over_the_zenoh_plugin() {
         .map(|node| {
             let endpoints = if *node == "uav1" { format!("listen = [\"tcp/127.0.0.1:{port}\"]") } else { format!("connect = [\"tcp/127.0.0.1:{port}\"]") };
             let transport = format!("kind = \"zenoh\"\npath = \"{}\"\n{endpoints}", plugin_path.display());
-            // The host waits for a remote subscriber on every out-channel,
-            // also those only read in its own process (detections, plan,
-            // cmd): cap that wait well before the epoch.
-            let text = manifest(node, &roster, Some(e0), 2000, &transport, &audit, &modules(&split, Some(node)))
-                .replace("run_for_ms = 2000\n", "run_for_ms = 2000\npeer_timeout_ms = 1000\n");
+            let text = manifest(node, &roster, Some(e0), 2000, &transport, &audit, &modules(&split, Some(node)));
             let file = dir.join(format!("{node}.toml"));
             std::fs::write(&file, text).unwrap();
             Command::new(env!("CARGO_BIN_EXE_xgc-rt-host")).arg("--manifest").arg(&file).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()
