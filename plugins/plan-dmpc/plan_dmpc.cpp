@@ -65,7 +65,7 @@ std::unique_ptr<PlanDmpc> PlanDmpc::open(const PlanDmpcOpen& request, std::strin
     const auto params = formation_generator_dmpc::privateParamsFromManifest(
         formation_generator_dmpc::loadParamManifest(request.manifest_path));
     auto agent = std::make_unique<formation_generator_dmpc::DmpcAgent>(params);
-    const auto& loaded = agent->configuration();
+    const auto& loaded = agent->settings();
     const int horizon = agent->referenceInfo().horizon - 1;
     if (!loaded.params.hasParam("num_uavs")) return fail("manifest is missing num_uavs");
     if (!loaded.params.hasParam("uav_id")) return fail("manifest is missing uav_id");

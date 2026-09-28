@@ -12,7 +12,6 @@
 #include <Eigen/Dense>
 
 #include "formation_generator/core/plan_wire.h"
-#include "formation_generator/dmpc_scheduler/dmpc_configuration.h"
 #include "formation_generator/dmpc_scheduler/dmpc_agent.h"
 #include "formation_generator/dmpc_scheduler/pattern_manager.h"
 #include "formation_generator/lifecycle/goal_queue.h"
@@ -54,7 +53,7 @@ class PlanDmpc {
   static std::unique_ptr<PlanDmpc> open(const PlanDmpcOpen& request, std::string* error);
 
   const xgc_dmpc_planner_config_v1& config() const { return config_; }
-  const formation_generator_dmpc::DmpcConfiguration& loaded() const { return agent_->configuration(); }
+  const formation_generator_dmpc::DmpcAgentSettings& loaded() const { return agent_->settings(); }
   std::string push_state(const xgc_dmpc_paired_state_v1& state, double now_sec);
   std::string push_controller(const xgc_dmpc_controller_status_v1& status, double now_sec);
   std::string push_scene(const xgc_dmpc_scene_ids_v1& snapshot, const xgc_dmpc_scene_ids_v1& state);
