@@ -66,7 +66,7 @@ std::unique_ptr<PlanDmpc> PlanDmpc::open(const PlanDmpcOpen& request, std::strin
         formation_generator_dmpc::loadParamManifest(request.manifest_path));
     auto agent = std::make_unique<formation_generator_dmpc::DmpcAgent>(params);
     const auto& loaded = agent->configuration();
-    const int horizon = agent->leader()->getHorizon() - 1;
+    const int horizon = agent->referenceInfo().horizon - 1;
     if (!loaded.params.hasParam("num_uavs")) return fail("manifest is missing num_uavs");
     if (!loaded.params.hasParam("uav_id")) return fail("manifest is missing uav_id");
     if (static_cast<int>(loaded.uav_id) != request.self_id) {
@@ -107,11 +107,11 @@ PlanDmpc::PlanDmpc(const xgc_dmpc_planner_config_v1& config,
     : config_(config), agent_(std::move(agent)) {}
 
 int PlanDmpc::leader_rows() const {
-  return agent_ && agent_->leader() ? static_cast<int>(agent_->leader()->getPredictedTrajectory().rows()) : 0;
+  return agent_ ? agent_->referenceInfo().rows : 0;
 }
 
 int PlanDmpc::leader_cols() const {
-  return agent_ && agent_->leader() ? static_cast<int>(agent_->leader()->getPredictedTrajectory().cols()) : 0;
+  return agent_ ? agent_->referenceInfo().columns : 0;
 }
 
 std::string PlanDmpc::push_state(const xgc_dmpc_paired_state_v1& state, double now_sec) {

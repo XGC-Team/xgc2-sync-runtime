@@ -71,8 +71,7 @@ class PlanDmpc {
                                 bool* have_state) const;
   std::string push_neighbor_plan(const uint8_t* bytes, size_t size);
   std::string push_neighbor_position(const xgc_dmpc_measured_position_v1& position);
-  size_t static_obstacle_count() const { return agent_ ? agent_->staticBodies().size() : 0; }
-  const std::vector<convex_geometry::BodyInstance>& static_bodies() const { return agent_->staticBodies(); }
+  size_t static_obstacle_count() const { return agent_ ? agent_->staticObstacleCount() : 0; }
   const std::string& scene_epoch() const { return scene_epoch_; }
   int leader_rows() const;
   int leader_cols() const;
