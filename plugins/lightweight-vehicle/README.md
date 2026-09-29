@@ -1,9 +1,10 @@
 # Lightweight vehicle
 
 Numerical plants behind the existing native plugin ABI, with no ROS, Gazebo,
-MAVLink, sockets or plugin-owned threads. One instance simulates one robot; a
-host can hold many instances, or each onboard host can integrate its own robot.
-No controller or planner implementation is changed.
+MAVLink, sockets or plugin-owned threads. One instance simulates one robot by
+default or a batch of up to 8 robots of one model; a host can hold many
+instances, or each onboard host can integrate its own robot. No controller or
+planner implementation is changed.
 
 `model` is `fs150`, `scout` or `mecanum`. `initial_pose = [x, y, z, yaw]` is in
 world metres/radians. `epoch_ns` is the same shared Session epoch given to the
@@ -89,4 +90,6 @@ with that ELF's libraries available to exercise actual SMC takeoff, 10 Hz PVA
 reference tracking and landing through both real plugin vtables. This test
 supplies in-memory host callbacks; actual scheduler/transport tests are separate.
 `cargo test -p xgc-rt-host --test lightweight_vehicle` loads the built ELF in
-two real hosts with independent manual clocks and loopback transport.
+real hosts with manual clocks and loopback transport: two hosts with
+independent clocks, and a batch host against a per-robot host that must
+publish byte-identical states at every output stamp.
