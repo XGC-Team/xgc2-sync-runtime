@@ -12,6 +12,18 @@ configuration, independently of where the host runs. Use the host's existing
 wall clock for wireless HIL; this plugin does not need Gazebo `/clock` or a
 central tick publisher.
 
+One instance can also advance a batch of up to 8 robots of the same model
+(`robots = N`, `initial_poses = [x0, y0, z0, yaw0, x1, ...]` with four numbers
+per robot). Their state is one contiguous vector; each step reads the host
+time once and advances every robot to the same grid point with the same
+per-robot function a single-robot instance uses, so a batch and independent
+instances given the same controls publish identical states and stamps. Robot 0
+keeps the single-robot ports; robot r uses the same names with `_r` appended
+(`setpoint_3`, `pose_3`, ...). The ABI's 64-port limit sets the 8-robot bound;
+larger fleets use several instances. Run a plant with `trigger = "on_dirty"`
+and `wake_ms = output_ms`: it catches up from the host time, so a 1 ms
+`on_round` wake per instance only adds work.
+
 The host wakes the instance. It advances complete `epoch + k * step` intervals,
 without waiting for other robots. Controls become active on the first grid
 boundary at or after both their effective header time and receive time. A late

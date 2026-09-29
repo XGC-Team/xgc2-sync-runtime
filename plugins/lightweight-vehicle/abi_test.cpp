@@ -1,6 +1,7 @@
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -8,7 +9,9 @@
 #include <deque>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" const xgc_plugin_descriptor *xgc_rt_plugin_v1();
@@ -19,8 +22,10 @@ struct Sample {
 };
 struct Boundary {
   const xgc_plugin_descriptor *plugin{xgc_rt_plugin_v1()};
-  std::array<std::deque<Sample>, 3> inputs;
+  std::array<std::deque<Sample>, XGC_RT_MAX_PORTS> inputs;
   std::map<uint32_t, std::vector<uint8_t>> outputs;
+  // Every publication in order: (port, bytes).
+  std::vector<std::pair<uint32_t, std::vector<uint8_t>>> published;
   std::vector<uint8_t> popped;
   std::vector<std::string> errors, warnings;
   xgc_host_api api{};
@@ -47,7 +52,9 @@ struct Boundary {
     };
     api.publish = [](void *p, uint32_t port, uint64_t, const uint8_t *data,
                      uint32_t size) {
-      static_cast<Boundary *>(p)->outputs[port] = {data, data + size};
+      auto &self = *static_cast<Boundary *>(p);
+      self.outputs[port] = {data, data + size};
+      self.published.emplace_back(port, std::vector<uint8_t>(data, data + size));
       return XGC_OK;
     };
     api.log = [](void *p, xgc_log_level level, const char *text) {
@@ -262,6 +269,227 @@ void bounded_future_controls() {
   assert(std::abs(full.velocity().linear[0] - expected) < 1e-12);
 }
 
+constexpr uint32_t kBlock = 8; // ports per robot
+
+// Robot r's publications in order, as (port within its block, bytes).
+std::vector<std::pair<uint32_t, std::vector<uint8_t>>>
+robot_outputs(const Boundary &boundary, uint32_t robot) {
+  std::vector<std::pair<uint32_t, std::vector<uint8_t>>> result;
+  for (const auto &item : boundary.published)
+    if (item.first / kBlock == robot)
+      result.emplace_back(item.first % kBlock, item.second);
+  return result;
+}
+
+double stamp_of(const std::vector<uint8_t> &bytes) {
+  double stamp;
+  std::memcpy(&stamp, bytes.data(), sizeof stamp);
+  return stamp;
+}
+
+bool configures(const std::string &config) {
+  const auto *plugin = xgc_rt_plugin_v1();
+  xgc_host_api api{};
+  api.abi_version = XGC_RT_ABI_VERSION;
+  api.abi_minor = XGC_RT_ABI_MINOR;
+  api.log = [](void *, xgc_log_level, const char *) {};
+  void *instance = plugin->vtbl->create(&api);
+  assert(instance);
+  const bool ok = plugin->vtbl->configure(instance, config.c_str()) == XGC_OK;
+  plugin->vtbl->destroy(instance);
+  return ok;
+}
+
+// Robot r owns block r; block 0 keeps the single-robot names and indices.
+void port_blocks() {
+  const auto *plugin = xgc_rt_plugin_v1();
+  assert(plugin->port_count == XGC_RT_MAX_PORTS);
+  const char *names[kBlock] = {"setpoint", "cmd_vel",   "fcu_request",
+                               "pose",     "velocity",  "imu",
+                               "fcu_state", "paired_state"};
+  for (uint32_t kind = 0; kind != kBlock; ++kind) {
+    const auto &first = plugin->ports[kind];
+    const auto &last = plugin->ports[7 * kBlock + kind];
+    assert(std::string(first.name) == names[kind]);
+    assert(std::string(last.name) == std::string(names[kind]) + "_7");
+    assert(std::string(last.schema_id) == first.schema_id);
+    assert(last.qos == first.qos);
+  }
+  assert(plugin->ports[3].dir == XGC_PORT_OUT);
+  assert(plugin->ports[kBlock + 3].dir == XGC_PORT_OUT_OPTIONAL);
+  const std::string base = "model = \"fs150\"\nepoch_ns = 1000000000\n";
+  assert(configures(base + "robots = 8\n"));
+  assert(!configures(base + "robots = 9\n"));
+  assert(!configures(base + "robots = 0\n"));
+  assert(!configures(base + "robots = 2\ninitial_pose = [0, 0, 0, 0]\n"));
+  assert(!configures(base + "robots = 2\ninitial_poses = [0, 0, 0, 0]\n"));
+  assert(!configures(base + "initial_pose = [0, 0, 0, 0]\n"
+                            "initial_poses = [0, 0, 0, 0]\n"));
+  assert(configures(base + "robots = 2\n"
+                           "initial_poses = [0, 0, 0, 0, 1, 1, 0, 0]\n"));
+}
+
+// A batch fed the controls a set of independent single-robot instances get,
+// with the same receive times, publishes byte-identical states and stamps.
+// A batch woken on another schedule matches them at every common stamp.
+void batch_matches_independent_robots(const char *model) {
+  constexpr int64_t ms = 1000000, epoch = Boundary::epoch;
+  constexpr uint32_t n = 5;
+  const bool flight = std::string(model) == "fs150";
+  std::vector<std::string> pose;
+  std::string poses;
+  for (uint32_t r = 0; r != n; ++r) {
+    pose.push_back(std::to_string(0.5 * r) + ", " + std::to_string(-0.25 * r) +
+                   ", " + std::to_string(0.1 * r) + ", " +
+                   std::to_string(0.3 * r));
+    poses += (r ? ", " : "") + pose.back();
+  }
+  const std::string batch_config =
+      "robots = 5\ninitial_poses = [" + poses + "]\n";
+  Boundary batch(model, batch_config), sparse(model, batch_config);
+  std::vector<std::unique_ptr<Boundary>> singles;
+  for (uint32_t r = 0; r != n; ++r)
+    singles.push_back(std::make_unique<Boundary>(
+        model, "initial_pose = [" + pose[r] + "]\n"));
+
+  struct Event {
+    int64_t received;
+    uint32_t robot, port;
+    std::vector<uint8_t> bytes;
+  };
+  std::vector<Event> events;
+  auto add = [&](int64_t received, uint32_t robot, uint32_t port,
+                 const auto &value) {
+    auto *bytes = reinterpret_cast<const uint8_t *>(&value);
+    events.push_back({received, robot, port, {bytes, bytes + sizeof value}});
+  };
+  auto request = [&](int64_t received, uint32_t robot, uint32_t kind,
+                     const char *mode, uint32_t arm) {
+    xgc_fcu_request_v1 value{};
+    value.stamp = double(received) * 1e-9;
+    value.kind = kind;
+    value.arm = arm;
+    std::strcpy(value.mode, mode);
+    add(received, robot, 2, value);
+  };
+  for (uint32_t r = 0; r != n; ++r) {
+    for (int64_t t = int64_t(r) * ms; t < 1400 * ms; t += 20 * ms) {
+      const int64_t received = epoch + t;
+      const double phase = 1e-9 * double(t) + r;
+      if (flight) {
+        if (r == 1 && t > 800 * ms)
+          break; // the stream stops: offboard timeout, AUTO.LOITER
+        auto value = acceleration(double(received) * 1e-9, 0.3 * std::sin(phase));
+        value.acceleration[1] = 0.1 * r;
+        value.acceleration[2] = 0.4 * std::cos(phase);
+        value.type_mask = 3135 & ~2048; // with a yaw rate
+        value.yaw_rate = 0.2 * r;
+        if (r == 3)
+          value.stamp -= 0.015; // late: effective at receipt
+        if (r == 4 && t == 404 * ms)
+          value.stamp += 0.030; // future: effective 30 ms after receipt
+        add(received, r, 0, value);
+        if (t == int64_t(r) * ms) {
+          request(received, r, 1, "", 1);
+          request(received, r, 2, "OFFBOARD", 0);
+        }
+      } else {
+        xgc_twist_v1 value{};
+        value.stamp = double(received) * 1e-9;
+        value.linear[0] = 0.5 + 0.1 * r;
+        value.linear[1] = 0.2 * std::sin(phase);
+        value.angular[2] = 0.3 * std::cos(phase);
+        add(received, r, 1, value);
+      }
+    }
+  }
+  if (flight) {
+    request(epoch + 600 * ms, 2, 2, "AUTO.LAND", 0);
+    request(epoch + 1000 * ms, 0, 1, "", 0); // in-air disarm: refused
+    request(epoch + 1100 * ms, 3, 2, "STABILIZED", 0);
+  }
+  std::stable_sort(events.begin(), events.end(),
+                   [](const Event &a, const Event &b) {
+                     return a.received < b.received;
+                   });
+
+  // Irregular reference wakes that include every 50 ms point; sparse wakes
+  // every 50 ms only.
+  std::vector<int64_t> wakes;
+  for (int64_t t = epoch, k = 0; t < epoch + 1500 * ms; ++k)
+    wakes.push_back(t += (1 + (k * 7919) % 7) * ms);
+  for (int64_t t = epoch; t <= epoch + 1500 * ms; t += 50 * ms)
+    wakes.push_back(t);
+  std::sort(wakes.begin(), wakes.end());
+  wakes.erase(std::unique(wakes.begin(), wakes.end()), wakes.end());
+
+  auto run = [&](const std::vector<int64_t> &schedule, auto &&deliver,
+                 auto &&tick) {
+    size_t next = 0;
+    for (int64_t now : schedule) {
+      for (; next != events.size() && events[next].received <= now; ++next)
+        deliver(events[next]);
+      tick(now);
+    }
+  };
+  run(
+      wakes,
+      [&](const Event &e) {
+        batch.inputs[e.robot * kBlock + e.port].push_back(
+            {e.received, e.bytes});
+        singles[e.robot]->inputs[e.port].push_back({e.received, e.bytes});
+      },
+      [&](int64_t now) {
+        batch.tick(now);
+        for (auto &single : singles)
+          single->tick(now);
+      });
+  std::vector<int64_t> every_50;
+  for (int64_t t = epoch; t <= epoch + 1500 * ms; t += 50 * ms)
+    every_50.push_back(t);
+  run(
+      every_50,
+      [&](const Event &e) {
+        sparse.inputs[e.robot * kBlock + e.port].push_back(
+            {e.received, e.bytes});
+      },
+      [&](int64_t now) { sparse.tick(now); });
+
+  size_t single_warnings = 0;
+  for (uint32_t r = 0; r != n; ++r) {
+    const auto independent = robot_outputs(*singles[r], 0);
+    assert(independent.size() > 1000);
+    assert(robot_outputs(batch, r) == independent);
+    const auto late = robot_outputs(sparse, r);
+    assert(late.size() == 31 * (flight ? 5 : 3));
+    for (const auto &[kind, bytes] : late) {
+      bool found = false;
+      for (const auto &item : independent)
+        if (item.first == kind && stamp_of(item.second) == stamp_of(bytes)) {
+          assert(item.second == bytes);
+          found = true;
+        }
+      assert(found);
+    }
+    single_warnings += singles[r]->warnings.size();
+  }
+  assert(batch.warnings.size() == single_warnings);
+  if (flight) {
+    // The scenario exercised the FCU paths it names.
+    const auto state = [&](uint32_t r) {
+      xgc_fcu_state_v1 value;
+      std::memcpy(&value, singles[r]->outputs.at(6).data(), sizeof value);
+      return value;
+    };
+    assert(std::string(state(1).mode) == "AUTO.LOITER");
+    assert(std::string(state(2).mode) == "AUTO.LAND");
+    assert(state(0).armed && std::string(state(3).mode) == "OFFBOARD");
+    assert(has_warning(batch, "robot 1: no setpoint for offboard_timeout_ms"));
+    assert(has_warning(batch, "robot 0: disarm refused while airborne"));
+    assert(has_warning(batch, "robot 3: FCU mode STABILIZED is not modelled"));
+  }
+}
+
 int main() {
   // Different wake schedules produce the same plant trajectory when the
   // actual arrivals are equal. Future controls cannot affect earlier steps.
@@ -309,6 +537,9 @@ int main() {
   assert(scout.outputs.count(6) == 0 && mecanum.outputs.count(6) == 0);
   fcu_semantics();
   bounded_future_controls();
+  port_blocks();
+  for (const char *model : {"fs150", "scout", "mecanum"})
+    batch_matches_independent_robots(model);
   std::cout
       << "lightweight ABI arrival timing and independent time grid: passed\n";
 }
