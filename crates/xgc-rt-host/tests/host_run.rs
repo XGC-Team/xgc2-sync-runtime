@@ -371,3 +371,67 @@ fn a_step_over_budget_degrades_the_module_without_abandoning_it() {
     let health = std::fs::read_to_string(ok.audit_dir.join("uav1/health.jsonl")).unwrap();
     assert!(!health.contains("\"event\":\"overrun\""));
 }
+
+#[test]
+fn a_sampled_step_log_keeps_one_round_in_n_and_every_failed_or_slow_step() {
+    // perception steps every 20 ms round; slow overruns its 10 ms budget on
+    // every step; failing fails its second step and is not restarted.
+    let dir = common::scratch("sampled-steps");
+    let manifest = format!(
+        r#"{}
+[[channel]]
+name = "detections"
+qos = "state"
+[[channel]]
+name = "cmd"
+qos = "event"
+
+[[plugin]]
+name = "perception"
+path = "{}"
+trigger = "on_round"
+bind = {{ detections = {{ channel = "detections" }} }}
+
+[[plugin]]
+name = "slow"
+path = "{}"
+trigger = "on_round"
+step_budget_ms = 10
+config = {{ step_sleep_ms = 12 }}
+bind = {{ cmd = {{ channel = "cmd", from = ["uav1"] }} }}
+
+[[plugin]]
+name = "failing"
+path = "{}"
+trigger = "on_round"
+config = {{ fail_after = 2 }}
+bind = {{ cmd = {{ channel = "cmd", from = ["uav1"] }} }}
+"#,
+        header("sampled-steps", 20, 1000).replace("dir = \"audit\"", "dir = \"audit\"\nsteps_every = 5"),
+        common::lib("stub_perception"),
+        common::lib("c_stub"),
+        common::lib("c_stub"),
+    );
+    let summary = run(&dir, &manifest);
+    let steps = std::fs::read_to_string(summary.audit_dir.join("uav1/steps.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = steps.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let rounds_of = |name: &str| -> Vec<u64> {
+        records.iter().filter(|r| r["m"] == name).map(|r| r["k"].as_u64().unwrap()).collect()
+    };
+
+    // A healthy module is recorded for one round in five, and still counted
+    // on every step.
+    let (perception, recorded) = (plugin(&summary, "perception"), rounds_of("perception"));
+    assert!(recorded.iter().all(|k| k % 5 == 0), "unsampled rounds recorded: {recorded:?}");
+    assert!(perception.steps >= 40 && recorded.len() as u64 * 5 <= perception.steps + 5, "{} records for {} steps", recorded.len(), perception.steps);
+    assert!(recorded.len() >= 6, "sampled rounds missing: {recorded:?}");
+
+    // Every step over budget and the failed step are recorded, whatever the round.
+    let slow = plugin(&summary, "slow");
+    assert_eq!(rounds_of("slow").len() as u64, slow.steps, "{slow:?}");
+    let failing = plugin(&summary, "failing");
+    let error = failing.last_error.clone().unwrap_or_default();
+    let failed_round: u64 = error.rsplit(' ').next().unwrap().parse().unwrap_or_else(|_| panic!("last error {error:?}"));
+    assert_eq!(failing.steps, 2, "{failing:?}");
+    assert!(rounds_of("failing").contains(&failed_round), "failed step (round {failed_round}) missing: {:?}", rounds_of("failing"));
+}

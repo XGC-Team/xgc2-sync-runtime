@@ -14,6 +14,7 @@
 //!
 //! [audit]
 //! dir = "out/audit"
+//! steps_every = 1   # steps.jsonl: every step of one round in N
 //!
 //! [[channel]]
 //! name = "dmpc/plan"
@@ -120,6 +121,16 @@ pub struct TransportSpec {
 #[serde(deny_unknown_fields)]
 pub struct AuditSpec {
     pub dir: PathBuf,
+    /// `steps.jsonl` keeps every step of one round in `steps_every`, and
+    /// every step that failed or overran its budget. The default 1 keeps
+    /// every step; a large graph samples, since a line per step is megabytes
+    /// per second at 100 robots.
+    #[serde(default = "default_steps_every")]
+    pub steps_every: u64,
+}
+
+fn default_steps_every() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -301,6 +312,9 @@ impl Manifest {
         if !(s.period_ms.is_finite() && s.period_ms > 0.0) {
             return err("period_ms must be positive".into());
         }
+        if self.audit.steps_every == 0 {
+            return err("audit.steps_every must be at least 1".into());
+        }
         let period_ns = (s.period_ms * 1e6).round() as i64;
         let publish_deadline_ns = match s.publish_deadline_ms {
             None => period_ns,
@@ -467,6 +481,16 @@ only_uav3 = { channel = "dmpc/plan", from = ["uav3"] }
         assert_eq!(r.publish_deadline_ns, 50_000_000);
         assert_eq!(r.bindings[0]["plan_in"], (0, vec![1, 2]));
         assert_eq!(r.bindings[0]["only_uav3"], (0, vec![2]));
+    }
+
+    #[test]
+    fn step_log_sampling_defaults_to_every_step_and_rejects_zero() {
+        assert_eq!(Manifest::from_toml_str(BASE).unwrap().audit.steps_every, 1);
+        let sampled = Manifest::from_toml_str(&BASE.replace("dir = \"out\"", "dir = \"out\"\nsteps_every = 100")).unwrap();
+        assert_eq!(sampled.audit.steps_every, 100);
+        assert!(sampled.resolve().is_ok());
+        let zero = Manifest::from_toml_str(&BASE.replace("dir = \"out\"", "dir = \"out\"\nsteps_every = 0")).unwrap();
+        assert!(zero.resolve().is_err());
     }
 
     #[test]

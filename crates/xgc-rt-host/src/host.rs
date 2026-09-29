@@ -21,7 +21,9 @@
 //! outputs are then also sent on it, and frames from other nodes land in the
 //! same inputs, so a module cannot tell a local writer from a remote one.
 //! Only link frames are audited as frames; same-process steps are recorded
-//! in `steps.jsonl` (module, round, start, end, and which samples it read).
+//! in `steps.jsonl` (module, round, start, end, and which samples it read):
+//! every step, or with `audit.steps_every = N` every step of one round in N
+//! and every step that failed or overran its budget.
 //!
 //! **Each step sees one consistent snapshot.** At step start the module
 //! thread takes every sample queued at that moment; `next` reads only from
@@ -317,6 +319,8 @@ struct Status {
 
 struct Module {
     name: String,
+    /// `name` as a JSON string, for step records.
+    name_json: String,
     lib: Arc<LoadedPlugin>,
     trigger: Trigger,
     /// Step again this long after the previous step (`wake_ms`).
@@ -363,6 +367,8 @@ struct Runtime {
     endpoint: Arc<Endpoint>,
     health: Arc<HealthLog>,
     steps: LineLog,
+    /// Record every step of one round in this many (`audit.steps_every`).
+    steps_every: u64,
     modules: Vec<Module>,
     started: Instant,
 }
@@ -864,8 +870,12 @@ impl ModuleThread {
                 }
             }
         }
-        let reads: Vec<_> = self.s().reads.iter().map(|&(p, o, q)| [p as u64, o as u64, q]).collect();
-        let _ = self.s().steps_tx.send(Some(serde_json::json!({ "m": module.name, "k": k, "t0": t0, "t1": t1, "in": reads }).to_string()));
+        // At 100 robots a line per step is ~40k lines/s; a sampled log keeps
+        // whole rounds, and never drops a failed or slow step.
+        if k % rt.steps_every == 0 || status != XGC_OK || took > module.budget {
+            let line = step_record(&module.name_json, k, t0, t1, &self.s().reads);
+            let _ = self.s().steps_tx.send(Some(line));
+        }
         if status != XGC_OK {
             rt.fault(m, &format!("step returned {status} in round {k}"));
             return true;
@@ -920,6 +930,23 @@ impl ModuleThread {
         self.inst().done.store(true, Ordering::Release);
         false
     }
+}
+
+/// One `steps.jsonl` line, byte for byte what serializing
+/// `{"m", "k", "t0", "t1", "in": [[port, origin, seq], ...]}` with serde_json
+/// writes (keys sorted), without building a JSON tree per step.
+fn step_record(name_json: &str, k: u64, t0: i64, t1: i64, reads: &[(u32, OriginId, u64)]) -> String {
+    use std::fmt::Write as _;
+    let mut line = String::with_capacity(56 + name_json.len() + 24 * reads.len());
+    line.push_str("{\"in\":[");
+    for (index, &(port, origin, seq)) in reads.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        let _ = write!(line, "[{port},{origin},{seq}]");
+    }
+    let _ = write!(line, "],\"k\":{k},\"m\":{name_json},\"t0\":{t0},\"t1\":{t1}}}");
+    line
 }
 
 // --- host -------------------------------------------------------------------
@@ -1193,6 +1220,7 @@ impl Host {
             let budget = decl.step_budget_ms.map_or(Duration::from_nanos(resolved.period_ns as u64), |ms| Duration::from_secs_f64(ms / 1e3));
             modules.push(Module {
                 name: decl.name.clone(),
+                name_json: serde_json::to_string(&decl.name).map_err(|e| HostError(format!("plugin {} name: {e}", decl.name)))?,
                 lib: Arc::new(lib),
                 trigger: decl.trigger,
                 wake: decl.wake_ms.map(|ms| Duration::from_secs_f64(ms / 1e3)),
@@ -1242,7 +1270,8 @@ impl Host {
             }
             _ => None,
         };
-        let rt = Arc::new(Runtime { node_id, link, clock, endpoint, health, steps, modules, started });
+        let steps_every = manifest.audit.steps_every.max(1);
+        let rt = Arc::new(Runtime { node_id, link, clock, endpoint, health, steps, steps_every, modules, started });
         Ok(Self { manifest, resolved, rt, audit, transport_kind, timings, started, run_dir, clock_service, clock_source })
     }
 
@@ -1575,6 +1604,19 @@ fn ms_since(t: Instant) -> f64 {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+
+    #[test]
+    fn a_step_record_is_what_serde_json_writes() {
+        for (name, k, t0, t1, reads) in [
+            ("estimation", 0u64, 0i64, 1i64, vec![]),
+            ("plant_3", 17, -5, 1_234_567_890_123, vec![(0u32, 0 as OriginId, 1u64)]),
+            ("edge/\"quoted\"\\\u{1}", u64::MAX, i64::MIN, i64::MAX, vec![(63, OriginId::MAX, u64::MAX), (2, 1, 9)]),
+        ] {
+            let reads_json: Vec<_> = reads.iter().map(|&(p, o, q)| [p as u64, o as u64, q]).collect();
+            let expected = serde_json::json!({ "m": name, "k": k, "t0": t0, "t1": t1, "in": reads_json }).to_string();
+            assert_eq!(step_record(&serde_json::to_string(name).unwrap(), k, t0, t1, &reads), expected);
+        }
+    }
 
     struct PausedWriter {
         entered: Option<mpsc::Sender<()>>,
