@@ -20,9 +20,16 @@ per-robot function a single-robot instance uses, so a batch and independent
 instances given the same controls publish identical states and stamps. Robot 0
 keeps the single-robot ports; robot r uses the same names with `_r` appended
 (`setpoint_3`, `pose_3`, ...). The ABI's 64-port limit sets the 8-robot bound;
-larger fleets use several instances. Run a plant with `trigger = "on_dirty"`
-and `wake_ms = output_ms`: it catches up from the host time, so a 1 ms
-`on_round` wake per instance only adds work.
+larger fleets use several instances.
+
+A plant catches up from the host time, so waking it every 1 ms only adds
+work. In a plant-only host set `period_ms = output_ms` and `trigger =
+"on_round"`: each instance wakes once per output period on the shared grid
+and input never wakes it. Where the host keeps 1 ms rounds, use `trigger =
+"on_dirty"`, `wake_ms = output_ms` and `step_budget_ms = output_ms`; without
+input that relative timer skips a few output periods, and without the budget
+a step slowed by a busy link past 10 ms is abandoned as hung. Measured cost at
+1/32/100 robots: `docs/validation/lightweight-batch-20260928/`.
 
 The host wakes the instance. It advances complete `epoch + k * step` intervals,
 without waiting for other robots. Controls become active on the first grid
