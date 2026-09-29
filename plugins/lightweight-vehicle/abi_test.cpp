@@ -227,6 +227,41 @@ void fcu_semantics() {
   assert(std::string(patient.fcu_state().mode) == "AUTO.LOITER");
 }
 
+void bounded_future_controls() {
+  constexpr int64_t ms = 1000000, epoch = Boundary::epoch;
+  // A stamp further ahead of its receipt than max_future_ms is a clock-domain
+  // error: it is dropped and reported, never queued for later.
+  Boundary future("fs150", "max_future_ms = 100\n");
+  future.send(0, acceleration(1.0, 0.0), epoch);
+  future.enable_flight();
+  future.send(0, acceleration(1.1005, 3.0), epoch + ms); // 99.5 ms ahead
+  future.send(0, acceleration(3.0, 5.0), epoch + ms);    // 2 s ahead
+  future.tick(epoch + 150 * ms);
+  assert(has_warning(future, "dropped 1 control(s) stamped beyond max_future_ms"));
+  // The in-window control applied at 100.5 ms -> the 101 ms grid boundary.
+  const double t = 0.049;
+  assert(std::abs(future.velocity().linear[0] - 3.0 * t) < 1e-12);
+  future.tick(epoch + 400 * ms);
+  assert(std::abs(future.velocity().linear[0] - 3.0 * 0.299) < 1e-12);
+
+  // At most max_pending future controls wait; the rest are dropped, counted.
+  Boundary full("fs150", "max_pending = 4\n");
+  full.send(0, acceleration(1.0, 0.0), epoch);
+  full.enable_flight();
+  full.tick(epoch);
+  full.tick(epoch + ms); // applies the controls due at the epoch
+  for (int i = 0; i != 10; ++i)
+    full.send(0, acceleration(1.0 + 0.01 * (i + 1), double(i)), epoch + ms);
+  full.tick(epoch + 2 * ms);
+  assert(has_warning(full, "dropped 1 control(s): max_pending"));
+  assert(has_warning(full, "dropped 4 control(s): max_pending"));
+  assert(!has_warning(full, "dropped 3 control(s): max_pending"));
+  // Only the four queued accelerations (0..3) ever act.
+  full.tick(epoch + 60 * ms);
+  const double expected = 0.01 * (1.0 + 2.0) + 0.02 * 3.0;
+  assert(std::abs(full.velocity().linear[0] - expected) < 1e-12);
+}
+
 int main() {
   // Different wake schedules produce the same plant trajectory when the
   // actual arrivals are equal. Future controls cannot affect earlier steps.
@@ -273,6 +308,7 @@ int main() {
   assert(std::abs(mecanum.pose().position[1] - 4.999) < 0.002);
   assert(scout.outputs.count(6) == 0 && mecanum.outputs.count(6) == 0);
   fcu_semantics();
+  bounded_future_controls();
   std::cout
       << "lightweight ABI arrival timing and independent time grid: passed\n";
 }

@@ -21,6 +21,11 @@ configured output period rather than serializing every catch-up step. This
 does not recover control samples already dropped by transport QoS, nor prove
 that the complete host/controller workload meets an onboard deadline.
 
+A control stamped more than `max_future_ms` (default 1000) after its receipt
+is a clock-domain error, not a schedule: it is dropped. At most `max_pending`
+(default 1024) controls wait per robot; later ones are dropped. Both drops are
+counted and logged as warnings on the 1st, 2nd, 4th, 8th... occurrence.
+
 | Model | Actual control input | Plant |
 | --- | --- | --- |
 | FS150 | `setpoint`, `xgc.position_target/1`, world frame 1; `fcu_request`, `xgc.fcu_request/1` | SMC acceleration-only input drives the exact ZOH translational double integrator. The position/velocity branch provides the ideal FCU response needed for the unchanged controller's Takeoff/Hover/Landing states. |

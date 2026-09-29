@@ -70,10 +70,12 @@ struct Vehicle {
   std::unique_ptr<xgc_lightweight::MecanumModel> mecanum;
   std::deque<Input> pending;
   int64_t epoch{0}, time{0}, step_ns{1000000}, output_ns{10000000},
-      next_output{0};
+      next_output{0}, max_future_ns{1000000000};
+  size_t max_pending{1024};
   double ground_z{0.0};
   std::string fcu_mode{"POSCTL"};
-  Occurrences refused_disarm, refused_mode, refused_offboard;
+  Occurrences future_drops, full_drops, refused_disarm, refused_mode,
+      refused_offboard;
 
   void log(xgc_log_level level, const std::string &message) {
     host->log(host->host, level, ("lightweight-vehicle: " + message).c_str());
@@ -95,7 +97,8 @@ struct Vehicle {
       throw std::invalid_argument(
           "lightweight-vehicle: shared epoch_ns is required");
     epoch = time = next_output = std::stoll(epoch_text);
-    int step_ms = 1, output_ms = 10, offboard_timeout_ms = 500;
+    int step_ms = 1, output_ms = 10, offboard_timeout_ms = 500,
+        max_future_ms = 1000, pending_limit = 1024;
     double initial[4]{0, 0, 0, 0};
     if (!cfg::integer(config, "step_ms", &step_ms) || step_ms <= 0 ||
         !cfg::integer(config, "output_ms", &output_ms) || output_ms < step_ms ||
@@ -104,20 +107,29 @@ struct Vehicle {
                      [](double v) { return std::isfinite(v); }))
       throw std::invalid_argument(
           "lightweight-vehicle: invalid step, output period or initial pose");
-    // PX4 COM_OF_LOSS_T role: a silent controller cannot fly the plant away.
+    // PX4 COM_OF_LOSS_T role; a future-stamped control beyond max_future_ms
+    // is a clock-domain error, not a schedule. Both bound what a silent or
+    // mis-stamped controller can do to the plant.
     if (!cfg::integer(config, "offboard_timeout_ms", &offboard_timeout_ms) ||
-        offboard_timeout_ms <= 0)
+        offboard_timeout_ms <= 0 ||
+        !cfg::integer(config, "max_future_ms", &max_future_ms) ||
+        max_future_ms < 0 ||
+        !cfg::integer(config, "max_pending", &pending_limit) ||
+        pending_limit <= 0)
       throw std::invalid_argument(
-          "lightweight-vehicle: invalid offboard timeout");
+          "lightweight-vehicle: invalid offboard timeout or command bounds");
     step_ns = int64_t(step_ms) * 1000000;
     output_ns = int64_t(output_ms) * 1000000;
+    max_future_ns = int64_t(max_future_ms) * 1000000;
+    max_pending = size_t(pending_limit);
     ground_z = initial[2];
     flight.reset();
     scout.reset();
     mecanum.reset();
     pending.clear();
     fcu_mode = "POSCTL";
-    refused_disarm = refused_mode = refused_offboard = {};
+    future_drops = full_drops = refused_disarm = refused_mode =
+        refused_offboard = {};
     if (kind == Kind::Flight)
       flight = std::make_unique<xgc_lightweight::FlightModel>(
           Eigen::Vector3d(initial[0], initial[1], initial[2]), initial[3],
@@ -137,8 +149,31 @@ struct Vehicle {
         throw std::invalid_argument("lightweight-vehicle: wrong input size");
       double stamp;
       std::memcpy(&stamp, sample.data, sizeof(stamp));
+      const int64_t effective = nanoseconds(stamp);
+      int64_t ahead;
+      const bool unrepresentable =
+          __builtin_sub_overflow(effective, sample.t_rx, &ahead);
+      if (unrepresentable || ahead > max_future_ns) {
+        if (future_drops.report())
+          log(XGC_LOG_WARN,
+              "dropped " + std::to_string(future_drops.count) +
+                  " control(s) stamped beyond max_future_ms after receipt "
+                  "(last " +
+                  (unrepresentable ? std::string("out of range")
+                                   : std::to_string(ahead / 1000000) +
+                                         " ms ahead") +
+                  ")");
+        continue;
+      }
+      if (pending.size() >= max_pending) {
+        if (full_drops.report())
+          log(XGC_LOG_WARN, "dropped " + std::to_string(full_drops.count) +
+                                " control(s): max_pending controls already "
+                                "queued");
+        continue;
+      }
       // Never use a future control early or rewrite an already integrated past.
-      Input input{std::max({time, sample.t_rx, nanoseconds(stamp)}), port, {}};
+      Input input{std::max({time, sample.t_rx, effective}), port, {}};
       std::memcpy(input.data.data(), sample.data, size);
       auto at = std::upper_bound(
           pending.begin(), pending.end(), input.at,
