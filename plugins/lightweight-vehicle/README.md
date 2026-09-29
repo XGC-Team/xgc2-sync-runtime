@@ -35,8 +35,20 @@ gravity and ground contact at the initial z. The minimal attitude model is
 level with ideal commanded yaw; it does not validate thrust, body rates, PX4
 inner loops, aerodynamic effects or EKF behavior. FORCE is rejected only when
 an acceleration axis is enabled; unused mask bits in the controller's
-position-only command have no effect. FCU mode requests are reflected in the
-synthetic state, including ALTCTL during takeoff initialization.
+position-only command have no effect. The reported angular rate is the yaw
+change actually integrated in the last step, not the last commanded rate.
+
+FCU requests follow PX4 only where the existing controller and Stop flows
+depend on it; a refused request leaves armed/mode unchanged and the next
+`fcu_state` shows it:
+
+| Request | Plant |
+| --- | --- |
+| `OFFBOARD` | Follows setpoints. Refused without a setpoint younger than `offboard_timeout_ms` (default 500). When the stream stops for that long the plant reports `AUTO.LOITER` and holds (PX4 `COM_OF_LOSS_T`). |
+| `POSCTL`, `ALTCTL`, `AUTO.LOITER` | Hold: brake to rest (0.2 s velocity time constant) and stay there; no RC sticks are modelled. |
+| `AUTO.LAND` | Descends at 0.7 m/s (PX4 default `MPC_LAND_SPEED`) with horizontal braking, then disarms on touchdown. |
+| Any other mode | Refused and logged; the previous mode stays. |
+| Disarm | Refused while more than 1 cm above the initial ground (no force flag exists in `xgc.fcu_request/1`). |
 
 Outputs `pose` and `velocity` are mandatory world-frame truth. Optional
 `paired_state` carries the same pose/velocity timestamp. FS150 also provides

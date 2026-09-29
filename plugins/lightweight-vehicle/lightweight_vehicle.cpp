@@ -38,6 +38,29 @@ int64_t nanoseconds(double seconds) {
   return static_cast<int64_t>(std::llround(seconds * 1e9));
 }
 
+// Counts a repeated condition; true on the 1st, 2nd, 4th, 8th... occurrence so
+// a persistent fault stays visible without flooding the health log.
+struct Occurrences {
+  uint64_t count{0};
+  bool report() {
+    ++count;
+    return (count & (count - 1)) == 0;
+  }
+};
+
+bool flight_mode(const std::string &name, xgc_lightweight::FlightMode *mode) {
+  using xgc_lightweight::FlightMode;
+  if (name == "OFFBOARD")
+    *mode = FlightMode::Offboard;
+  else if (name == "POSCTL" || name == "ALTCTL" || name == "AUTO.LOITER")
+    *mode = FlightMode::Hold;
+  else if (name == "AUTO.LAND")
+    *mode = FlightMode::Land;
+  else
+    return false;
+  return true;
+}
+
 struct Vehicle {
   const xgc_host_api *host;
   explicit Vehicle(const xgc_host_api *api) : host(api) {}
@@ -48,10 +71,13 @@ struct Vehicle {
   std::deque<Input> pending;
   int64_t epoch{0}, time{0}, step_ns{1000000}, output_ns{10000000},
       next_output{0};
-  double ground_z{0.0}, yaw{0.0}, yaw_rate{0.0};
+  double ground_z{0.0};
   std::string fcu_mode{"POSCTL"};
-  bool yaw_target_enabled{false};
-  double yaw_target{0.0};
+  Occurrences refused_disarm, refused_mode, refused_offboard;
+
+  void log(xgc_log_level level, const std::string &message) {
+    host->log(host->host, level, ("lightweight-vehicle: " + message).c_str());
+  }
 
   void configure(const char *text) {
     namespace cfg = xgc_rt_config;
@@ -69,7 +95,7 @@ struct Vehicle {
       throw std::invalid_argument(
           "lightweight-vehicle: shared epoch_ns is required");
     epoch = time = next_output = std::stoll(epoch_text);
-    int step_ms = 1, output_ms = 10;
+    int step_ms = 1, output_ms = 10, offboard_timeout_ms = 500;
     double initial[4]{0, 0, 0, 0};
     if (!cfg::integer(config, "step_ms", &step_ms) || step_ms <= 0 ||
         !cfg::integer(config, "output_ms", &output_ms) || output_ms < step_ms ||
@@ -78,26 +104,30 @@ struct Vehicle {
                      [](double v) { return std::isfinite(v); }))
       throw std::invalid_argument(
           "lightweight-vehicle: invalid step, output period or initial pose");
+    // PX4 COM_OF_LOSS_T role: a silent controller cannot fly the plant away.
+    if (!cfg::integer(config, "offboard_timeout_ms", &offboard_timeout_ms) ||
+        offboard_timeout_ms <= 0)
+      throw std::invalid_argument(
+          "lightweight-vehicle: invalid offboard timeout");
     step_ns = int64_t(step_ms) * 1000000;
     output_ns = int64_t(output_ms) * 1000000;
     ground_z = initial[2];
-    yaw = initial[3];
     flight.reset();
     scout.reset();
     mecanum.reset();
     pending.clear();
-    yaw_rate = 0;
-    yaw_target_enabled = false;
     fcu_mode = "POSCTL";
+    refused_disarm = refused_mode = refused_offboard = {};
     if (kind == Kind::Flight)
       flight = std::make_unique<xgc_lightweight::FlightModel>(
-          Eigen::Vector3d(initial[0], initial[1], initial[2]));
+          Eigen::Vector3d(initial[0], initial[1], initial[2]), initial[3],
+          offboard_timeout_ms * 1e-3);
     else if (kind == Kind::Scout)
       scout = std::make_unique<xgc_lightweight::ScoutModel>(
-          xgc2_math::Pose2{{initial[0], initial[1]}, yaw});
+          xgc2_math::Pose2{{initial[0], initial[1]}, initial[3]});
     else
       mecanum = std::make_unique<xgc_lightweight::MecanumModel>(
-          xgc2_math::Pose2{{initial[0], initial[1]}, yaw});
+          xgc2_math::Pose2{{initial[0], initial[1]}, initial[3]});
   }
 
   void drain(Port port, size_t size) {
@@ -146,14 +176,14 @@ struct Vehicle {
         value.velocity[i] = wire.velocity[i];
         value.acceleration[i] = wire.acceleration[i];
       }
-      flight->setpoint(value);
-      yaw_target_enabled = !(wire.type_mask & 1024);
-      yaw_target = wire.yaw;
-      yaw_rate = (wire.type_mask & 2048) ? 0.0 : wire.yaw_rate;
-      if ((yaw_target_enabled && !std::isfinite(yaw_target)) ||
-          !std::isfinite(yaw_rate))
+      value.yaw_enabled = !(wire.type_mask & 1024);
+      value.yaw = wire.yaw;
+      value.yaw_rate = (wire.type_mask & 2048) ? 0.0 : wire.yaw_rate;
+      if ((value.yaw_enabled && !std::isfinite(value.yaw)) ||
+          !std::isfinite(value.yaw_rate))
         throw std::invalid_argument(
             "lightweight-vehicle: nonfinite yaw command");
+      flight->setpoint(value);
     } else if (input.port == VelocityCommand) {
       xgc_twist_v1 value;
       std::memcpy(&value, input.data.data(), sizeof value);
@@ -176,16 +206,36 @@ struct Vehicle {
             "lightweight-vehicle: FCU request on ground model");
       xgc_fcu_request_v1 request;
       std::memcpy(&request, input.data.data(), sizeof request);
-      if (request.kind == 1)
-        flight->arm(request.arm != 0);
-      else if (request.kind == 2) {
+      // A refused request leaves armed/mode unchanged; the next fcu_state
+      // shows the refusal, as PX4's does.
+      if (request.kind == 1) {
+        if (!flight->request_arm(request.arm != 0) && refused_disarm.report())
+          log(XGC_LOG_WARN, "disarm refused while airborne (" +
+                                std::to_string(refused_disarm.count) +
+                                " time(s))");
+      } else if (request.kind == 2) {
         const auto end = static_cast<const char *>(
             std::memchr(request.mode, 0, sizeof request.mode));
         if (!end)
           throw std::invalid_argument(
               "lightweight-vehicle: unterminated FCU mode");
-        fcu_mode.assign(request.mode, static_cast<size_t>(end - request.mode));
-        flight->offboard(fcu_mode == "OFFBOARD");
+        const std::string name(request.mode,
+                               static_cast<size_t>(end - request.mode));
+        xgc_lightweight::FlightMode mode;
+        if (!flight_mode(name, &mode)) {
+          if (refused_mode.report())
+            log(XGC_LOG_WARN, "FCU mode " + name + " is not modelled; " +
+                                  fcu_mode + " kept (" +
+                                  std::to_string(refused_mode.count) +
+                                  " unmodelled mode request(s))");
+        } else if (!flight->request_mode(mode)) {
+          if (refused_offboard.report())
+            log(XGC_LOG_WARN, "OFFBOARD refused without a fresh setpoint; " +
+                                  fcu_mode + " kept (" +
+                                  std::to_string(refused_offboard.count) +
+                                  " time(s))");
+        } else
+          fcu_mode = name;
       } else
         throw std::invalid_argument(
             "lightweight-vehicle: unsupported FCU request");
@@ -208,7 +258,10 @@ struct Vehicle {
     xgc_imu_v1 imu{};
     imu.stamp = stamp;
     imu.accel[2] = 9.8066;
+    double yaw, yaw_rate;
     if (flight) {
+      yaw = flight->yaw();
+      yaw_rate = flight->yaw_rate();
       for (int i = 0; i != 3; ++i) {
         pose.position[i] = flight->state().position[i];
         velocity.linear[i] = flight->state().velocity[i];
@@ -267,11 +320,13 @@ struct Vehicle {
       }
       const double dt = double(step_ns) * 1e-9;
       if (flight) {
-        flight->step(dt);
-        if (flight->armed() && flight->offboard())
-          yaw = yaw_target_enabled
-                    ? yaw_target
-                    : xgc2_math::normalizeAngle(yaw + yaw_rate * dt);
+        const auto event = flight->step(dt);
+        if (event == xgc_lightweight::FlightEvent::OffboardLost) {
+          fcu_mode = "AUTO.LOITER";
+          log(XGC_LOG_WARN, "no setpoint for offboard_timeout_ms; holding in "
+                            "AUTO.LOITER");
+        } else if (event == xgc_lightweight::FlightEvent::Landed)
+          log(XGC_LOG_INFO, "AUTO.LAND touchdown; disarmed");
       } else if (scout)
         scout->advance(double(time + step_ns - epoch) * 1e-9);
       else

@@ -131,8 +131,21 @@ def main():
         mode = rospy.ServiceProxy('/fs150/mavros/set_mode', SetMode)
         assert not arm(command=176).success
         assert arm(command=400, param1=1).success
+        # Like PX4, the plant refuses OFFBOARD without a live setpoint stream.
+        hold = PositionTarget()
+        hold.coordinate_frame = 1
+        hold.type_mask = 3135
+
+        def streaming_offboard():
+            hold.header.stamp = rospy.Time.now()
+            setpoint.publish(hold)
+            return states[-1].armed and states[-1].mode == 'OFFBOARD'
+
+        for unused in range(10):
+            streaming_offboard()
+            time.sleep(.05)
         assert mode(custom_mode='OFFBOARD').mode_sent
-        wait_for(lambda:states[-1].armed and states[-1].mode == 'OFFBOARD', 'actual model mode and arm feedback')
+        wait_for(streaming_offboard, 'actual model mode and arm feedback')
         scout = Twist()
         scout.linear.x = .5
         mecanum = Twist()
@@ -161,8 +174,14 @@ def main():
             assert all(a.header.stamp < b.header.stamp for a, b in zip(poses[name], poses[name][1:]))
         for pub in publishers.values():
             pub.publish(Twist())
+        # An in-air disarm is refused, as by PX4; AUTO.LAND lands and disarms.
         assert arm(command=400, param1=0).success
-        wait_for(lambda:not states[-1].armed, 'model disarm')
+        time.sleep(.2)
+        assert states[-1].armed
+        assert mode(custom_mode='AUTO.LAND').mode_sent
+        wait_for(lambda:not states[-1].armed, 'AUTO.LAND touchdown disarm')
+        wait_for(lambda:poses['fs150'][-1].pose.position.z == 0.0, 'FS150 on the ground')
+        assert states[-1].mode == 'AUTO.LAND'
         result = {
             'scope':'three real native plants and ROS edges; no planner/controller/SITL/Gazebo',
             'elapsed':elapsed,
