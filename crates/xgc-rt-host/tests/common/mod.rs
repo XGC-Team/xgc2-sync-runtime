@@ -123,7 +123,7 @@ pub fn est_rigid_state() -> &'static (PathBuf, PathBuf) {
         std::fs::create_dir_all(&out).unwrap();
         let (lib, reference) = (out.join("libest_rigid_state.so"), out.join("eskf_reference"));
         let products = root.join("../..");
-        let estimator = std::env::var_os("ESKF_ROOT").map(PathBuf::from).unwrap_or_else(||
+        let estimator = std::env::var_os("ESKF_ROOT").filter(|path| !path.is_empty()).map(PathBuf::from).unwrap_or_else(||
             products.join("ros1/perception/estimator/rigid-state/estimator_vrpn_px4_rotor_state"));
         let inputs = [
             root.join("scripts/build-est-rigid-state.sh"),
