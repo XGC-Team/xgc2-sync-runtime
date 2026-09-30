@@ -11,7 +11,7 @@ establish deployment on a vehicle. Exact sources, commands and results are in
 | Hover-thrust estimator | `est-hover-thrust` | Upstream runtime and FSM; byte-equivalent replay and real estimator output in the five-module composition fixture. |
 | DFBC kernel | `ctl-dfbc` | Upstream controller functions; byte-equivalent kernel replay. This standalone plugin is distinct from the DFBC tracking backend inside `ctl-px4`. |
 | PX4 multirotor control | `ctl-px4` | Links current ROS-free controller core and real acados runtime; byte-equivalent PX4 local, DFBC and NMPC core traces. |
-| Reference generation | `ref-trajectory` | Links current ROS-free core; analytic, sampled and polynomial interfaces compared with the original ROS node and core. |
+| Reference generation | `ref-trajectory` | Links current ROS-free core; retained analytic/sample payloads and state sequences compared with the ROS node/core; UAV waypoint and external polynomial interfaces retired. |
 | ROS boundary | `ros-io` | Real ROS subscriptions, publications and service calls; contains the ROS dependencies. |
 | UGV control | No UGV domain wrapper in this tree | Upstream ROS-free core extraction is separate work; it is not an aggregated UGV deployment here. |
 | DMPC exchange | `dmpc-rounds` | Owns neighbor admission and round timing. A source round is delivered before the next planner beat; the planner does not apply a second delay. The 27 module tests pass on this integration tree. |

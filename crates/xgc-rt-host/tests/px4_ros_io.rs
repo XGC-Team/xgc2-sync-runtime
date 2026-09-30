@@ -192,7 +192,6 @@ bind = {{ imu = {{ channel = "imu", from = ["uav1"] }}, pose = {{ channel = "pos
                 "/uav1/hover_thrust/estimate_state",
                 "/uav1/alg/multirotor_reference_trajectory/request/analytic",
                 "/uav1/alg/multirotor_reference_trajectory/active/analytic",
-                "/uav1/alg/multirotor_reference_trajectory/active/polynomial",
                 "/uav1/alg/multirotor_reference_trajectory/active/sampled",
             ]);
             c.env("ROS_HOME", &ros_home).env("ROS_MASTER_URI", &master).stdout(Stdio::null()).stderr(Stdio::null());

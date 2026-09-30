@@ -40,7 +40,7 @@ fi
 gen="$(dirname "$1")/ros-io-gen"
 rm -rf "$gen"
 for msg in formation_generator/AssumedTrajectory formation_generator/FormationTick periodic_sync/SyncTrigger rigid_state_estimator_msgs/RigidStateEstimate \
-  multirotor_reference_trajectory_msgs/{AnalyticReference,SampledReference,FlatReferencePoint,WaypointReferenceRequest,ActivePolynomialReference,ReferenceStatus} \
+  multirotor_reference_trajectory_msgs/{AnalyticReference,SampledReference,FlatReferencePoint,ReferenceStatus} \
   hover_thrust_estimator_msgs/HoverThrustEstimate \
   xgc2_geometry_msgs/{SceneGeometry,ScenePart,SceneObstacle,SceneObstacleState,SceneSnapshot,SceneState} \
   unicycle_reference_trajectory_msgs/PlanarPvaReference; do

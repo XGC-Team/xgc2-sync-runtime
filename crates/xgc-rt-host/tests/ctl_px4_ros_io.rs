@@ -102,7 +102,6 @@ fn fly(backend: &str, native_hover: bool) {
             ("ref_request", "event"),
             ("ref_status", "state"),
             ("ref_active_analytic", "state"),
-            ("ref_active_polynomial", "state"),
             ("ref_active_sampled", "state"),
         ]);
     }
@@ -123,7 +122,7 @@ name = "ref-trajectory"
 path = "{module}"
 trigger = "on_round"
 config = {{ time_source = "session" }}
-bind = {{ analytic = {{ channel = "ref_request", from = ["uav1"] }}, status = {{ channel = "ref_status" }}, active_analytic = {{ channel = "ref_active_analytic" }}, active_polynomial = {{ channel = "ref_active_polynomial" }}, active_sampled = {{ channel = "ref_active_sampled" }} }}
+bind = {{ analytic = {{ channel = "ref_request", from = ["uav1"] }}, status = {{ channel = "ref_status" }}, active_analytic = {{ channel = "ref_active_analytic" }}, active_sampled = {{ channel = "ref_active_sampled" }} }}
 "#,
             module = module.display()
         )
@@ -131,7 +130,7 @@ bind = {{ analytic = {{ channel = "ref_request", from = ["uav1"] }}, status = {{
         String::new()
     };
     let ctl_refs = if reference {
-        r#", ref_request = { channel = "ref_request" }, ref_active_analytic = { channel = "ref_active_analytic", from = ["uav1"] }, ref_active_polynomial = { channel = "ref_active_polynomial", from = ["uav1"] }, ref_active_sampled = { channel = "ref_active_sampled", from = ["uav1"] }"#
+        r#", ref_request = { channel = "ref_request" }, ref_active_analytic = { channel = "ref_active_analytic", from = ["uav1"] }, ref_active_sampled = { channel = "ref_active_sampled", from = ["uav1"] }"#
     } else {
         ""
     };

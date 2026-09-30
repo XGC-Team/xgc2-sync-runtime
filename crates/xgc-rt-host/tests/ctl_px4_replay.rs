@@ -34,7 +34,7 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
 // Channel ids = ctl-px4 port indices (the stream converter emits those).
-const CHANNELS: [(&str, Qos); 20] = [
+const CHANNELS: [(&str, Qos); 19] = [
     ("estimate", Qos::State),
     ("local_pose", Qos::State),
     ("local_velocity", Qos::State),
@@ -52,11 +52,10 @@ const CHANNELS: [(&str, Qos); 20] = [
     ("alg_setpoint", Qos::Control),
     ("hover_thrust", Qos::State),
     ("ref_active_analytic", Qos::State),
-    ("ref_active_polynomial", Qos::State),
     ("ref_active_sampled", Qos::State),
     ("ref_request", Qos::Event),
 ];
-const INPUTS: [u32; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 18];
+const INPUTS: [u32; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17];
 const CLOCK: u32 = 8;
 const TRACE: u32 = 13;
 

@@ -17,7 +17,6 @@
 
 #include <multirotor_reference_trajectory_msgs/AnalyticReference.h>
 #include <multirotor_reference_trajectory_msgs/SampledReference.h>
-#include <multirotor_reference_trajectory_msgs/WaypointReferenceRequest.h>
 #include <ros/serialization.h>
 
 #include "reference_wire.hpp"
@@ -63,12 +62,11 @@ int main(int argc, char** argv) {
     if (len > 0 && !in.read(reinterpret_cast<char*>(d.data()), len)) throw std::runtime_error("truncated stream");
     switch (kind) {
       case 1: emit(t, 0, xgc_ref_wire::encode_analytic(decode<msgs::AnalyticReference>(d))); break;
-      case 2: emit(t, 1, xgc_ref_wire::encode_waypoint_request(decode<msgs::WaypointReferenceRequest>(d))); break;
-      case 3: emit(t, 2, xgc_ref_wire::encode_sampled(decode<msgs::SampledReference>(d))); break;
+      case 3: emit(t, 1, xgc_ref_wire::encode_sampled(decode<msgs::SampledReference>(d))); break;
       case 4: {
         const xgc_ref_reset_v1 r{};
         const auto* b = reinterpret_cast<const uint8_t*>(&r);
-        emit(t, 3, std::vector<uint8_t>(b, b + sizeof r));
+        emit(t, 2, std::vector<uint8_t>(b, b + sizeof r));
         break;
       }
       default:

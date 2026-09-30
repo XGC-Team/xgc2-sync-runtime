@@ -3,7 +3,7 @@
 //! as the node's 100 Hz loop). Next to it runs the unchanged
 //! multirotor_reference_trajectory node (its own launch file). ref_compare.py
 //! sends the same requests to both (module: /uav1, node: /uav2): analytic
-//! curves, a sampled reference, two MINCO waypoint plans, reset, expiry. Per
+//! curves, a sampled reference, reset, expiry. Per
 //! trajectory, the active references each side publishes must be equal field
 //! for field and bit for bit, except the receive-time-dependent header stamps
 //! and start times; the status sequences must match.
@@ -79,9 +79,6 @@ dir = "audit"
 name = "analytic"
 qos = "event"
 [[channel]]
-name = "waypoint"
-qos = "event"
-[[channel]]
 name = "sampled"
 qos = "event"
 [[channel]]
@@ -94,9 +91,6 @@ qos = "state"
 name = "active_analytic"
 qos = "state"
 [[channel]]
-name = "active_polynomial"
-qos = "state"
-[[channel]]
 name = "active_sampled"
 qos = "state"
 
@@ -104,15 +98,15 @@ qos = "state"
 name = "ros_io"
 path = "{ros_io}"
 trigger = "on_round"
-config = {{ node_name = "xgc_ros_io_uav1", ref_analytic_topic = "{base}/request/analytic", ref_waypoint_topic = "{base}/request/waypoint", ref_sampled_topic = "{base}/request/sampled", ref_reset_topic = "{base}/reset", ref_status_topic = "{base}/status", ref_active_analytic_topic = "{base}/active/analytic", ref_active_polynomial_topic = "{base}/active/polynomial", ref_active_sampled_topic = "{base}/active/sampled" }}
-bind = {{ ref_analytic = {{ channel = "analytic" }}, ref_waypoint = {{ channel = "waypoint" }}, ref_sampled = {{ channel = "sampled" }}, ref_reset = {{ channel = "reset" }}, ref_status = {{ channel = "status", from = ["uav1"] }}, ref_active_analytic = {{ channel = "active_analytic", from = ["uav1"] }}, ref_active_polynomial = {{ channel = "active_polynomial", from = ["uav1"] }}, ref_active_sampled = {{ channel = "active_sampled", from = ["uav1"] }} }}
+config = {{ node_name = "xgc_ros_io_uav1", ref_analytic_topic = "{base}/request/analytic", ref_sampled_topic = "{base}/request/sampled", ref_reset_topic = "{base}/reset", ref_status_topic = "{base}/status", ref_active_analytic_topic = "{base}/active/analytic", ref_active_sampled_topic = "{base}/active/sampled" }}
+bind = {{ ref_analytic = {{ channel = "analytic" }}, ref_sampled = {{ channel = "sampled" }}, ref_reset = {{ channel = "reset" }}, ref_status = {{ channel = "status", from = ["uav1"] }}, ref_active_analytic = {{ channel = "active_analytic", from = ["uav1"] }}, ref_active_sampled = {{ channel = "active_sampled", from = ["uav1"] }} }}
 
 [[plugin]]
 name = "ref-trajectory"
 path = "{module}"
 trigger = "on_round"
 config = {{ time_source = "session" }}
-bind = {{ analytic = {{ channel = "analytic", from = ["uav1"] }}, waypoint = {{ channel = "waypoint", from = ["uav1"] }}, sampled = {{ channel = "sampled", from = ["uav1"] }}, reset = {{ channel = "reset", from = ["uav1"] }}, status = {{ channel = "status" }}, active_analytic = {{ channel = "active_analytic" }}, active_polynomial = {{ channel = "active_polynomial" }}, active_sampled = {{ channel = "active_sampled" }} }}
+bind = {{ analytic = {{ channel = "analytic", from = ["uav1"] }}, sampled = {{ channel = "sampled", from = ["uav1"] }}, reset = {{ channel = "reset", from = ["uav1"] }}, status = {{ channel = "status" }}, active_analytic = {{ channel = "active_analytic" }}, active_sampled = {{ channel = "active_sampled" }} }}
 "#,
         ros_io = ros_io.display(),
         module = module.display(),
@@ -171,10 +165,9 @@ bind = {{ analytic = {{ channel = "analytic", from = ["uav1"] }}, waypoint = {{ 
     }
     assert_eq!(r["ready"], true, "both sides up (see {}/node.log)", dir.display());
     let sent = r["sent"].as_array().unwrap();
-    assert_eq!(sent.len(), 7, "all active references seen");
+    assert_eq!(sent.len(), 5, "all active references seen");
     assert!(sent.iter().all(|s| s["both"] == true), "every request activated on both sides: {sent:?}");
-    assert_eq!(r["compared"].as_u64().unwrap(), 7);
+    assert_eq!(r["compared"].as_u64().unwrap(), 5);
     assert!(r["diffs"].as_object().unwrap().is_empty(), "module and node differ: {}", r["diffs"]);
     assert_eq!(r["states_module"], r["states_node"], "status sequences");
-    assert!(r["polynomial_coeffs"].as_u64().unwrap() > 0);
 }
