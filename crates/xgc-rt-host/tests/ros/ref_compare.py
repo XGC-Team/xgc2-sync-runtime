@@ -16,9 +16,8 @@ import threading
 
 import rospy
 from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
-from multirotor_reference_trajectory_msgs.msg import (ActivePolynomialReference, AnalyticReference,
-                                                      FlatReferencePoint, ReferenceStatus, SampledReference,
-                                                      WaypointReferenceRequest)
+from multirotor_reference_trajectory_msgs.msg import (AnalyticReference,
+                                                      FlatReferencePoint, ReferenceStatus, SampledReference)
 from std_msgs.msg import Empty
 
 BASE = "alg/multirotor_reference_trajectory/"
@@ -48,12 +47,10 @@ def on_status(side):
 pubs = {}
 for s in SIDES:
     rospy.Subscriber(s + BASE + "active/analytic", AnalyticReference, keep(s, "analytic"))
-    rospy.Subscriber(s + BASE + "active/polynomial", ActivePolynomialReference, keep(s, "polynomial"))
     rospy.Subscriber(s + BASE + "active/sampled", SampledReference, keep(s, "sampled"))
     rospy.Subscriber(s + BASE + "status", ReferenceStatus, on_status(s))
     pubs[s] = {
         "analytic": rospy.Publisher(s + BASE + "request/analytic", AnalyticReference, queue_size=5),
-        "waypoint": rospy.Publisher(s + BASE + "request/waypoint", WaypointReferenceRequest, queue_size=5),
         "sampled": rospy.Publisher(s + BASE + "request/sampled", SampledReference, queue_size=5),
         "reset": rospy.Publisher(s + BASE + "reset", Empty, queue_size=5),
     }
@@ -115,29 +112,12 @@ def sampled(tid):
     send("sampled", m, ("sampled", tid, 1))
 
 
-def waypoints(tid, points, segment_times=(), constraints=(), sizes=(), revision=3):
-    m = WaypointReferenceRequest()
-    m.header.stamp = rospy.Time.now()
-    m.trajectory_id, m.revision = tid, revision
-    m.waypoints = [pose(*p) for p in points]
-    m.constraint_types = list(constraints)
-    m.region_size = [Vector3(*s) for s in sizes]
-    m.segment_times = list(segment_times)
-    m.desired_speed, m.time_weight, m.max_iterations, m.rel_cost_tol = 1.0, 0.1, 80, 1.0e-5
-    m.objective = WaypointReferenceRequest.OBJECTIVE_MINCO
-    send("waypoint", m, ("polynomial", tid, revision))
-
-
-A, W = AnalyticReference, WaypointReferenceRequest
+A = AnalyticReference
 if ready:
     analytic(1, A.ANALYTIC_CIRCLE_ENTRY, [1.5, 1.0, 1.2, 0.2, 0.3, 2.0, 0.5, -0.5], duration=8.0)
     analytic(2, A.ANALYTIC_LINE, [2.0, 1.0, 1.5, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0], duration=4.0)
     analytic(3, A.ANALYTIC_TORUS_KNOT, [0.3, 0.3, 2.0, 0.2, 0.1, 1.6], duration=10.0)
     sampled(4)
-    waypoints(5, [(0, 0, 1), (1, 0.5, 1.2), (2, 0, 1)], segment_times=(1.0, 1.0))
-    waypoints(6, [(0, 0, 1), (1, 1, 1.5), (2, 0, 1.2), (3, 1, 1)],
-              constraints=(W.CONSTRAINT_POINT, W.CONSTRAINT_SPHERE, W.CONSTRAINT_BOX, W.CONSTRAINT_POINT),
-              sizes=((0, 0, 0), (0.2, 0.2, 0.2), (0.3, 0.2, 0.1), (0, 0, 0)))
     send("reset", Empty())
     analytic(7, A.ANALYTIC_HOLD, [], duration=1.0)
     rospy.sleep(2.5)  # expires on both sides -> Ready
@@ -179,7 +159,6 @@ with lock:
         d = same(a, b)
         if d:
             diffs[f"{k[0]}:{k[1]}"] = d[:5]
-    poly = [active[SIDES[0]][k] for k in keys if k[0] == "polynomial" and k in active[SIDES[0]]]
     result = {
         "ready": ready,
         "sent": sent,
@@ -187,6 +166,5 @@ with lock:
         "diffs": diffs,
         "states_module": states[SIDES[0]],
         "states_node": states[SIDES[1]],
-        "polynomial_coeffs": sum(len(p.coeff_x) + len(p.coeff_y) + len(p.coeff_z) + len(p.coeff_yaw) for p in poly),
     }
 print(json.dumps(result), flush=True)

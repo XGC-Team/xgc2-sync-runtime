@@ -31,20 +31,18 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 
 // Channel ids = ref-trajectory port indices (the stream converter emits those).
-const CHANNELS: [(&str, Qos); 10] = [
+const CHANNELS: [(&str, Qos); 8] = [
     ("analytic", Qos::Event),
-    ("waypoint", Qos::Event),
     ("sampled", Qos::Event),
     ("reset", Qos::Event),
     ("clock", Qos::Event),
     ("status", Qos::State),
     ("active_analytic", Qos::State),
-    ("active_polynomial", Qos::State),
     ("active_sampled", Qos::State),
     ("trace", Qos::Bulk),
 ];
-const CLOCK: u32 = 4;
-const TRACE: u32 = 9;
+const CLOCK: u32 = 3;
+const TRACE: u32 = 7;
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).filter(|p| p.exists())

@@ -3,24 +3,20 @@
 //
 // Runs multirotor_reference_trajectory_core, the ROS-free runtime of
 // xgc2-multirotor-controller's multirotor_reference_trajectory (analytic
-// curves, sampled references, MINCO waypoint plans, and the state machine
+// curves, sampled references, and the state machine
 // that activates them), behind module I/O. What the ROS node's input
 // producer and output consumer did becomes ports; ros_io does the ROS side.
 //
 //   in  analytic         xgc.ref.analytic/1          (request/analytic)
-//   in  waypoint         xgc.ref.waypoint_request/1  (request/waypoint)
 //   in  sampled          xgc.ref.sampled/1           (request/sampled)
 //   in  reset            xgc.ref.reset/1             (reset)
 //   in  clock            xgc.clock/1                 (optional; replay: advance time)
 //   out status           xgc.ref.status/1            (status)
 //   out active_analytic  xgc.ref.analytic/1          (active/analytic)
-//   out active_polynomial xgc.ref.polynomial/1       (active/polynomial)
 //   out active_sampled   xgc.ref.sampled/1           (active/sampled)
 //   out trace            xgc.text/1                  (optional; replay trace)
 //
-// Every request's receive time is its envelope t_produce. Waypoint plans are
-// solved inline by default (inline_planning), so the module's thread is the
-// only one and runs are deterministic; the result arrives at the next update.
+// Every request's receive time is its envelope t_produce.
 //
 // time_source:
 //   "session" (default)  one runtime update per round at Session time (the
@@ -33,7 +29,7 @@
 //                        test/replay/reference_replay_harness.cpp) exactly;
 //                        with trace = true the trace port carries its lines.
 //
-// Config: time_source, trace, inline_planning, status_rate,
+// Config: time_source, trace, status_rate,
 // active_publish_rate, validation_sample_dt, trajectory_timeout,
 // min_lead_time, max_velocity, max_acceleration, max_jerk, max_snap,
 // min_specific_thrust (defaults: config/multirotor_reference_trajectory.yaml).
@@ -64,8 +60,8 @@ namespace sm = state_machine;
 namespace trajectory = xgc2_math::trajectory;
 
 enum Port : uint32_t {
-  kAnalytic, kWaypoint, kSampled, kReset, kClock,
-  kStatus, kActiveAnalytic, kActivePolynomial, kActiveSampled, kTrace, kPortCount
+  kAnalytic, kSampled, kReset, kClock,
+  kStatus, kActiveAnalytic, kActiveSampled, kTrace, kPortCount
 };
 
 struct Input {
@@ -123,19 +119,6 @@ struct Text {
     d(m.origin.orientation.x); d(m.origin.orientation.y); d(m.origin.orientation.z); d(m.origin.orientation.w);
     ds(m.params);
   }
-  void polynomial(const ref::ActivePolynomialReference& m) {
-    s += " polynomial";
-    header(m.header);
-    f(" id %u rev %u fl %u", m.trajectory_id, m.revision, m.flags);
-    t(m.start_time);
-    d(m.duration);
-    f(" order %u", m.order);
-    ds(m.segment_durations);
-    ds(m.coeff_x);
-    ds(m.coeff_y);
-    ds(m.coeff_z);
-    ds(m.coeff_yaw);
-  }
   void sampled(const ref::SampledReference& m) {
     s += " sampled";
     header(m.header);
@@ -178,7 +161,6 @@ struct RefTrajectory {
 
   RefTrajectory() {
     config.limits.min_specific_thrust = 0.1;
-    config.inline_planning = true;
   }
 
   void log(xgc_log_level level, const std::string& m) const { host->log(host->host, level, m.c_str()); }
@@ -207,7 +189,8 @@ struct RefTrajectory {
   // One request, exactly as the node's input producer callback for it.
   void apply(const Input& in) {
     const double now = mrt::Time().fromNSec(in.t_ns).toSec();
-    if (trace) text.f("%" PRIu64 " in %u\n", k, in.port + 1);
+    const uint32_t record_kind = in.port == kAnalytic ? 1U : in.port == kSampled ? 3U : 4U;
+    if (trace) text.f("%" PRIu64 " in %u\n", k, record_kind);
     bool accepted = false;
     uint32_t event = 0;
     const char* source = "";
@@ -217,14 +200,6 @@ struct RefTrajectory {
         accepted = xgc_ref_wire::decode_analytic(in.data.data(), in.data.size(), m) && runtime.acceptAnalytic(m);
         event = mrt::event_type::ANALYTIC_RECEIVED;
         source = "analytic_reference";
-        break;
-      }
-      case kWaypoint: {
-        ref::WaypointReferenceRequest m;
-        accepted =
-            xgc_ref_wire::decode_waypoint_request(in.data.data(), in.data.size(), m) && runtime.acceptWaypoint(m);
-        event = mrt::event_type::WAYPOINT_RECEIVED;
-        source = "waypoint_reference";
         break;
       }
       case kSampled: {
@@ -292,9 +267,7 @@ struct RefTrajectory {
       } else if (e.id == mrt::output_event_type::PUBLISH_ACTIVE_ANALYTIC) {
         publish(kActiveAnalytic, round, xgc_ref_wire::encode_analytic(runtime.activeAnalyticMessage()));
         if (trace) text.analytic(runtime.activeAnalyticMessage());
-      } else if (e.id == mrt::output_event_type::PUBLISH_ACTIVE_POLYNOMIAL) {
-        publish(kActivePolynomial, round, xgc_ref_wire::encode_polynomial(runtime.activePolynomialMessage()));
-        if (trace) text.polynomial(runtime.activePolynomialMessage());
+
       } else if (e.id == mrt::output_event_type::PUBLISH_ACTIVE_SAMPLED) {
         publish(kActiveSampled, round, xgc_ref_wire::encode_sampled(runtime.activeSampledMessage()));
         if (trace) text.sampled(runtime.activeSampledMessage());
@@ -304,7 +277,7 @@ struct RefTrajectory {
     if (runtime.currentState() != last_state) {
       if (trace) text.f("%" PRIu64 " state %u\n", k, runtime.currentState());
       last_state = runtime.currentState();
-      static const char* const kNames[] = {"", "SelfCheck", "Ready", "Planning", "Active"};
+      static const char* const kNames[] = {"", "SelfCheck", "Ready", "", "Active"};
       domain = last_state < 5 ? kNames[last_state] : "unknown";
     }
     if (runtime.flags() != last_flags) {
@@ -316,8 +289,7 @@ struct RefTrajectory {
       start = runtime.activeAnalyticMessage().start_time;
     } else if (runtime.activeType() == trajectory::TrajectoryModelType::kSampled) {
       start = runtime.activeSampledMessage().start_time;
-    } else if (runtime.activeType() == trajectory::TrajectoryModelType::kPolynomial) {
-      start = runtime.activePolynomialMessage().start_time;
+
     }
     const std::tuple<int, uint32_t, uint32_t, uint64_t> active{static_cast<int>(runtime.activeType()),
                                                                runtime.activeTrajectoryId(), runtime.activeRevision(),
@@ -332,7 +304,7 @@ struct RefTrajectory {
 
   void drain(std::vector<Input>& into) {
     xgc_sample_view v;
-    for (uint32_t port : {kAnalytic, kWaypoint, kSampled, kReset, kClock}) {
+    for (uint32_t port : {kAnalytic, kSampled, kReset, kClock}) {
       while (host->next(host->host, port, &v) == XGC_OK) {
         if (port == kClock) {
           xgc_clock_v1 c;
@@ -413,7 +385,7 @@ xgc_status configure(void* p, const char* config) {
     const std::string t = config ? config : "";
     mrt::ReferenceTrajectoryConfig& c = self->config;
     const std::string source = cfg::text_or(t, "time_source", "session");
-    const bool ok = cfg::boolean(t, "trace", &self->trace) && cfg::boolean(t, "inline_planning", &c.inline_planning) &&
+    const bool ok = cfg::boolean(t, "trace", &self->trace) &&
                     cfg::number(t, "status_rate", &c.status_rate_hz) &&
                     cfg::number(t, "active_publish_rate", &c.active_publish_rate_hz) &&
                     cfg::number(t, "validation_sample_dt", &c.validation_sample_dt) &&
@@ -449,13 +421,11 @@ const char* domain_state(void* p) { return static_cast<RefTrajectory*>(p)->domai
 
 const xgc_port_decl kPorts[kPortCount] = {
     {"analytic", XGC_PORT_IN_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_EVENT},
-    {"waypoint", XGC_PORT_IN_OPTIONAL, "xgc.ref.waypoint_request/1", XGC_QOS_EVENT},
     {"sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_EVENT},
     {"reset", XGC_PORT_IN_OPTIONAL, "xgc.ref.reset/1", XGC_QOS_EVENT},
     {"clock", XGC_PORT_IN_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
     {"status", XGC_PORT_OUT, "xgc.ref.status/1", XGC_QOS_STATE},
     {"active_analytic", XGC_PORT_OUT_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_STATE},
-    {"active_polynomial", XGC_PORT_OUT_OPTIONAL, "xgc.ref.polynomial/1", XGC_QOS_STATE},
     {"active_sampled", XGC_PORT_OUT_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
     {"trace", XGC_PORT_OUT_OPTIONAL, "xgc.text/1", XGC_QOS_BULK},
 };

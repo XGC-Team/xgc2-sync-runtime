@@ -20,7 +20,6 @@
 #include <hover_thrust_estimator_msgs/HoverThrustEstimate.h>
 #include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/State.h>
-#include <multirotor_reference_trajectory_msgs/ActivePolynomialReference.h>
 #include <multirotor_reference_trajectory_msgs/AnalyticReference.h>
 #include <multirotor_reference_trajectory_msgs/SampledReference.h>
 #include <rigid_state_estimator_msgs/RigidStateEstimate.h>
@@ -179,12 +178,11 @@ int main(int argc, char** argv) {
         emit(t, 15, &s, sizeof s);
         break;
       }
-      case 11: case 12: case 13: {  // active references -> ref_active_* (ports 16-18)
+      case 11: case 13: {  // active references -> ref_active_* (ports 16-17)
         namespace rm = multirotor_reference_trajectory_msgs;
         const auto bytes = kind == 11   ? xgc_ref_wire::encode_analytic(decode<rm::AnalyticReference>(d))
-                           : kind == 12 ? xgc_ref_wire::encode_polynomial(decode<rm::ActivePolynomialReference>(d))
                                         : xgc_ref_wire::encode_sampled(decode<rm::SampledReference>(d));
-        emit(t, 16 + (kind - 11), bytes.data(), static_cast<uint32_t>(bytes.size()));
+        emit(t, kind == 11 ? 16 : 17, bytes.data(), static_cast<uint32_t>(bytes.size()));
         break;
       }
       default:

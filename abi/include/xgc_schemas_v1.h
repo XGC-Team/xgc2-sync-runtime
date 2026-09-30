@@ -317,61 +317,6 @@ typedef struct xgc_ref_sampled_v1 {
   double sample_dt;
 } xgc_ref_sampled_v1;
 
-/* "xgc.ref.waypoint_request/1": WaypointReferenceRequest; then
- * waypoints_len poses (7 doubles: position xyz, orientation xyzw),
- * constraint_types_len uint8 (zero-padded to a multiple of 8 bytes),
- * region_size_len vectors (3 doubles) and segment_times_len doubles. */
-typedef struct xgc_ref_waypoint_request_v1 {
-  xgc_ref_header_v1 header;
-  uint32_t request_id;
-  uint32_t trajectory_id;
-  uint32_t revision;
-  uint32_t flags;
-  uint32_t waypoints_len;
-  uint32_t constraint_types_len;
-  uint32_t region_size_len;
-  uint32_t segment_times_len;
-  double start_velocity[3];
-  double start_acceleration[3];
-  double end_velocity[3];
-  double end_acceleration[3];
-  double desired_speed;
-  double time_weight;
-  double max_body_rate;
-  double max_tilt;
-  double min_thrust;
-  double max_thrust;
-  uint32_t max_iterations;
-  uint8_t objective;
-  uint8_t reserved[3];
-  double rel_cost_tol;
-  double max_velocity;
-  double max_acceleration;
-  double max_jerk;
-  double max_snap;
-} xgc_ref_waypoint_request_v1;
-
-/* "xgc.ref.polynomial/1": ActivePolynomialReference; then
- * segment_durations_len, coeff_x_len, coeff_y_len, coeff_z_len and
- * coeff_yaw_len doubles, in that order. */
-typedef struct xgc_ref_polynomial_v1 {
-  xgc_ref_header_v1 header;
-  uint32_t trajectory_id;
-  uint32_t revision;
-  uint32_t flags;
-  uint8_t order;
-  uint8_t reserved[3];
-  uint32_t start_sec;
-  uint32_t start_nsec;
-  double duration;
-  uint32_t segment_durations_len;
-  uint32_t coeff_x_len;
-  uint32_t coeff_y_len;
-  uint32_t coeff_z_len;
-  uint32_t coeff_yaw_len;
-  uint32_t reserved2;
-} xgc_ref_polynomial_v1;
-
 /* "xgc.ref.status/1": ReferenceStatus. */
 typedef struct xgc_ref_status_v1 {
   xgc_ref_header_v1 header;
@@ -419,8 +364,6 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_ref_header_v1) == 48, "xgc_ref_header_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_analytic_v1) == 144, "xgc_ref_analytic_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_flat_point_v1) == 152, "xgc_ref_flat_point_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_sampled_v1) == 80, "xgc_ref_sampled_v1");
-XGC_SCHEMA_ASSERT(sizeof(xgc_ref_waypoint_request_v1) == 272, "xgc_ref_waypoint_request_v1");
-XGC_SCHEMA_ASSERT(sizeof(xgc_ref_polynomial_v1) == 104, "xgc_ref_polynomial_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_status_v1) == 64, "xgc_ref_status_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_reset_v1) == 8, "xgc_ref_reset_v1");
 

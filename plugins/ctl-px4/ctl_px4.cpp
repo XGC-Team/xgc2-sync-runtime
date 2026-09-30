@@ -17,7 +17,6 @@
 //   in  alg_setpoint    xgc.position_target/1       (optional; planner setpoint, alg/setpoint_raw/local)
 //   in  hover_thrust    xgc.hover_thrust/1          (optional; hover_thrust/estimate_state)
 //   in  ref_active_analytic   xgc.ref.analytic/1    (optional; the reference generator's active
-//   in  ref_active_polynomial xgc.ref.polynomial/1   reference, for the nmpc and dfbc
 //   in  ref_active_sampled    xgc.ref.sampled/1      Custom1 backends)
 //   out ref_request     xgc.ref.analytic/1          (optional; the reference Custom1 activates,
 //                                                    to the reference generator's analytic input)
@@ -96,7 +95,7 @@ namespace sm = state_machine;
 enum Port : uint32_t {
   kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
   kSetpoint, kAttitudeRate, kFcuRequest, kStatus, kTrace, kAlgSetpoint, kHoverThrust,
-  kRefActiveAnalytic, kRefActivePolynomial, kRefActiveSampled, kRefRequest, kTickDone, kPortCount
+  kRefActiveAnalytic, kRefActiveSampled, kRefRequest, kTickDone, kPortCount
 };
 constexpr uint32_t kFirstStatsPort = kEstimate;
 constexpr uint32_t kStatsPorts = 7;  // estimate .. vrpn_pose, in port order
@@ -347,8 +346,7 @@ struct CtlPx4 {
         break;
       }
       case kRefActiveAnalytic:
-      case kRefActivePolynomial:
-      case kRefActiveSampled: {  // TrajectoryInputProducer::active{Analytic,Polynomial,Sampled}Callback
+      case kRefActiveSampled: {  // TrajectoryInputProducer::active{Analytic,Sampled}Callback
         auto& cache = controller.activeTrajectoryCache();
         const pmc::Time received = pmc::Time().fromNSec(in.t_ns);
         bool accepted = false;
@@ -357,11 +355,6 @@ struct CtlPx4 {
           pmc::reference::AnalyticReference m;
           accepted = xgc_ref_wire::decode_analytic(in.data.data(), in.data.size(), m) && cache.updateAnalytic(m, received);
           source = "alg/multirotor_reference_trajectory/active/analytic";
-        } else if (in.port == kRefActivePolynomial) {
-          pmc::reference::ActivePolynomialReference m;
-          accepted =
-              xgc_ref_wire::decode_polynomial(in.data.data(), in.data.size(), m) && cache.updatePolynomial(m, received);
-          source = "alg/multirotor_reference_trajectory/active/polynomial";
         } else {
           pmc::reference::SampledReference m;
           accepted = xgc_ref_wire::decode_sampled(in.data.data(), in.data.size(), m) && cache.updateSampled(m, received);
@@ -566,7 +559,7 @@ struct CtlPx4 {
   void drain(std::vector<Input>& into) {
     xgc_sample_view v;
     for (uint32_t port : {kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
-                          kAlgSetpoint, kHoverThrust, kRefActiveAnalytic, kRefActivePolynomial, kRefActiveSampled}) {
+                          kAlgSetpoint, kHoverThrust, kRefActiveAnalytic, kRefActiveSampled}) {
       while (host->next(host->host, port, &v) == XGC_OK) {
         if (port == kClock) {
           xgc_clock_v1 c;
@@ -711,7 +704,6 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"alg_setpoint", XGC_PORT_IN_OPTIONAL, "xgc.position_target/1", XGC_QOS_CONTROL},
     {"hover_thrust", XGC_PORT_IN_OPTIONAL, "xgc.hover_thrust/1", XGC_QOS_STATE},
     {"ref_active_analytic", XGC_PORT_IN_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_STATE},
-    {"ref_active_polynomial", XGC_PORT_IN_OPTIONAL, "xgc.ref.polynomial/1", XGC_QOS_STATE},
     {"ref_active_sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
     {"ref_request", XGC_PORT_OUT_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_EVENT},
     {"tick_done", XGC_PORT_OUT_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
