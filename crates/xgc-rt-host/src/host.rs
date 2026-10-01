@@ -32,7 +32,10 @@
 //!
 //! **Wake rule.** A module thread sleeps until its next round boundary (for
 //! `on_round`/`both`), a new sample (for `on_dirty`/`both`), a pending
-//! restart or stop. It never busy-polls.
+//! restart or stop. It never busy-polls. A delivery signals the thread only
+//! when it sleeps waiting for input: the first sample of a burst wakes it,
+//! and samples for a thread that is running, already woken or waiting only
+//! for its round cost no wakeup.
 //!
 //! **Stop.** Each module thread finishes its current step, deactivates and
 //! destroys its instance. A sample written after its reader stopped is not
@@ -217,6 +220,12 @@ struct Inner {
     dropped: u64,
     schedule: Option<RoundSchedule>,
     stop: bool,
+    /// The module thread sleeps in `Instance::wait` and a new sample ends
+    /// that sleep (`on_dirty`/`both`). Only then does a delivery notify:
+    /// std's futex `Condvar::notify_one` makes a syscall whether or not a
+    /// thread waits, and an `on_round` thread would wake only to sleep again.
+    /// The delivery that notifies clears it, so the rest of a burst does not.
+    input_waiter: bool,
 }
 
 /// One running instance of a module: its thread's inputs and wake signal.
@@ -231,18 +240,23 @@ struct Instance {
     in_step: AtomicBool,
     abandoned: AtomicBool,
     done: AtomicBool,
+    /// Deliveries that notified the module thread.
+    #[cfg(test)]
+    notified: AtomicU64,
 }
 
 impl Instance {
     fn new(inputs: &[Option<InputSpec>], schedule: Option<RoundSchedule>) -> Arc<Self> {
         let inputs = inputs.iter().map(|s| s.clone().map(|spec| Input { spec, queue: VecDeque::new() })).collect();
         Arc::new(Self {
-            inner: Mutex::new(Inner { inputs, dirty: 0, dropped: 0, schedule, stop: false }),
+            inner: Mutex::new(Inner { inputs, dirty: 0, dropped: 0, schedule, stop: false, input_waiter: false }),
             wake: Condvar::new(),
             call_started: AtomicU64::new(0),
             in_step: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            #[cfg(test)]
+            notified: AtomicU64::new(0),
         })
     }
 
@@ -250,18 +264,39 @@ impl Instance {
         self.deliver_all([(port, sample)], audit, now);
     }
 
-    /// Put a batch into the inputs under one lock with one notify, so the
-    /// module never steps on half of a batch that arrived together.
+    /// Put a batch into the inputs under one lock with at most one notify,
+    /// so the module never steps on half of a batch that arrived together.
     fn deliver_all(&self, batch: impl IntoIterator<Item = (u32, Arc<Sample>)>, audit: &dyn AuditSink, now: i64) {
         let mut g = self.inner.lock().unwrap();
         let mut any = false;
         for (port, sample) in batch {
             any |= Self::push(&mut g, port, sample, audit, now);
         }
+        let wake = any && std::mem::take(&mut g.input_waiter);
         drop(g);
-        if any {
+        if wake {
+            #[cfg(test)]
+            self.notified.fetch_add(1, Ordering::Relaxed);
             self.wake.notify_one();
         }
+    }
+
+    /// Sleep until stop, a new schedule, `timeout`, or with `wakes_on_input`
+    /// a new sample. A sample that arrived before the call returns at once.
+    fn wait<'a>(
+        &self,
+        mut g: std::sync::MutexGuard<'a, Inner>,
+        timeout: Duration,
+        wakes_on_input: bool,
+        schedule: Option<RoundSchedule>,
+    ) -> std::sync::MutexGuard<'a, Inner> {
+        g.input_waiter = wakes_on_input;
+        let (mut g, _) = self
+            .wake
+            .wait_timeout_while(g, timeout, |g| !g.stop && !(wakes_on_input && g.dirty != 0) && g.schedule == schedule)
+            .unwrap();
+        g.input_waiter = false;
+        g
     }
 
     fn push(g: &mut Inner, port: u32, sample: Arc<Sample>, audit: &dyn AuditSink, now: i64) -> bool {
@@ -734,11 +769,7 @@ impl ModuleThread {
                 timeout = timeout.min(w.saturating_sub(last_step.elapsed()));
             }
             let wakes_on_input = module.trigger != Trigger::OnRound;
-            let g = inst.inner.lock().unwrap();
-            let _ = inst
-                .wake
-                .wait_timeout_while(g, timeout, |g| !g.stop && !(wakes_on_input && g.dirty != 0) && g.schedule == schedule)
-                .unwrap();
+            drop(inst.wait(inst.inner.lock().unwrap(), timeout, wakes_on_input, schedule));
         }
         self.finish()
     }
@@ -1671,5 +1702,116 @@ mod log_tests {
         assert_eq!(events[1]["event"], "second");
         assert!(events[0]["steady_elapsed_ns"].is_u64());
         assert!(events[1]["t"].is_i64());
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use xgc_rt_core::audit::NullAudit;
+
+    fn sample(seq: u64) -> Arc<Sample> {
+        Arc::new(Sample { origin: 0, seq, round: 0, t_produce: 0, t_tx: 0, t_rx: 0, payload: vec![0; 8], link_header: None })
+    }
+
+    fn instance(ports: u32) -> Arc<Instance> {
+        let spec = InputSpec { channel: 0, origins: vec![0], latest: false };
+        Instance::new(&vec![Some(spec); ports as usize], None)
+    }
+
+    /// Block until the module thread sleeps in `wait` waiting for input.
+    fn until_waiting(inst: &Instance) {
+        let started = Instant::now();
+        while !inst.inner.lock().unwrap().input_waiter {
+            assert!(started.elapsed() < Duration::from_secs(10), "reader never slept");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_sleeping_input_reader_wakes_once_per_burst() {
+        let inst = instance(4);
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let reader = {
+            let inst = inst.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let started = Instant::now();
+                    let dirty = inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), true, None).dirty;
+                    woke_tx.send((started.elapsed(), dirty)).unwrap();
+                    // "Stepping": the rest of the burst lands meanwhile, then
+                    // the step's snapshot takes it.
+                    go_rx.recv().unwrap();
+                    inst.inner.lock().unwrap().dirty = 0;
+                }
+            })
+        };
+        for burst in 0..20u64 {
+            until_waiting(&inst);
+            // A plant output: one sample per state channel, one write each.
+            for port in 0..4 {
+                inst.deliver(port, sample(burst), &NullAudit, 0);
+            }
+            let (after, dirty) = woke_rx.recv_timeout(Duration::from_secs(10)).expect("the reader did not wake");
+            assert!(after < Duration::from_secs(10) && dirty != 0, "burst {burst}: {after:?} {dirty:#b}");
+            assert_eq!(inst.notified.load(Ordering::Relaxed), burst + 1, "one notify per burst");
+            go_tx.send(()).unwrap();
+        }
+        reader.join().unwrap();
+        let queued: usize = inst.inner.lock().unwrap().inputs.iter().flatten().map(|i| i.queue.len()).sum();
+        assert_eq!(queued, 80, "every sample stays queued for the step");
+    }
+
+    #[test]
+    fn a_sample_for_a_running_reader_is_seen_without_a_notify() {
+        let inst = instance(1);
+        inst.deliver(0, sample(1), &NullAudit, 0);
+        let started = Instant::now();
+        let g = inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), true, None);
+        assert!(started.elapsed() < Duration::from_secs(10) && g.dirty == 1);
+        assert!(!g.input_waiter);
+        drop(g);
+        assert_eq!(inst.notified.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn input_never_wakes_a_round_only_reader_but_stop_and_schedules_do() {
+        let inst = instance(1);
+        let waits = {
+            let inst = inst.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                drop(inst.wait(inst.inner.lock().unwrap(), Duration::from_millis(300), false, None));
+                let by_timeout = started.elapsed();
+                let started = Instant::now();
+                drop(inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), false, None));
+                (by_timeout, started.elapsed())
+            })
+        };
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(200) {
+            inst.deliver(0, sample(0), &NullAudit, 0);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        inst.set_schedule(RoundSchedule::new(0, 10_000_000, 10_000_000));
+        let (by_timeout, by_schedule) = waits.join().unwrap();
+        assert!(by_timeout >= Duration::from_millis(300), "input woke an on_round reader after {by_timeout:?}");
+        assert!(by_schedule < Duration::from_secs(10), "a new schedule did not wake it");
+        assert_eq!(inst.notified.load(Ordering::Relaxed), 0);
+
+        let schedule = inst.inner.lock().unwrap().schedule;
+        let stopper = {
+            let inst = inst.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                drop(inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), false, schedule));
+                started.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        inst.stop();
+        assert!(stopper.join().unwrap() < Duration::from_secs(10), "stop did not wake it");
     }
 }
