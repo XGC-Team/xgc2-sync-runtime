@@ -95,6 +95,8 @@
 #include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/SetMode.h>
 #include <mavros_msgs/State.h>
+#include <nav_msgs/Odometry.h>
+#include "sim_odometry.hpp"
 #include <multirotor_reference_trajectory_msgs/AnalyticReference.h>
 #include <multirotor_reference_trajectory_msgs/ReferenceStatus.h>
 #include <multirotor_reference_trajectory_msgs/SampledReference.h>
@@ -215,6 +217,13 @@ std::string text(const char (&in)[N]) {
 struct RosIo {
   const xgc_host_api* host;
   std::string topics[kPortCount];
+  std::string sim_odometry_topic;
+  std::string sim_odometry_child_frame;
+  xgc_pose_v1 sim_pose_cache{};
+  xgc_twist_v1 sim_velocity_cache{};
+  bool have_sim_pose{false}, have_sim_velocity{false};
+  double last_sim_odometry_stamp{0};
+  ros::Publisher sim_odometry_pub;
   std::string scene_snapshot_topic;
   std::string scene_state_topic;
   std::string node_name{"xgc_ros_io"};
@@ -617,6 +626,8 @@ struct RosIo {
       m.pose.orientation.z = s.q_wxyz[3];
       pubs[kSimPose].publish(m);
       ++to_ros;
+      sim_pose_cache = s;
+      have_sim_pose = true;
     }
     while (host->next(host->host, kSimVelocity, &v) == XGC_OK) {
       if (v.len != sizeof(xgc_twist_v1)) continue;
@@ -629,6 +640,29 @@ struct RosIo {
       vec3(m.twist.angular, s.angular);
       pubs[kSimVelocity].publish(m);
       ++to_ros;
+      sim_velocity_cache = s;
+      have_sim_velocity = true;
+    }
+    if (sim_odometry_pub && have_sim_pose && have_sim_velocity) {
+      SimOdometry measured;
+      if (measured_sim_odometry(sim_pose_cache, sim_velocity_cache, last_sim_odometry_stamp, &measured)) {
+        nav_msgs::Odometry m;
+        m.header.stamp.fromSec(measured.pose.stamp);
+        m.header.frame_id = frame_id;
+        m.child_frame_id = sim_odometry_child_frame;
+        m.pose.pose.position.x = measured.pose.position[0];
+        m.pose.pose.position.y = measured.pose.position[1];
+        m.pose.pose.position.z = measured.pose.position[2];
+        m.pose.pose.orientation.w = measured.pose.q_wxyz[0];
+        m.pose.pose.orientation.x = measured.pose.q_wxyz[1];
+        m.pose.pose.orientation.y = measured.pose.q_wxyz[2];
+        m.pose.pose.orientation.z = measured.pose.q_wxyz[3];
+        vec3(m.twist.twist.linear, measured.linear);
+        vec3(m.twist.twist.angular, measured.angular);
+        sim_odometry_pub.publish(m);
+        last_sim_odometry_stamp = measured.pose.stamp;
+        ++to_ros;
+      }
     }
     while (host->next(host->host, kSimImu, &v) == XGC_OK) {
       if (v.len != sizeof(xgc_imu_v1)) continue;
@@ -887,6 +921,11 @@ struct RosIo {
     if (enabled(kSimPose)) pubs[kSimPose] = nh->advertise<geometry_msgs::PoseStamped>(topics[kSimPose], queue_size);
     if (enabled(kSimVelocity))
       pubs[kSimVelocity] = nh->advertise<geometry_msgs::TwistStamped>(topics[kSimVelocity], queue_size);
+    if (!sim_odometry_topic.empty()) {
+      if (!enabled(kSimPose) || !enabled(kSimVelocity) || sim_odometry_child_frame.empty())
+        throw std::invalid_argument("sim_odometry_topic requires sim_pose, sim_velocity and a child frame");
+      sim_odometry_pub = nh->advertise<nav_msgs::Odometry>(sim_odometry_topic, queue_size);
+    }
     if (enabled(kSimImu)) pubs[kSimImu] = nh->advertise<sensor_msgs::Imu>(topics[kSimImu], queue_size);
     if (enabled(kSimFcuState)) pubs[kSimFcuState] = nh->advertise<mavros_msgs::State>(topics[kSimFcuState], queue_size);
     if (enabled(kNeighborPlans))
@@ -984,6 +1023,7 @@ struct RosIo {
 
   void shutdown() {
     stop_calls();
+    sim_odometry_pub.shutdown();
     sim_command_service.shutdown();
     sim_set_mode_service.shutdown();
     subs.clear();
@@ -1020,6 +1060,8 @@ xgc_status configure(void* p, const char* config) {
   return guarded(self->host, "configure", [&] {
     const std::string t = config ? config : "";
     for (uint32_t i = 0; i < kPortCount; ++i) self->topics[i] = cfg::text_or(t, (std::string(kPortNames[i]) + "_topic").c_str(), "");
+    self->sim_odometry_topic = cfg::text_or(t, "sim_odometry_topic", "");
+    self->sim_odometry_child_frame = cfg::text_or(t, "sim_odometry_child_frame", "base_link");
     self->scene_snapshot_topic = cfg::text_or(t, "scene_snapshot_topic", "");
     self->scene_state_topic = cfg::text_or(t, "scene_state_topic", "");
     if (!self->scene_snapshot_topic.empty() && !self->scene_state_topic.empty()) {
