@@ -10,6 +10,7 @@ import rospy
 from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
 from mavros_msgs.msg import PositionTarget, State
 from mavros_msgs.srv import CommandLong, SetMode
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 
 
@@ -73,7 +74,9 @@ def main():
             f'config = {{ model="{name}", epoch_ns={epoch}, step_ms=1, output_ms=10, initial_pose=[0.0,0.0,0.0,{yaw}] }}\n'
             f'bind = {{ {",".join(bindings)} }}\n'
         )
-        config = [f'sim_pose_topic="/{name}/pose"', f'sim_velocity_topic="/{name}/velocity"', 'node_name="private_lightweight_models"', 'frame_id="world"']
+        config = [f'sim_pose_topic="/{name}/pose"', f'sim_velocity_topic="/{name}/velocity"',
+                  f'sim_odometry_topic="/{name}/odom"', f'sim_odometry_child_frame="{name}/base_link"',
+                  'node_name="private_lightweight_models"', 'frame_id="world"']
         bindings = [f'sim_pose={{channel="{name}-pose",from=["models"]}}', f'sim_velocity={{channel="{name}-velocity",from=["models"]}}']
         if name == 'fs150':
             config += ['alg_setpoint_topic="/fs150/setpoint"', 'sim_fcu_request_topic="/fs150/mavros"', 'sim_fcu_state_topic="/fs150/state"', 'sim_imu_topic="/fs150/imu"']
@@ -94,7 +97,7 @@ def main():
     host = subprocess.Popen([str(host_path), '--manifest', str(manifest_path)], stdout=out, stderr=subprocess.STDOUT)
     try:
         rospy.init_node('private_model_probe', anonymous=False)
-        poses, velocities, states, imus = {}, {}, [], []
+        poses, velocities, odometry, states, imus = {}, {}, {}, [], []
 
         def save_pose(message, name):
             poses.setdefault(name, []).append(message)
@@ -102,10 +105,14 @@ def main():
         def save_velocity(message, name):
             velocities.setdefault(name, []).append(message)
 
+        def save_odometry(message, name):
+            odometry.setdefault(name, []).append(message)
+
         subscriptions = []
         for name in names:
             subscriptions.append(rospy.Subscriber('/' + name + '/pose', PoseStamped, save_pose, name))
             subscriptions.append(rospy.Subscriber('/' + name + '/velocity', TwistStamped, save_velocity, name))
+            subscriptions.append(rospy.Subscriber('/' + name + '/odom', Odometry, save_odometry, name))
         subscriptions.append(rospy.Subscriber('/fs150/state', State, states.append))
         subscriptions.append(rospy.Subscriber('/fs150/imu', Imu, imus.append))
         publishers = {name:rospy.Publisher('/' + name + '/cmd_vel', Twist, queue_size=1) for name in names[1:]}
@@ -120,7 +127,7 @@ def main():
                     raise AssertionError('timeout: ' + description)
                 time.sleep(.01)
 
-        wait_for(lambda:all(poses.get(n) and velocities.get(n) for n in names) and states and imus, 'all model feedback', 8)
+        wait_for(lambda:all(poses.get(n) and velocities.get(n) and odometry.get(n) for n in names) and states and imus, 'all model feedback', 8)
         assert states[-1].connected and not states[-1].armed
         assert imus[-1].orientation_covariance[0] == -1
         for name in names:
@@ -172,6 +179,20 @@ def main():
             vs = {m.header.stamp.to_nsec() for m in velocities[name]}
             assert len(ps & vs) > 100, (name, len(ps & vs))
             assert all(a.header.stamp < b.header.stamp for a, b in zip(poses[name], poses[name][1:]))
+            by_pose = {m.header.stamp.to_nsec(): m for m in poses[name]}
+            by_velocity = {m.header.stamp.to_nsec(): m for m in velocities[name]}
+            matches = [m for m in odometry[name] if m.header.stamp.to_nsec() in ps & vs]
+            assert len(matches) > 100, (name, 'same-step odometry', len(matches))
+            assert all(a.header.stamp < b.header.stamp for a, b in zip(odometry[name], odometry[name][1:]))
+            for m in matches:
+                stamp = m.header.stamp.to_nsec()
+                assert m.header.frame_id == 'world' and m.child_frame_id == name + '/base_link'
+                assert m.pose.pose == by_pose[stamp].pose
+                actual, measured = m.twist.twist.linear, by_velocity[stamp].twist.linear
+                # Independently known fixture orientations: FS150 yaw=0;
+                # both ground vehicles yaw=90 degrees. Twist is BODY, not world.
+                expected = (measured.x, measured.y, measured.z) if name == 'fs150' else (measured.y, -measured.x, measured.z)
+                assert max(abs(a-b) for a, b in zip((actual.x, actual.y, actual.z), expected)) < 1e-9
         for pub in publishers.values():
             pub.publish(Twist())
         # An in-air disarm is refused, as by PX4; AUTO.LAND lands and disarms.
@@ -186,7 +207,7 @@ def main():
             'scope':'three real native plants and ROS edges; no planner/controller/SITL/Gazebo',
             'elapsed':elapsed,
             'robots':{
-                n:{'samples':len(poses[n]),'last_position':[poses[n][-1].pose.position.x, poses[n][-1].pose.position.y, poses[n][-1].pose.position.z]}
+                n:{'samples':len(poses[n]),'odometrySamples':len(odometry[n]),'last_position':[poses[n][-1].pose.position.x, poses[n][-1].pose.position.y, poses[n][-1].pose.position.z]}
                 for n in names
             },
         }
