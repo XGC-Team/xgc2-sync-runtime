@@ -70,7 +70,9 @@
 // round's deadline). With long rounds (DMPC, 100 ms) set `slice_ms` (e.g. 2)
 // and the plugin's `wake_ms` to the same value: each step then services ROS
 // for at most one slice, and module outputs (the planner's local
-// FormationTick) reach ROS within about a slice instead of a round.
+// FormationTick) reach ROS within about a slice instead of a round. A slice
+// remainder shorter than the kernel's timer slack (50 us) is not waited, so
+// `slice_ms` = 0.001 is exactly one non-blocking pass (ros_slice.hpp).
 
 #include <algorithm>
 #include <cmath>
@@ -116,6 +118,7 @@
 #include "ros_dmpc_edge.hpp"
 #include "ros_edge.hpp"
 #include "ros_paired_pose.hpp"
+#include "ros_slice.hpp"
 #include "xgc_dmpc_planner_v1.h"
 #include "xgc_rt.h"
 #include "xgc_schemas_v1.h"
@@ -997,22 +1000,17 @@ struct RosIo {
     }
     // One non-blocking pass, then a budget fixed in steady time. Session time
     // is not read again: a frozen simulation clock must not extend the wait.
+    // A remainder shorter than the timer slack is not waited (ros_slice.hpp).
     queue.callAvailable(ros::WallDuration(0));
-    const int64_t session_now = host->now(host->host);
-    int64_t until = ctx->deadline - 1000000;
-    if (slice_ms > 0.0) {
-      until = std::min<int64_t>(until, session_now + static_cast<int64_t>(slice_ms * 1e6));
-    }
-    int64_t budget_ns = until - session_now;
-    if (budget_ns < 0) budget_ns = 0;
+    const int64_t budget_ns = xgc_ros_slice::budget_ns(host->now(host->host), ctx->deadline, slice_ms);
     const auto started = std::chrono::steady_clock::now();
     while (ros::ok()) {
       const int64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - started)
                                   .count();
-      if (elapsed >= budget_ns) break;
-      const int64_t left = budget_ns - elapsed;
-      queue.callAvailable(ros::WallDuration(std::min<int64_t>(left, 1000000) * 1e-9));
+      const int64_t wait_ns = xgc_ros_slice::next_wait_ns(budget_ns, elapsed);
+      if (wait_ns == 0) break;
+      queue.callAvailable(ros::WallDuration(wait_ns * 1e-9));
     }
     if (write_failed) {
       log(XGC_LOG_ERROR, "ros_io: a module output write failed");

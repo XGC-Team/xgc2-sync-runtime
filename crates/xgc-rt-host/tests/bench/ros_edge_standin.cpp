@@ -6,10 +6,10 @@
 //   - forward_inputs(): `next` on every module input port in ros_io's order,
 //     copying each sample out as ros_io does before it builds a ROS message,
 //     and the same-stamp odometry pairing (sim_odometry.hpp);
-//   - the ROS service of the step, with ros_io's arithmetic: one
-//     non-blocking pass, then condition-variable waits for whatever remains of
-//     the slice, as ros::CallbackQueue::callAvailable(timeout) waits when its
-//     queue is empty (a stand-in queue that never receives a callback).
+//   - the ROS service of the step, with ros_io's arithmetic (ros_slice.hpp):
+//     one non-blocking pass, then condition-variable waits for what remains
+//     of the slice, as ros::CallbackQueue::callAvailable(timeout) waits when
+//     its queue is empty (a stand-in queue that never receives a callback).
 // Nothing reaches ROS, so roscpp's serialization and socket writes are not
 // part of the measured cost.
 //
@@ -18,6 +18,8 @@
 //   standin_commands = true  a commanded edge stands in for the controller's
 //                            ROS input: one setpoint, arm and OFFBOARD, then
 //                            a 50 Hz acceleration setpoint stream.
+//   standin_slice = "legacy" ros_io's service loop before the timer-slack
+//                            rule: it waited out any remainder of the slice.
 //
 // Build: $CXX -std=c++17 -O2 -fPIC -shared -I abi/include -I plugins/common \
 //          -I plugins/ros-io ros_edge_standin.cpp -o libros_edge_standin.so
@@ -31,6 +33,7 @@
 #include <string>
 
 #include "flat_config.hpp"
+#include "ros_slice.hpp"
 #include "sim_odometry.hpp"
 #include "xgc_dmpc_planner_v1.h"
 #include "xgc_rt.h"
@@ -75,6 +78,7 @@ struct Edge {
   bool enabled[kPortCount]{};
   bool odometry{false};
   bool commands{false};
+  bool legacy_slice{false};
   double slice_ms{0.0};
   CallbackQueue queue;
   uint64_t round{0};
@@ -173,17 +177,15 @@ struct Edge {
   // budget in waits of at most 1 ms.
   void service(const xgc_step_ctx* ctx) {
     queue.callAvailable(0);
-    const int64_t session_now = host->now(host->host);
-    int64_t until = ctx->deadline - 1000000;
-    if (slice_ms > 0.0) until = std::min<int64_t>(until, session_now + static_cast<int64_t>(slice_ms * 1e6));
-    int64_t budget_ns = until - session_now;
-    if (budget_ns < 0) budget_ns = 0;
+    const int64_t budget_ns = xgc_ros_slice::budget_ns(host->now(host->host), ctx->deadline, slice_ms);
     const auto started = std::chrono::steady_clock::now();
     for (;;) {
       const int64_t elapsed =
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-      if (elapsed >= budget_ns) break;
-      queue.callAvailable(std::min<int64_t>(budget_ns - elapsed, 1000000));
+      const int64_t wait_ns = legacy_slice ? (elapsed >= budget_ns ? 0 : std::min<int64_t>(budget_ns - elapsed, 1000000))
+                                           : xgc_ros_slice::next_wait_ns(budget_ns, elapsed);
+      if (wait_ns == 0) break;
+      queue.callAvailable(wait_ns);
     }
   }
 
@@ -220,6 +222,7 @@ xgc_status configure(void* p, const char* config) {
   self->odometry = !cfg::text_or(text, "sim_odometry_topic", "").empty();
   if (!cfg::number(text, "slice_ms", &self->slice_ms) || self->slice_ms < 0.0) return XGC_ERR_INVALID;
   if (!cfg::boolean(text, "standin_commands", &self->commands)) return XGC_ERR_INVALID;
+  self->legacy_slice = cfg::text_or(text, "standin_slice", "") == "legacy";
   return XGC_OK;
 }
 

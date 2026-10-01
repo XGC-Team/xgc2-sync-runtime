@@ -14,6 +14,8 @@
 //!   XGC_LIGHTWEIGHT_BENCH_OUT      JSON lines results file
 //!   XGC_ROS_EDGE_STANDIN_ELF       prebuilt ROS edge stand-in (default: build
 //!                                  tests/bench/ros_edge_standin.cpp with $CXX)
+//!   XGC_ROS_EDGE_STANDIN_SLICE     `legacy`: the edges wait out every slice
+//!                                  remainder, as ros_io did before ros_slice.hpp
 //!
 //! Shapes: `per-robot-round` is one instance per robot stepped on every 1 ms
 //! round (today's manifests); `per-robot-dirty` keeps one instance per robot
@@ -278,6 +280,8 @@ fn platform_manifest(robots: usize, commanded: bool, plant: &Path, edge: &Path, 
     for r in 0..robots {
         let (b, ns) = (body(r), format!("/{}", body(r)));
         let reader = |port: &str| format!("{{ channel = \"{b}/{port}\", from = [\"plant\"] }}");
+        let legacy = std::env::var("XGC_ROS_EDGE_STANDIN_SLICE").is_ok_and(|v| v == "legacy");
+        let slice = if legacy { ", standin_slice = \"legacy\"" } else { "" };
         let commands = if commanded { ", standin_commands = true" } else { "" };
         text += &format!(
             "[[plugin]]\nname = \"ros-{b}-mavros\"\npath = \"{}\"\ntrigger = \"on_dirty\"\nwake_ms = {COMMAND_POLL_MS}\n\
@@ -286,7 +290,7 @@ fn platform_manifest(robots: usize, commanded: bool, plant: &Path, edge: &Path, 
              sim_pose_topic = \"{ns}/mavros/local_position/pose\", sim_velocity_topic = \"{ns}/mavros/local_position/velocity_local\", \
              sim_odometry_topic = \"{ns}/mavros/local_position/odom\", sim_imu_topic = \"{ns}/mavros/imu/data\", \
              sim_fcu_state_topic = \"{ns}/mavros/state\", alg_setpoint_topic = \"{ns}/mavros/setpoint_raw/local\", \
-             sim_fcu_request_topic = \"{ns}/mavros\"{commands} }}\n\
+             sim_fcu_request_topic = \"{ns}/mavros\"{commands}{slice} }}\n\
              bind = {{ sim_pose = {}, sim_velocity = {}, sim_imu = {}, sim_fcu_state = {}, \
              alg_setpoint = {{ channel = \"{b}/setpoint\" }}, sim_fcu_request = {{ channel = \"{b}/fcu_request\" }} }}\n",
             edge.display(),
@@ -299,7 +303,7 @@ fn platform_manifest(robots: usize, commanded: bool, plant: &Path, edge: &Path, 
             "[[plugin]]\nname = \"ros-{b}-mocap\"\npath = \"{}\"\ntrigger = \"on_dirty\"\nstep_budget_ms = {OUTPUT_MS}\n\
              config = {{ node_name = \"xgc_lightweight_plant\", frame_id = \"world\", slice_ms = {SLICE_MS}, \
              sim_pose_topic = \"/vrpn_client_node{ns}/pose\", sim_velocity_topic = \"/vrpn_client_node{ns}/twist\", \
-             sim_imu_topic = \"{ns}/mavros/imu/data_raw\" }}\n\
+             sim_imu_topic = \"{ns}/mavros/imu/data_raw\"{slice} }}\n\
              bind = {{ sim_pose = {}, sim_velocity = {}, sim_imu = {} }}\n",
             edge.display(),
             reader("pose"),
