@@ -28,7 +28,7 @@
 //! from planner_status. Network scheduling need not be deterministic.
 //!
 //! Requires the bridge environment documented in plan_dmpc_bridge plus
-//! PX4_CONTROLLER_ROOT, PX4_CORE_LIB_DIR and the controller build dependencies.
+//! PX4_CONTROLLER_NATIVE_LIBRARY and its installed owning dependency closure.
 //! Missing prerequisites fail, rather than producing an environment-skipped pass.
 
 mod common;
@@ -773,16 +773,10 @@ struct Setup {
 
 fn setup() -> Setup {
     let env = bridge::require_env();
-    assert!(env_path("PX4_CORE_LIB_DIR").is_some(), "PX4_CORE_LIB_DIR is required");
+    assert!(env_path("PX4_CONTROLLER_NATIVE_LIBRARY").is_some(), "PX4_CONTROLLER_NATIVE_LIBRARY is required");
     let plan_dmpc = bridge::plan_dmpc_lib(&env).clone();
-    let out = common::workspace_root().join("target/plugin-tests/cpp");
-    std::fs::create_dir_all(&out).unwrap();
-    let ctl_px4 = out.join("libctl_px4_fleet.so");
-    static BUILT: std::sync::Once = std::sync::Once::new();
-    BUILT.call_once(|| {
-        assert!(Command::new(common::workspace_root().join("scripts/build-ctl-px4.sh")).arg(&ctl_px4).status().unwrap().success());
-        common::lib("dmpc_rounds");
-    });
+    let ctl_px4 = common::ctl_px4_lib(&env.core_prefix).clone();
+    common::lib("dmpc_rounds");
     Setup { plan_dmpc, ctl_px4, fg_root: env.formation_generator_root, tool: env.fleet_replay }
 }
 

@@ -145,22 +145,21 @@ pub fn ros_io_lib(prefix: &std::path::Path) -> &'static PathBuf {
     })
 }
 
-/// ctl-px4 built against the ROS-free PX4 controller core
-/// (PX4_CORE_LIB_DIR and the other build-ctl-px4.sh variables), with the
-/// toolchain that built the core (RoboStack's, when present).
-pub fn ctl_px4_lib(prefix: &std::path::Path) -> &'static PathBuf {
+/// Consume the owning PX4 controller product's installed native adapter.
+/// The generic Runtime tests load the same artifact as external workspaces;
+/// they do not rebuild a second controller wrapper from Runtime sources.
+pub fn ctl_px4_lib(_prefix: &std::path::Path) -> &'static PathBuf {
     static LIB: OnceLock<PathBuf> = OnceLock::new();
     LIB.get_or_init(|| {
-        let out = workspace_root().join("target/plugin-tests/cpp");
-        std::fs::create_dir_all(&out).unwrap();
-        let lib = out.join("libctl_px4.so");
-        let mut c = Command::new(workspace_root().join("scripts/build-ctl-px4.sh"));
-        c.arg(&lib);
-        let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
-        if std::env::var_os("CXX").is_none() && conda_cxx.is_file() {
-            c.env("CXX", conda_cxx);
-        }
-        assert!(c.status().unwrap().success(), "building ctl-px4 failed");
+        let lib = std::env::var_os("PX4_CONTROLLER_NATIVE_LIBRARY")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .expect("set PX4_CONTROLLER_NATIVE_LIBRARY to the owning controller product's installed libctl_px4.so");
+        assert!(
+            lib.is_absolute() && lib.is_file(),
+            "PX4_CONTROLLER_NATIVE_LIBRARY must name an existing absolute installed artifact: {}",
+            lib.display()
+        );
         lib
     })
 }

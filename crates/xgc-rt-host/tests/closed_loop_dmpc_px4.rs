@@ -36,7 +36,7 @@
 //! rounds; the robot tracks the planner's setpoints and travels.
 //!
 //! Requires the same planner build prefixes as plan_dmpc_replay.rs, plus
-//! PX4_CORE_LIB_DIR and the build-ctl-px4.sh controller headers.
+//! PX4_CONTROLLER_NATIVE_LIBRARY: the absolute installed owning controller ELF.
 //! Missing dependencies fail. This does not establish SITL or vehicle acceptance.
 
 mod common;
@@ -334,11 +334,7 @@ fn check_flight(backend: &str) {
     let env = bridge::require_env();
     let fg_root = &env.formation_generator_root;
     let plan_dmpc = bridge::plan_dmpc_lib(&env);
-    let out = common::workspace_root().join("target/plugin-tests/cpp");
-    std::fs::create_dir_all(&out).unwrap();
-    let ctl_px4 = out.join("libctl_px4_closed_loop.so");
-    let status = Command::new(common::workspace_root().join("scripts/build-ctl-px4.sh")).arg(&ctl_px4).status().unwrap();
-    assert!(status.success(), "building ctl-px4 failed");
+    let ctl_px4 = common::ctl_px4_lib(&env.core_prefix).clone();
 
     // The recording: robot 1 of the knot_fs150 fleet with its scene.
     let tool = &env.fleet_replay;

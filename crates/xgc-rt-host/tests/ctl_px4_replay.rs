@@ -8,13 +8,13 @@
 //!
 //! Needs:
 //!   ROS_PREFIX          ROS Noetic (only for the stream converter)
-//!   PX4_CORE_LIB_DIR    dir with libpx4_multirotor_controller_core.so
+//!   PX4_CONTROLLER_NATIVE_LIBRARY absolute installed owning libctl_px4.so
 //!   PX4_REPLAY_STREAM   the replay stream (bag_to_stream.py output)
 //!   PX4_REPLAY_REF      replay_harness output on that stream
 //!   PX4_REPLAY_BACKEND  optional: the tracking backend the harness ran with
 //!                       (px4_local | dfbc | nmpc; default px4_local)
 //!   PX4_REPLAY_REFERENCE_TYPE optional: its reference_analytic_type
-//!   XGC2_PREFIX, ACADOS_ROOT, PX4_CONTROLLER_ROOT, EIGEN_INCLUDE (as for build-ctl-px4.sh)
+//!   LD_LIBRARY_PATH for the owning installed controller/core/state-machine closure
 //! Without them the test prints why and passes.
 
 mod common;
@@ -104,11 +104,11 @@ fn convert_stream(prefix: &std::path::Path, stream: &std::path::Path) -> Vec<(u6
 fn ctl_px4_module_reproduces_the_controller_replay_byte_for_byte() {
     let (Some(prefix), Some(_core), Some(stream), Some(reference)) = (
         common::ros_prefix(),
-        env_path("PX4_CORE_LIB_DIR"),
+        env_path("PX4_CONTROLLER_NATIVE_LIBRARY"),
         env_path("PX4_REPLAY_STREAM"),
         env_path("PX4_REPLAY_REF"),
     ) else {
-        eprintln!("skipped: set ROS_PREFIX, PX4_CORE_LIB_DIR, PX4_REPLAY_STREAM and PX4_REPLAY_REF");
+        eprintln!("skipped: set ROS_PREFIX, PX4_CONTROLLER_NATIVE_LIBRARY, PX4_REPLAY_STREAM and PX4_REPLAY_REF");
         return;
     };
     let lib = common::ctl_px4_lib(&prefix);

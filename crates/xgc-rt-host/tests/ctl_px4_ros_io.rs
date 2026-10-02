@@ -27,8 +27,8 @@
 //! This remains a software plant validation, not PX4 or physical flight.
 //!
 //! Needs ROS_PREFIX (ROS Noetic), XGC2_WS (for the stand-in's messages),
-//! PX4_CORE_LIB_DIR and, for dfbc/nmpc, REF_CORE_LIB_DIR (plus the other
-//! build-ctl-px4.sh / build-ref-trajectory.sh variables). Without them the
+//! PX4_CONTROLLER_NATIVE_LIBRARY and, for dfbc/nmpc, REF_CORE_LIB_DIR
+//! (the owning installed controller and reference dependency closure). Without them the
 //! test prints why and passes.
 
 mod common;
@@ -57,8 +57,8 @@ fn fly(backend: &str, native_hover: bool) {
         eprintln!("skipped: set ROS_PREFIX (Noetic) and XGC2_WS");
         return;
     };
-    if std::env::var_os("PX4_CORE_LIB_DIR").is_none() || (reference && std::env::var_os("REF_CORE_LIB_DIR").is_none()) {
-        eprintln!("skipped: set PX4_CORE_LIB_DIR (and REF_CORE_LIB_DIR for dfbc/nmpc)");
+    if std::env::var_os("PX4_CONTROLLER_NATIVE_LIBRARY").is_none() || (reference && std::env::var_os("REF_CORE_LIB_DIR").is_none()) {
+        eprintln!("skipped: set PX4_CONTROLLER_NATIVE_LIBRARY (and REF_CORE_LIB_DIR for dfbc/nmpc)");
         return;
     }
     let _one = FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
