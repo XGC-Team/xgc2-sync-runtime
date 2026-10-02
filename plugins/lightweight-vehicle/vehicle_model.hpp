@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+
+#include "flight_controller.hpp"
 
 #include <xgc2_math/control/delayed_planar_velocity.hpp>
 #include <xgc2_math/geometry/kinematics.hpp>
 
-// The numerical plant has no ROS, transport, scheduler or controller. Native
-// and ROS boundaries supply actual actuator commands and elapsed model time.
+// The numerical plant has no ROS, transport or scheduler. Native and ROS
+// boundaries supply commands and elapsed model time; flight embeds an FCU loop.
 namespace xgc_lightweight {
 
 struct FlightSetpoint {
@@ -17,8 +20,8 @@ struct FlightSetpoint {
   bool position_enabled[3]{false, false, false};
   bool velocity_enabled[3]{false, false, false};
   bool acceleration_enabled[3]{false, false, false};
-  // PositionTarget yaw fields. Without a yaw target, yaw_rate is integrated;
-  // it is zero when the command ignores yaw rate.
+  // PositionTarget yaw fields. Without a yaw target, yaw_rate is integrated
+  // into the desired heading; it is zero when the command ignores yaw rate.
   bool yaw_enabled{false};
   double yaw{0.0};
   double yaw_rate{0.0};
@@ -35,43 +38,53 @@ enum class FlightMode {
 // Transitions the plant makes on its own during a step.
 enum class FlightEvent { None, OffboardLost, Landed };
 
-// Ideal acceleration inner loop for SMC. The position/velocity branch models
-// the FCU modes used by the existing controller's Takeoff/Hover/Landing states;
-// its constants match the existing px4_plant numerical test (not PX4 tuning).
-// It is bypassed entirely for an acceleration-only command from SMC.
-//
-// FCU rules follow PX4 where the existing controller depends on them:
-// OFFBOARD needs a setpoint younger than the offboard timeout, and a stream
-// that stops for that long falls back to Hold (COM_OF_LOSS_T); a disarm
-// without force is refused in the air; AUTO.LAND descends at the default
-// MPC_LAND_SPEED and disarms on touchdown. Estimator, RC and preflight
-// behaviour is not modelled.
+// Simplified FCU mode/stream behaviour around a physical four-rotor plant.
+// Existing P/V branches keep their numerical outer-loop constants. ACC-only
+// commands bypass those branches, then pass through the same finite-bandwidth
+// attitude/rate/motor dynamics. Estimator, RC and preflight are not modelled.
 class FlightModel {
 public:
-  static constexpr double kLandSpeed = 0.7;    // PX4 default MPC_LAND_SPEED
-  static constexpr double kLandedHeight = 0.01; // above the initial ground
+  static constexpr double kLandSpeed = 0.7;
+  static constexpr double kLandedHeight = 0.01;
+  static constexpr double kMaxControlStep = 0.001;
 
   explicit FlightModel(const Eigen::Vector3d &position, double yaw = 0.0,
                        double offboard_timeout_s = 0.5)
-      : state_{position, Eigen::Vector3d::Zero()}, ground_z_(position.z()),
-        offboard_timeout_s_(offboard_timeout_s), yaw_(yaw) {}
+      : body_(position, yaw), controller_(body_.parameters()),
+        ground_z_(position.z()), offboard_timeout_s_(offboard_timeout_s),
+        yaw_command_(yaw) {
+    if (!std::isfinite(offboard_timeout_s) || offboard_timeout_s <= 0.0)
+      throw std::invalid_argument("flight model: invalid offboard timeout");
+    refresh_state();
+  }
 
   void setpoint(const FlightSetpoint &value) {
+    for (int i = 0; i != 3; ++i)
+      if ((value.position_enabled[i] && !std::isfinite(value.position[i])) ||
+          (value.velocity_enabled[i] && !std::isfinite(value.velocity[i])) ||
+          (value.acceleration_enabled[i] &&
+           !std::isfinite(value.acceleration[i])))
+        throw std::invalid_argument("flight model: nonfinite setpoint");
+    if ((value.yaw_enabled && !std::isfinite(value.yaw)) ||
+        !std::isfinite(value.yaw_rate))
+      throw std::invalid_argument("flight model: nonfinite yaw setpoint");
     setpoint_ = value;
     has_setpoint_ = true;
     setpoint_age_ = 0.0;
   }
-  // False when refused: disarming is refused while airborne.
   bool request_arm(bool value) {
     if (!value && armed_ && !landed())
       return false;
+    if (value != armed_)
+      yaw_command_ = yaw();
     armed_ = value;
     return true;
   }
-  // False when refused: OFFBOARD needs a fresh setpoint stream.
   bool request_mode(FlightMode value) {
     if (value == FlightMode::Offboard && !setpoint_fresh())
       return false;
+    if (value != mode_)
+      yaw_command_ = yaw();
     mode_ = value;
     return true;
   }
@@ -80,71 +93,117 @@ public:
   bool landed() const {
     return state_.position.z() <= ground_z_ + kLandedHeight;
   }
+  // The original measurement point is the body origin, not the COM.
   const xgc2_math::TranslationalState &state() const { return state_; }
   const Eigen::Vector3d &acceleration() const { return acceleration_; }
-  double yaw() const { return yaw_; }
-  // Realized yaw change over the last step, not the last commanded rate.
+  const Eigen::Quaterniond &orientation() const {
+    return body_.state().orientation;
+  }
+  Eigen::Vector3d angular_velocity_body() const {
+    return body_.state().angular_velocity;
+  }
+  Eigen::Vector3d specific_force_body() const {
+    return orientation().conjugate() *
+           (acceleration_ - Eigen::Vector3d(0.0, 0.0, -body_.parameters().gravity));
+  }
+  double yaw() const {
+    const auto r = orientation().toRotationMatrix();
+    return std::atan2(r(1, 0), r(0, 0));
+  }
+  // Realized world-heading change, distinct from the body gyro's z component
+  // when tilted. Neither is the commanded yaw rate.
   double yaw_rate() const { return yaw_rate_; }
+  const FlightControlOutput &control_output() const { return control_output_; }
 
   FlightEvent step(double dt) {
+    if (!std::isfinite(dt) || dt < 0.0 ||
+        dt / kMaxControlStep > std::numeric_limits<int>::max())
+      throw std::invalid_argument("flight model: invalid dt");
+    if (dt == 0.0)
+      return FlightEvent::None;
     FlightEvent event = FlightEvent::None;
-    if (mode_ == FlightMode::Offboard && !setpoint_fresh()) {
-      mode_ = FlightMode::Hold;
-      event = FlightEvent::OffboardLost;
-    }
-    Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
-    const double yaw_before = yaw_;
-    if (armed_ && mode_ == FlightMode::Offboard) {
-      acceleration = track(setpoint_);
-      yaw_ = setpoint_.yaw_enabled
-                 ? setpoint_.yaw
-                 : xgc2_math::normalizeAngle(yaw_ + setpoint_.yaw_rate * dt);
-    } else if (armed_ && mode_ == FlightMode::Land) {
-      FlightSetpoint descend;
-      descend.velocity.z() = -kLandSpeed;
-      for (auto &enabled : descend.velocity_enabled)
-        enabled = true;
-      acceleration = track(descend);
-    } else if (armed_) {
-      acceleration = -state_.velocity / 0.2; // Hold brakes, also on the ground
-    } else if (state_.position.z() > ground_z_) {
-      acceleration = Eigen::Vector3d(0.0, 0.0, -9.8066);
-    }
-    state_ = xgc2_math::stepWorldAcceleration(state_, acceleration, dt);
-    if (state_.position.z() <= ground_z_) {
-      state_.position.z() = ground_z_;
-      state_.velocity.z() = std::max(0.0, state_.velocity.z());
-      acceleration.z() = std::max(0.0, acceleration.z());
-      if (armed_ && mode_ == FlightMode::Land) {
-        armed_ = false;
-        event = FlightEvent::Landed;
+    const double yaw_before = yaw();
+    // Resolve the FCU and ground constraint at 1 kHz even if a caller advances
+    // in larger chunks. Motor response remains exclusively in RigidBodyModel.
+    const int count = static_cast<int>(std::ceil(dt / kMaxControlStep));
+    const double h = dt / count;
+    for (int step = 0; step != count; ++step) {
+      if (mode_ == FlightMode::Offboard && !setpoint_fresh()) {
+        mode_ = FlightMode::Hold;
+        yaw_command_ = yaw();
+        event = FlightEvent::OffboardLost;
       }
-      if (!armed_) {
-        state_.velocity.setZero();
-        acceleration.setZero();
+      Eigen::Vector3d a_command = Eigen::Vector3d::Zero();
+      double desired_yaw_rate = 0.0;
+      Eigen::Vector4d motors = Eigen::Vector4d::Zero();
+      if (armed_) {
+        if (mode_ == FlightMode::Offboard) {
+          a_command = track(setpoint_);
+          if (setpoint_.yaw_enabled)
+            yaw_command_ = setpoint_.yaw;
+          else {
+            desired_yaw_rate = setpoint_.yaw_rate;
+            yaw_command_ = xgc2_math::normalizeAngle(
+                yaw_command_ + desired_yaw_rate * h);
+          }
+        } else if (mode_ == FlightMode::Land) {
+          FlightSetpoint descend;
+          descend.velocity.z() = -kLandSpeed;
+          for (auto &enabled : descend.velocity_enabled)
+            enabled = true;
+          a_command = track(descend);
+        } else {
+          a_command = -state_.velocity / 0.2;
+        }
+        control_output_ = controller_.command(body_.state(), a_command,
+                                             yaw_command_, desired_yaw_rate);
+        motors = control_output_.allocation.target_rotor_speed;
+      } else {
+        control_output_ = FlightControlOutput{};
       }
+      body_.step(motors, h);
+      acceleration_ = body_.base_acceleration();
+      // Only the initial ground plane constrains the base measurement point.
+      // This is not full contact/friction/collision physics: no wall avoidance,
+      // roll/pitch constraint or horizontal friction is introduced here.
+      if (body_.base_position().z() <= ground_z_) {
+        auto contact = body_.state();
+        contact.position.z() += ground_z_ - body_.base_position().z();
+        const double downward = std::min(0.0, body_.base_velocity().z());
+        contact.velocity.z() -= downward;
+        body_.set_state(contact);
+        acceleration_ = body_.base_acceleration();
+        // Include sustained support and the resolved impact impulse in the
+        // base accelerometer sample. Impact is averaged over this substep;
+        // the underlying free rigid-body acceleration is an endpoint value.
+        acceleration_.z() +=
+            std::max({0.0, -acceleration_.z(), -downward / h});
+        if (armed_ && mode_ == FlightMode::Land) {
+          armed_ = false;
+          event = FlightEvent::Landed;
+        }
+      }
+      refresh_state();
+      setpoint_age_ += h;
     }
-    acceleration_ = acceleration;
-    yaw_rate_ =
-        dt > 0.0 ? xgc2_math::normalizeAngle(yaw_ - yaw_before) / dt : 0.0;
-    setpoint_age_ += dt;
+    yaw_rate_ = xgc2_math::normalizeAngle(yaw() - yaw_before) / dt;
     return event;
   }
 
 private:
-  // A setpoint applied at t stays usable until t + timeout (1 ns tolerance
-  // absorbs the summed step lengths).
+  void refresh_state() {
+    state_.position = body_.base_position();
+    state_.velocity = body_.base_velocity();
+  }
   bool setpoint_fresh() const {
     return has_setpoint_ && setpoint_age_ < offboard_timeout_s_ - 1e-9;
   }
-
   Eigen::Vector3d track(const FlightSetpoint &setpoint) const {
     bool acceleration_only = true;
-    for (int i = 0; i != 3; ++i) {
-      acceleration_only =
-          acceleration_only && !setpoint.position_enabled[i] &&
-          !setpoint.velocity_enabled[i] && setpoint.acceleration_enabled[i];
-    }
+    for (int i = 0; i != 3; ++i)
+      acceleration_only = acceleration_only && !setpoint.position_enabled[i] &&
+                          !setpoint.velocity_enabled[i] &&
+                          setpoint.acceleration_enabled[i];
     if (acceleration_only)
       return setpoint.acceleration;
     Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
@@ -168,13 +227,16 @@ private:
     return acceleration;
   }
 
+  RigidBodyModel body_;
+  FlightController controller_;
   xgc2_math::TranslationalState state_;
   double ground_z_;
   double offboard_timeout_s_;
   FlightSetpoint setpoint_;
+  FlightControlOutput control_output_;
   Eigen::Vector3d acceleration_{Eigen::Vector3d::Zero()};
   double setpoint_age_{0.0};
-  double yaw_;
+  double yaw_command_;
   double yaw_rate_{0.0};
   FlightMode mode_{FlightMode::Hold};
   bool has_setpoint_{false};
