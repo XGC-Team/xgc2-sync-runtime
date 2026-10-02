@@ -94,36 +94,20 @@ pub fn ctl_dfbc() -> &'static (PathBuf, PathBuf) {
     })
 }
 
-/// Build `libest_rigid_state.so` and its replay reference (needs `$CXX` and
-/// Eigen headers in `$EIGEN_INCLUDE`, default /usr/include/eigen3).
+/// Consume the owning rigid-state product's installed native adapter/reference.
+/// These explicit artifacts are validated by the Host/replay tests; the generic
+/// Runtime test harness never compiles a retired domain implementation.
 pub fn est_rigid_state() -> &'static (PathBuf, PathBuf) {
     static OUT: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     OUT.get_or_init(|| {
-        let root = workspace_root();
-        let out = root.join("target/plugin-tests/cpp");
-        std::fs::create_dir_all(&out).unwrap();
-        let (lib, reference) = (out.join("libest_rigid_state.so"), out.join("eskf_reference"));
-        let products = root.join("../..");
-        let estimator = std::env::var_os("ESKF_ROOT").filter(|path| !path.is_empty()).map(PathBuf::from).unwrap_or_else(||
-            products.join("ros1/perception/estimator/rigid-state/estimator_vrpn_px4_rotor_state"));
-        let inputs = [
-            root.join("scripts/build-est-rigid-state.sh"),
-            root.join("plugins/est-rigid-state"),
-            root.join("plugins/common"),
-            root.join("abi/include"),
-            estimator.join("src"),
-            estimator.join("include"),
-        ];
-        if up_to_date(&[&lib, &reference], &inputs) {
-            return (lib, reference);
-        }
-        let status = Command::new(root.join("scripts/build-est-rigid-state.sh"))
-            .arg(&lib)
-            .arg(&reference)
-            .status()
-            .expect("run build-est-rigid-state.sh (needs $CXX and Eigen headers in $EIGEN_INCLUDE)");
-        assert!(status.success(), "building est-rigid-state failed");
-        (lib, reference)
+        let installed = |name: &str| {
+            let path = std::env::var_os(name).filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| panic!("set {name} to the owning rigid-state product's installed artifact (docs/native_adapter.md)"));
+            assert!(path.is_absolute() && path.is_file(), "{name} must name an existing absolute installed artifact: {}", path.display());
+            path
+        };
+        (installed("RIGID_STATE_NATIVE_LIBRARY"), installed("RIGID_STATE_REFERENCE_BIN"))
     })
 }
 
