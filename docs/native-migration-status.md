@@ -8,7 +8,7 @@ establish deployment on a vehicle. Exact sources, commands and results are in
 | Component | Current native entry | Evidence and boundary |
 |---|---|---|
 | Rigid-state ESKF | `est-rigid-state` | Upstream runtime and FSM compiled into the plugin; byte-equivalent replay and ROS sensor integration. |
-| Hover-thrust estimator | `est-hover-thrust` | Upstream runtime and FSM; byte-equivalent replay and real estimator output in the five-module composition fixture. |
+| Hover-thrust estimator | Domain-owned `hover-thrust/hover_thrust_estimator/native` | Shared ROS/native runtime and FSM; built/installed domain ELF. Generic Host fixtures require explicit `HTE_NATIVE_LIBRARY`; no runtime-tree source builder. |
 | DFBC kernel | `ctl-dfbc` | Upstream controller functions; byte-equivalent kernel replay. This standalone plugin is distinct from the DFBC tracking backend inside `ctl-px4`. |
 | PX4 multirotor control | `ctl-px4` | Links current ROS-free controller core and real acados runtime; byte-equivalent PX4 local, DFBC and NMPC core traces. |
 | Reference generation | `ref-trajectory` | Links current ROS-free core; retained analytic/sample payloads and state sequences compared with the ROS node/core; UAV waypoint and external polynomial interfaces retired. |

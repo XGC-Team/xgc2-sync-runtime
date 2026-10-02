@@ -40,8 +40,8 @@ if sum(map(int, counts)) != int(sys.argv[2]):
 PY
 }
 
-gate native-equivalence 3 cargo test -p xgc-rt-host \
-  --test est_rigid_state --test est_hover_thrust --test ctl_dfbc -- --nocapture --test-threads=1
+gate native-equivalence 2 cargo test -p xgc-rt-host \
+  --test est_rigid_state --test ctl_dfbc -- --nocapture --test-threads=1
 gate ros-baseline 6 cargo test -p xgc-rt-host \
   --test ros_io --test ref_trajectory_ros_io --test px4_ros_io -- --nocapture --test-threads=1
 
@@ -61,4 +61,4 @@ for backend in px4_local dfbc nmpc; do
 done
 gate native-composition 5 cargo test -p xgc-rt-host --test ctl_px4_ros_io -- --nocapture --test-threads=1
 sha256sum "$out"/*.log "$out"/replays/* > "$out/SHA256SUMS"
-echo "18 native/ROS functional tests executed; no environment skips. Software plant only."
+echo "17 native/ROS functional tests executed; no environment skips. Software plant only."

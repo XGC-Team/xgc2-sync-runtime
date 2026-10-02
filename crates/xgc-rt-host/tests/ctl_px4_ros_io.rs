@@ -135,7 +135,12 @@ bind = {{ analytic = {{ channel = "ref_request", from = ["uav1"] }}, status = {{
         ""
     };
     let hover_plugin = if native_hover {
-        let (module, _) = common::est_hover_thrust();
+        let module = std::path::PathBuf::from(
+            std::env::var("HTE_NATIVE_LIBRARY")
+                .expect("set HTE_NATIVE_LIBRARY to the installed domain-owned HTE ELF"),
+        );
+        assert!(module.is_absolute() && module.is_file(),
+                "HTE_NATIVE_LIBRARY must be an actual absolute installed artifact; no source fallback");
         format!(r#"
 [[plugin]]
 name = "hover-thrust"
