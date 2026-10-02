@@ -35,6 +35,19 @@ typedef struct xgc_attitude_target_v1 {
   uint32_t reserved;
 } xgc_attitude_target_v1;
 
+/* "xgc.attitude_target/2": complete MAVROS AttitudeTarget payload.
+ * /1 remains byte-for-byte unchanged for existing thrust observers.
+ * type_mask preserves MAVROS IGNORE_* bits; ignored payload is not rewritten.
+ * Quaternion rotates body FLU into ENU; body_rate is in FLU rad/s. */
+typedef struct xgc_attitude_target_v2 {
+  double stamp;
+  double q_wxyz[4];
+  double body_rate[3];
+  double thrust;          /* normalized [0, 1], unless IGNORE_THRUST is set */
+  uint32_t type_mask;
+  uint32_t reserved;
+} xgc_attitude_target_v2;
+
 /* "xgc.pose/1": position and orientation in the Session world frame. */
 typedef struct xgc_pose_v1 {
   double stamp;
@@ -254,6 +267,43 @@ typedef struct xgc_fcu_request_v1 {
   char mode[32];          /* kind 2: custom mode, NUL-terminated */
 } xgc_fcu_request_v1;
 
+/* "xgc.fcu_request/2": simulation FCU request with result correlation.
+ * /1 remains the unchanged physical service-client boundary.
+ * flags bit 0 preserves forced disarm; a model may explicitly refuse it. */
+typedef struct xgc_fcu_request_v2 {
+  double stamp;
+  uint32_t kind;
+  uint32_t arm;
+  char mode[32];
+  uint64_t request_id;
+  uint32_t flags;
+  uint32_t reserved;
+} xgc_fcu_request_v2;
+
+/* "xgc.fcu_result/1": event, one executed request in a six-robot batch.
+ * result is MAV_RESULT: 0 accepted, 1 temporary rejection, 2 denied,
+ * 3 unsupported, 4 failed. No successful result is produced on mere enqueue. */
+typedef struct xgc_fcu_result_v1 {
+  double stamp;
+  double request_stamp;
+  uint64_t request_id;
+  uint32_t robot_index;
+  uint32_t kind;
+  uint32_t result;
+  uint32_t reserved;
+} xgc_fcu_result_v1;
+
+/* "xgc.fcu_extended_state/1": one same-stamp batch snapshot.
+ * landed_state uses MAV_LANDED_STATE; vtol_state=0 for these quadrotors. */
+typedef struct xgc_fcu_extended_state_v1 {
+  double stamp;
+  uint32_t count;
+  uint32_t reserved;
+  uint8_t landed_state[6];
+  uint8_t vtol_state[6];
+  uint8_t reserved_tail[4];
+} xgc_fcu_extended_state_v1;
+
 /* "xgc.controller_status/1": the controller's control-region state name. */
 typedef struct xgc_controller_status_v1 {
   double stamp;
@@ -340,6 +390,7 @@ typedef struct xgc_ref_reset_v1 {
 #endif
 XGC_SCHEMA_ASSERT(sizeof(xgc_imu_v1) == 56, "xgc_imu_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_target_v1) == 56, "xgc_attitude_target_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_attitude_target_v2) == 80, "xgc_attitude_target_v2");
 XGC_SCHEMA_ASSERT(sizeof(xgc_pose_v1) == 64, "xgc_pose_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_hover_thrust_v1) == 64, "xgc_hover_thrust_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_rigid_state_v1) == 112, "xgc_rigid_state_v1");
@@ -359,6 +410,9 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_clock_v1) == 8, "xgc_clock_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_position_target_v1) == 104, "xgc_position_target_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_body_rate_thrust_v1) == 40, "xgc_body_rate_thrust_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_request_v1) == 48, "xgc_fcu_request_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_request_v2) == 64, "xgc_fcu_request_v2");
+XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_result_v1) == 40, "xgc_fcu_result_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_extended_state_v1) == 32, "xgc_fcu_extended_state_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_controller_status_v1) == 56, "xgc_controller_status_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_header_v1) == 48, "xgc_ref_header_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_analytic_v1) == 144, "xgc_ref_analytic_v1");

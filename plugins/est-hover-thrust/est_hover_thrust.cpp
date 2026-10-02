@@ -40,7 +40,7 @@ namespace {
 namespace hte = hover_thrust_estimator;
 namespace sm = state_machine;
 
-enum Port : uint32_t { kImu = 0, kAttitudeTarget = 1, kPose = 2, kHoverThrust = 3 };
+enum Port : uint32_t { kImu = 0, kAttitudeTarget = 1, kPose = 2, kHoverThrust = 3, kAttitudeTargetFull = 4 };
 
 struct Pending {
   double stamp;
@@ -158,7 +158,7 @@ struct EstHoverThrust {
   xgc_status step(const xgc_step_ctx* ctx) {
     pending.clear();
     xgc_sample_view view;
-    for (uint32_t port : {kImu, kAttitudeTarget, kPose}) {
+    for (uint32_t port : {kImu, kAttitudeTarget, kPose, kAttitudeTargetFull}) {
       while (host->next(host->host, port, &view) == XGC_OK) {
         if (port == kImu && view.len == sizeof(xgc_imu_v1)) {
           xgc_imu_v1 m;
@@ -168,6 +168,12 @@ struct EstHoverThrust {
           xgc_attitude_target_v1 m;
           std::memcpy(&m, view.data, sizeof m);
           pending.push_back({m.stamp, port, m.thrust, m.ignore_thrust != 0});
+        } else if (port == kAttitudeTargetFull && view.len == sizeof(xgc_attitude_target_v2)) {
+          xgc_attitude_target_v2 m;
+          std::memcpy(&m, view.data, sizeof m);
+          // Only this transport conversion is new. The estimator receives the
+          // same normalized command and IGNORE_THRUST semantics as /1.
+          pending.push_back({m.stamp, kAttitudeTarget, m.thrust, (m.type_mask & 64) != 0});
         } else if (port == kPose && view.len == sizeof(xgc_pose_v1)) {
           xgc_pose_v1 m;
           std::memcpy(&m, view.data, sizeof m);
@@ -269,15 +275,16 @@ const char* domain_state(void* p) {
 
 const xgc_port_decl kPorts[] = {
     {"imu", XGC_PORT_IN, "xgc.imu/1", XGC_QOS_STATE},
-    {"attitude_target", XGC_PORT_IN, "xgc.attitude_target/1", XGC_QOS_STATE},
+    {"attitude_target", XGC_PORT_IN_OPTIONAL, "xgc.attitude_target/1", XGC_QOS_STATE},
     {"pose", XGC_PORT_IN, "xgc.pose/1", XGC_QOS_STATE},
     {"hover_thrust", XGC_PORT_OUT, "xgc.hover_thrust/1", XGC_QOS_STATE},
+    {"attitude_target_full", XGC_PORT_IN_OPTIONAL, "xgc.attitude_target/2", XGC_QOS_STATE},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
 
 const xgc_plugin_descriptor kDescriptor = {
-    XGC_RT_ABI_VERSION, 4u, "est-hover-thrust", "0.1.0", kPorts, &kVtbl,
+    XGC_RT_ABI_VERSION, 5u, "est-hover-thrust", "0.2.0", kPorts, &kVtbl,
 };
 
 }  // namespace

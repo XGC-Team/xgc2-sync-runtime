@@ -95,7 +95,7 @@ namespace sm = state_machine;
 enum Port : uint32_t {
   kEstimate, kLocalPose, kLocalVelocity, kImu, kFcuState, kBattery, kVrpnPose, kCommand, kClock,
   kSetpoint, kAttitudeRate, kFcuRequest, kStatus, kTrace, kAlgSetpoint, kHoverThrust,
-  kRefActiveAnalytic, kRefActiveSampled, kRefRequest, kTickDone, kPortCount
+  kRefActiveAnalytic, kRefActiveSampled, kRefRequest, kTickDone, kAttitudeCommand, kFcuRequestFull, kPortCount
 };
 constexpr uint32_t kFirstStatsPort = kEstimate;
 constexpr uint32_t kStatsPorts = 7;  // estimate .. vrpn_pose, in port order
@@ -139,6 +139,7 @@ bool read(const std::vector<uint8_t>& d, T* out) {
 std::string bounded(const char* s, size_t n) { return std::string(s, strnlen(s, n)); }
 
 struct CtlPx4 {
+  uint64_t fcu_request_sequence{0};
   const xgc_host_api* host{nullptr};
   pmc::SensorData sensor;
   pmc::DroneController controller{sensor};
@@ -503,6 +504,15 @@ struct CtlPx4 {
         const auto& a = controller.getAttitudeRateTarget();
         const xgc_body_rate_thrust_v1 m{t, {a.body_rate_x, a.body_rate_y, a.body_rate_z}, a.thrust};
         publish(kAttitudeRate, round, &m, sizeof m);
+        xgc_attitude_target_v2 full{};
+        full.stamp = t;
+        full.q_wxyz[0] = 1.0; // ignored: this is a body-rate command
+        full.body_rate[0] = a.body_rate_x;
+        full.body_rate[1] = a.body_rate_y;
+        full.body_rate[2] = a.body_rate_z;
+        full.thrust = a.thrust;
+        full.type_mask = 128; // MAVROS IGNORE_ATTITUDE, rates/thrust active
+        if (!publish(kAttitudeCommand, round, &full, sizeof full)) return false;
         if (trace) appendHex(line, "art", {a.body_rate_x, a.body_rate_y, a.body_rate_z, a.thrust});
       } else if (e.id == pmc::output_event_type::REQUEST_ARMING) {
         const auto it = e.payload.find("arm");
@@ -512,6 +522,10 @@ struct CtlPx4 {
           m.kind = 1;
           m.arm = std::get<bool>(it->second) ? 1u : 0u;
           publish(kFcuRequest, round, &m, sizeof m);
+          xgc_fcu_request_v2 full{};
+          std::memcpy(&full, &m, sizeof m);
+          full.request_id = ++fcu_request_sequence;
+          publish(kFcuRequestFull, round, &full, sizeof full);
         }
       } else if (e.id == pmc::output_event_type::REQUEST_MODE) {
         const auto it = e.payload.find("mode");
@@ -521,6 +535,10 @@ struct CtlPx4 {
           m.kind = 2;
           std::strncpy(m.mode, std::get<std::string>(it->second).c_str(), sizeof m.mode - 1);
           publish(kFcuRequest, round, &m, sizeof m);
+          xgc_fcu_request_v2 full{};
+          std::memcpy(&full, &m, sizeof m);
+          full.request_id = ++fcu_request_sequence;
+          publish(kFcuRequestFull, round, &full, sizeof full);
         }
       } else if (e.id == pmc::output_event_type::PUBLISH_REFERENCE_TRAJECTORY_ACTIVATION) {
         activateReference(e, t, round);
@@ -707,11 +725,13 @@ const xgc_port_decl kPorts[kPortCount] = {
     {"ref_active_sampled", XGC_PORT_IN_OPTIONAL, "xgc.ref.sampled/1", XGC_QOS_STATE},
     {"ref_request", XGC_PORT_OUT_OPTIONAL, "xgc.ref.analytic/1", XGC_QOS_EVENT},
     {"tick_done", XGC_PORT_OUT_OPTIONAL, "xgc.clock/1", XGC_QOS_EVENT},
+    {"attitude_command", XGC_PORT_OUT_OPTIONAL, "xgc.attitude_target/2", XGC_QOS_CONTROL},
+    {"fcu_request_full", XGC_PORT_OUT_OPTIONAL, "xgc.fcu_request/2", XGC_QOS_EVENT},
 };
 
 const xgc_plugin_vtbl kVtbl = {create, configure, activate, step, deactivate, destroy, domain_state};
 
-const xgc_plugin_descriptor kDescriptor = {XGC_RT_ABI_VERSION, kPortCount, "ctl-px4", "0.1.0", kPorts, &kVtbl};
+const xgc_plugin_descriptor kDescriptor = {XGC_RT_ABI_VERSION, kPortCount, "ctl-px4", "0.2.0", kPorts, &kVtbl};
 
 }  // namespace
 
