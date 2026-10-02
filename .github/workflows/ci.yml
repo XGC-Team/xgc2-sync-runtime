@@ -1,0 +1,61 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  build-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build one header-only all Deb and refuse artifact overwrite
+        run: .xgc2/scripts/build_debs_in_docker.sh --output-dir "$GITHUB_WORKSPACE/debs" --work-dir "$RUNNER_TEMP/sdk-build"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-sdk-deb-bytes
+          path: debs/*.deb
+          retention-days: 14
+  build-debs:
+    name: Install and check identical SDK Deb (${{ matrix.arch }})
+    needs: build-sdk
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-sdk-deb-bytes
+          path: debs
+      - name: Actual installed ownership, ABI and missing-payload negatives
+        run: |
+          mapfile -t debs < <(find debs -maxdepth 1 -type f -name '*.deb')
+          test "${#debs[@]}" -eq 1
+          .xgc2/scripts/build_debs_in_docker.sh --deb "${debs[0]}" --architecture "${{ matrix.arch }}"
+      - name: Create strict source-bound build manifest
+        run: |
+          version="$(awk '/^version:/ {print $2; exit}' .xgc2/product.yml)"
+          python3 .xgc2/scripts/xgc2_artifact_manifest.py build \
+            --deb-dir debs --output-dir .ci/build-manifests \
+            --product libxgc2-runtime-sdk-dev --product-version "$version" \
+            --distribution focal --architecture "${{ matrix.arch }}" \
+            --source-sha "$GITHUB_SHA" --ci-run-id "$GITHUB_RUN_ID" \
+            --ci-workflow "$GITHUB_WORKFLOW" --ci-workflow-ref "$GITHUB_WORKFLOW_REF"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libxgc2-runtime-sdk-dev-debs-${{ matrix.arch }}
+          path: |
+            debs/*.deb
+            .ci/build-manifests/*.json
+          retention-days: 14
+          include-hidden-files: true

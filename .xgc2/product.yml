@@ -1,5 +1,5 @@
 schema: xgc2.product.v1
-id: libxgc-runtime-sdk-dev
+id: libxgc2-runtime-sdk-dev
 name: XGC Runtime SDK
 version: 0.1.0-1
 kind: toolchain-apt
@@ -7,15 +7,15 @@ summary: Header-only C/C++ plugin, clock-source and wire SDK for XGC Runtime con
 apt:
   distribution: focal
   install:
-  - libxgc-runtime-sdk-dev
+  - libxgc2-runtime-sdk-dev
   packages:
-  - libxgc-runtime-sdk-dev
+  - libxgc2-runtime-sdk-dev
   package_architectures:
-    libxgc-runtime-sdk-dev:
+    libxgc2-runtime-sdk-dev:
     - all
   depends: []
 usage:
-  install: dpkg -i libxgc-runtime-sdk-dev_0.1.0-1~focal_all.deb
+  install: dpkg -i libxgc2-runtime-sdk-dev_0.1.0-1~focal_all.deb
   smoke_test: python3 abi/tests/test_sdk.py --work-dir /tmp/xgc-runtime-sdk-check
   notes: >-
     Consumers use find_package(XgcRuntimeSDK CONFIG REQUIRED) and link
@@ -31,5 +31,9 @@ ownership:
   - /usr/include/xgc-runtime
   - /usr/share/cmake/XgcRuntimeSDK
 release:
+  repository: XGC-Team/xgc2-sync-runtime
+  ref: main
+  ci_workflow: ci.yml
+  workflow: release.yml
   apt_versions:
     focal: 0.1.0-1~focal

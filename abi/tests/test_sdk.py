@@ -152,7 +152,7 @@ def main():
     fields = {}
     for field in ['Package', 'Version', 'Architecture', 'Depends']:
         fields[field] = run('dpkg-deb', '-f', deb, field).strip()
-    assert fields == {'Package': 'libxgc-runtime-sdk-dev', 'Version': '0.1.0-1~focal', 'Architecture': 'all', 'Depends': ''}, fields
+    assert fields == {'Package': 'libxgc2-runtime-sdk-dev', 'Version': '0.1.0-1~focal', 'Architecture': 'all', 'Depends': ''}, fields
     before = hashlib.sha256(deb.read_bytes()).hexdigest()
     run('bash', source / '.xgc2/scripts/build_deb.sh', '--output', deb_dir, success=False)
     assert hashlib.sha256(deb.read_bytes()).hexdigest() == before

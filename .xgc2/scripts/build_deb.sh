@@ -8,7 +8,7 @@ if [[ $# != 2 || "$1" != --output || -z "$2" ]]; then
   exit 2
 fi
 output="$2"
-package=libxgc-runtime-sdk-dev
+package=libxgc2-runtime-sdk-dev
 version="$(awk '$1 == "focal:" { print $2; exit }' "$root/.xgc2/product.yml")"
 base="$(awk '/^version:/ { print $2; exit }' "$root/.xgc2/product.yml")"
 [[ -n "$base" && "$version" == "$base~focal" ]] || { echo 'SDK product version/apt_versions.focal is missing or inconsistent' >&2; exit 2; }
@@ -35,6 +35,10 @@ Description: XGC Runtime header-only C and C++ SDK
 CONTROL
 # Build exactly one all-architecture artifact. A release orchestrator may later
 # publish these verified bytes; this local builder does not claim publication.
+epoch="${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct)}"
+[[ "$epoch" =~ ^[0-9]+$ ]] || { echo 'invalid SOURCE_DATE_EPOCH' >&2; exit 2; }
+export SOURCE_DATE_EPOCH="$epoch"
+find "$work/package" -exec touch -h -d "@$epoch" {} +
 dpkg-deb --root-owner-group --build "$work/package" "$work/sdk.deb"
 # Refuse a racing existing artifact instead of silently overwriting it.
 cp --no-clobber "$work/sdk.deb" "$deb"
