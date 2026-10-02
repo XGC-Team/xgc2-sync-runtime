@@ -258,3 +258,33 @@ fn production_unknown_bound_and_loaded_descriptor_checks_are_consumed() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("loaded descriptor"));
     }
 }
+
+#[test]
+fn required_short_probe_interval_passes_with_three_fresh_samples() {
+    let plugin = common::lib("stub_perception");
+    let dir = common::scratch("required-short-clock-pair");
+    let bin = fake_chrony(&dir);
+    let port = common::listen_port();
+    let epoch = WallClock::new(0).now() + 2_000_000_000;
+    let short = |node: &str, role: &str, transport: &str| {
+        strict_manifest(node, role, epoch, 200, transport, &plugin)
+            .replace("interval_ms = 100", "interval_ms = 10")
+            .replace("stale_after_ms = 800", "stale_after_ms = 100")
+    };
+    let server = short("station", "server", &format!("kind=\"zenoh\"\nlisten=[\"tcp/127.0.0.1:{port}\"]"));
+    let client = short("uav1", "client", &format!("kind=\"zenoh\"\nconnect=[\"tcp/127.0.0.1:{port}\"]"));
+    let a = host_process(&dir, "server.toml", &server, &bin);
+    let b = host_process(&dir, "client.toml", &client, &bin);
+    let (a_status, a) = output(a);
+    let (b_status, b) = output(b);
+    assert!(a_status.success(), "reference: {a}");
+    assert!(b_status.success(), "10 ms probes / 100 ms TTL cannot establish or retain admission: {b}");
+    assert_eq!(a["e0_ns"], b["e0_ns"]);
+    assert!(b["plugins"][0]["steps"].as_u64().unwrap() > 0);
+    assert!(b["plugins"][0]["published"].as_u64().unwrap() > 0);
+    let log = std::fs::read_to_string(dir.join("audit/uav1/clock.jsonl")).unwrap();
+    assert!(log.lines().filter_map(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+        .any(|v| v["accepted"] == true && v["estimate"]["samples"].as_u64().is_some_and(|n| n >= 3)));
+    let health = std::fs::read_to_string(dir.join("audit/uav1/health.jsonl")).unwrap();
+    assert!(health.contains("clock_gate_passed"));
+}

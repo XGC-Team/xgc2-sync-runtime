@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use xgc_rt_clock::{ChronyTracking, Estimate, ProbeEstimator, ProbeSample};
-use xgc_rt_core::manifest::{ClockRole, ResolvedClock};
+use xgc_rt_core::manifest::{ClockRole, ResolvedClock, CLOCK_STARTUP_PROBE_MAX_INTERVAL_MS};
 use xgc_rt_core::transport::TransportError;
 use xgc_rt_core::OriginId;
 
@@ -199,7 +199,8 @@ impl ClockService {
         }
     }
 
-    /// The startup probe cadence remains 100 ms; no change to round scheduling.
+    /// Startup probes use the faster of the configured interval and 100 ms;
+    /// this clock-service cadence does not alter Session round scheduling.
     pub fn tick(&mut self, fast: bool) {
         let now = Instant::now();
         let _ = self.guard.failure();
@@ -212,7 +213,9 @@ impl ClockService {
         }
         // Bound outstanding requests even with unusually long configured TTLs.
         while self.pending.len() > 4096 { self.pending.pop_front(); }
-        self.next_probe = now + if fast { Duration::from_millis(100) } else { self.interval };
+        self.next_probe = now + if fast {
+            self.interval.min(Duration::from_millis(CLOCK_STARTUP_PROBE_MAX_INTERVAL_MS))
+        } else { self.interval };
     }
 
     pub fn on_frame(&mut self, f: &RxFrame) -> bool {

@@ -50,7 +50,8 @@ malformed, failed or timed-out observations are failures, never zero error.
 Each command has a 500 ms wall timeout and runs outside module scheduling.
 
 A client also needs at least three fresh four-stamp probe samples whose
-estimated bound is within `gate_ms`. Startup probes retain the 100 ms cadence.
+estimated bound is within `gate_ms`. Startup probes use `min(interval_ms, 100 ms)`;
+the required freshness window must exceed two such intervals to admit three samples.
 Replies must match the reference origin, an outstanding nonce and its exact
 original transmit stamp; consumed, expired or unmatched requests cannot refresh
 the window. Required clients reject unknown/degraded reference replies. The

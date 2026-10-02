@@ -188,6 +188,8 @@ fn default_probe_window() -> usize {
 /// Reserved channels the host appends when `[clock]` is set.
 pub const CLOCK_REQ_CHANNEL: &str = "xgc/clock/req";
 pub const CLOCK_REP_CHANNEL: &str = "xgc/clock/rep";
+/// Startup probes may accelerate a slow configured cadence, never slow a fast one.
+pub const CLOCK_STARTUP_PROBE_MAX_INTERVAL_MS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedClock {
@@ -395,6 +397,9 @@ impl Manifest {
                         .any(|v| !v.is_finite() || *v <= 0.0 || *v > 4_000.0) {
                     return err("clock requires positive finite gates, bounded interval/timeout/window, and stale_after_ms > interval_ms".into());
                 }
+                if c.required && c.stale_after_ms <= 2 * c.interval_ms.min(CLOCK_STARTUP_PROBE_MAX_INTERVAL_MS) {
+                    return err("clock.stale_after_ms must strictly contain three startup probe samples: increase it above 2 * min(interval_ms, 100)".into());
+                }
                 if c.chrony_source.as_ref().is_some_and(|v| v.is_empty() || v.len() > 255 || v.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())) {
                     return err("clock.chrony_source must be a nonempty exact external source name".into());
                 }
@@ -572,6 +577,23 @@ chrony_source="station"
 interval_ms=100
 stale_after_ms=500
 "#).unwrap()
+    }
+
+    #[test]
+    fn required_clock_ttl_strictly_contains_three_startup_samples() {
+        for interval_ms in [10, 100] {
+            let mut value = manifest();
+            let clock = value.clock.as_mut().unwrap();
+            clock.interval_ms = interval_ms;
+            clock.stale_after_ms = 2 * interval_ms;
+            assert!(value.resolve().unwrap_err().0.contains("three startup probe samples"));
+            value.clock.as_mut().unwrap().stale_after_ms += 1;
+            assert!(value.resolve().is_ok());
+        }
+        let mut value = manifest();
+        value.clock.as_mut().unwrap().interval_ms = 200;
+        value.clock.as_mut().unwrap().stale_after_ms = 201;
+        assert!(value.resolve().is_ok(), "the 100 ms startup cap, not twice the steady interval, determines initial sample spacing");
     }
 
     #[test]

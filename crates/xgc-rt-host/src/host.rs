@@ -1460,7 +1460,9 @@ impl Host {
                     break;
                 }
                 cs.tick(true);
-                rt.endpoint.wait(Duration::from_millis(20));
+                let poll = Duration::from_millis(20);
+                let wait = cs.next_due().map_or(poll, |at| at.saturating_duration_since(Instant::now()).min(poll));
+                rt.endpoint.wait(wait);
             }
             let cs = self.clock_service.as_ref().unwrap();
             let estimate = cs.estimate();
