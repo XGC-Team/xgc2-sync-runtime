@@ -15,7 +15,6 @@ members = [
   "plugins/stub-control",
   "plugins/dmpc-exchange-demo",
   "plugins/station-io",
-  "plugins/numeric-vehicle",
   "plugins/transport-loopback",
   "plugins/transport-zenoh",
 ]

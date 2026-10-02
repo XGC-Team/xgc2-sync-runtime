@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -30,26 +29,18 @@ const VEHICLE_A: &str = "vehicle-a";
 const VEHICLE_B: &str = "vehicle-b";
 const FEEDER: &str = "feeder";
 
+// The simulator product owns compilation and installation. Generic Host tests
+// consume one explicit installed artifact and never rebuild domain sources.
 fn lightweight_vehicle_elf() -> &'static Path {
     static ELF: OnceLock<PathBuf> = OnceLock::new();
     ELF.get_or_init(|| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
-        let output = root.join("target/plugin-tests/cpp/liblightweight_vehicle.so");
-        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
-        let status = Command::new(root.join("scripts/build-lightweight-vehicle.sh"))
-            .arg(&output)
-            .status()
-            .expect("run scripts/build-lightweight-vehicle.sh (needs C++17 and Eigen headers)");
-        assert!(status.success(), "building lightweight-vehicle ELF failed");
-        assert!(
-            output.is_file(),
-            "build script did not create {}",
-            output.display()
-        );
-        output
+        let path = std::env::var_os("XGC_LIGHTWEIGHT_ELF")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .expect("set XGC_LIGHTWEIGHT_ELF to the independent lightweight-sim owner's installed ELF");
+        assert!(path.is_absolute() && path.is_file(),
+                "XGC_LIGHTWEIGHT_ELF must name an existing absolute installed artifact: {}", path.display());
+        path
     })
 }
 
@@ -537,13 +528,14 @@ fn position_target(stamp: f64, acceleration: [f64; 3]) -> Vec<u8> {
 }
 
 fn fcu_request(stamp: f64, kind: u32, arm: u32, mode: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(48);
+    let mut bytes = Vec::with_capacity(64);
     bytes.extend_from_slice(&stamp.to_le_bytes());
     bytes.extend_from_slice(&kind.to_le_bytes());
     bytes.extend_from_slice(&arm.to_le_bytes());
     let mut text = [0u8; 32];
     text[..mode.len()].copy_from_slice(mode.as_bytes());
     bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&[0; 16]); // /2 correlation ID, flags and reserved
     bytes
 }
 
@@ -570,7 +562,7 @@ impl Outputs {
 }
 
 #[test]
-fn a_batch_instance_reproduces_independent_plants_at_every_output_stamp() {
+fn a_batch_reproduces_independent_states_and_disabled_providers_reject_controls() {
     let elf = lightweight_vehicle_elf();
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lightweight-vehicle-batch-test");
     let _ = std::fs::remove_dir_all(&dir);
@@ -630,8 +622,8 @@ fn a_batch_instance_reproduces_independent_plants_at_every_output_stamp() {
         for r in 0..BATCH_ROBOTS {
             let phase = (step * (r as i64 + 1)) as f64;
             let a = [0.2 * r as f64 - 0.1, 0.1 * phase.sin(), 0.5 + 0.1 * phase.cos()];
-            // A 20 ms control stream (climbing); robot 1 lands at 150 ms and
-            // robot 2's in-air disarm at 350 ms is refused.
+            // These inputs cannot activate a provider. The domain's explicit
+            // CAS lifecycle is intentionally absent from this generic Host test.
             if step % 2 == 0 && !(r == 1 && step >= 15) {
                 send(format!("cmd-{r}"), now, position_target(stamp, a));
             }
@@ -667,9 +659,12 @@ fn a_batch_instance_reproduces_independent_plants_at_every_output_stamp() {
     }
     let fcu = |r: usize| outputs.0[&(batch_channel(&format!("b-fcu-{r}")), ((EPOCH_NS + 400_000_000) as f64 * 1e-9).to_bits())].clone();
     let mode = |bytes: &[u8]| String::from_utf8_lossy(&bytes[16..]).trim_end_matches('\0').to_string();
-    assert_eq!(mode(&fcu(0)), "OFFBOARD");
-    assert_eq!(mode(&fcu(1)), "AUTO.LAND");
-    assert_eq!(fcu(2)[9], 1, "robot 2 stays armed: in-air disarm refused");
+    for r in 0..BATCH_ROBOTS {
+        let state = fcu(r);
+        assert_eq!(state[8], 0, "inactive provider {r} must stay disconnected");
+        assert_eq!(state[9], 0, "inactive provider {r} must not accept arming");
+        assert_ne!(mode(&state), "OFFBOARD", "inactive provider {r} must not accept mode changes");
+    }
 
     let summary_b = batch.stop_and_join();
     let summary_i = independent.stop_and_join();

@@ -1,3 +1,4 @@
+//! Station IPC/scheduling fixtures only, not flight or controller acceptance.
 //! 1 ms period and no step_budget_ms: hang limit is period * HANG_FACTOR = 10 ms.
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,7 +13,8 @@ use xgc_rt_host::{Host, HostOptions};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 use zenoh::Wait;
 
-fn elf(name: &str) -> PathBuf {
+fn elf(variable: &str, name: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(variable) { return PathBuf::from(path); }
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug").join(name)
 }
 
@@ -85,61 +87,30 @@ qos="control"
     text
 }
 
+fn paired_source(dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let output = dir.join("paired-source.so");
+    let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../abi/include");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/paired_source.c");
+    assert!(Command::new("cc").args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC", "-I"])
+        .arg(include).arg(source).arg("-o").arg(&output).status().unwrap().success());
+    output
+}
+
 #[test]
-fn one_host_at_one_millisecond_answers_prepare_without_abandon() {
-    let station = elf("libstation_io.so");
-    let vehicle = elf("libnumeric_vehicle.so");
-    let bin = elf("station-io-cmd");
-    assert!(station.is_file() && vehicle.is_file() && bin.is_file());
+fn one_host_at_one_millisecond_answers_command_without_abandon() {
+    let station = elf("STATION_IO_ELF", "libstation_io.so");
+    let bin = elf("STATION_IO_CMD", "station-io-cmd");
+    assert!(station.is_file() && bin.is_file());
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
     let _peer = peer(&endpoint);
     let socket = format!("/tmp/xgc-sio-1ms-{}.sock", std::process::id());
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("station-1ms");
-    let mut text = format!(
-        r#"[session]
-id="station-1ms"
-node="n1"
-roster=["n1"]
-period_ms=1
-start_delay_ms=40
-run_for_ms=2000
-[transport]
-kind="loopback"
-[audit]
-dir="audit"
-[[channel]]
-name="paired"
-qos="state"
-[[channel]]
-name="status"
-qos="state"
-[[channel]]
-name="command"
-qos="event"
-[[channel]]
-name="pva"
-qos="control"
-"#
-    );
-    let config = format!(
-        "{{robot_id=\"xgc2e-0123456789abcdef0001\",zenoh_connect={endpoint:?},command_socket={socket:?},authority=true,command=true,mission=false}}"
-    );
-    text += &plugin_line(
-        "station-io",
-        &station,
-        &config,
-        r#"{paired_state={channel="paired",from=["n1"]},controller_status={channel="status",from=["n1"]},command={channel="command"}}"#,
-    );
-    text += &plugin_line(
-        "numeric-vehicle",
-        &vehicle,
-        "{initial_position=[1.0,0.0,0.0],initial_velocity=[0.2,0.0,0.0]}",
-        r#"{command={channel="command",from=["n1"]},position_target={channel="pva",from=["n1"]},paired_state={channel="paired"},controller_state={channel="status"}}"#,
-    );
+    let source = paired_source(&dir);
+    let manifest = station_manifest("xgc2e-0123456789abcdef0001", &endpoint, &socket, &station, &source, true);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_host = Arc::clone(&stop);
-    let manifest = text;
     let host_dir = dir.clone();
     let runner = thread::spawn(move || run(manifest, &host_dir, &stop_host));
     let socket_path = PathBuf::from(&socket);
@@ -148,18 +119,20 @@ qos="control"
         assert!(!runner.is_finished(), "host exited before the socket");
         thread::sleep(Duration::from_millis(5));
     }
-    let output = Command::new(&bin).args([&socket, "command", "prepare"]).output().unwrap();
+    // Queue acceptance is the IPC assertion; this fixture has no controller.
+    let output = Command::new(&bin).args([&socket, "command", "takeoff"]).output().unwrap();
+    thread::sleep(Duration::from_millis(400));
+    stop.store(true, Ordering::Relaxed);
+    let summary = runner.join().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("os error 11"), "{stderr}");
     assert!(output.status.success(), "{stderr}");
     assert_eq!(output.stdout, b"queued\n");
-    thread::sleep(Duration::from_millis(400));
-    stop.store(true, Ordering::Relaxed);
-    let summary = runner.join().unwrap();
     let station_summary = summary.plugins.iter().find(|p| p.name == "station-io").unwrap();
     assert_eq!(station_summary.abandons, 0, "{station_summary:?}");
     assert!(station_summary.steps > 200, "steps {}", station_summary.steps);
     assert!(summary.aborted.is_none(), "{:?}", summary.aborted);
+    assert!(!socket_path.exists(), "station did not release the fixture socket");
 }
 
 #[test]
@@ -196,20 +169,9 @@ fn eight_host_child() {
 
 #[test]
 fn eight_hosts_keep_stepping_inside_ten_milliseconds() {
-    let station = elf("libstation_io.so");
-    let bin = elf("station-io-cmd");
-    let plant_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/paired_source.c");
-    let plant = Path::new(env!("CARGO_TARGET_TMPDIR")).join("paired-source.so");
-    let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../abi/include");
-    assert!(Command::new("cc")
-        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC", "-I"])
-        .arg(&include)
-        .arg(&plant_src)
-        .arg("-o")
-        .arg(&plant)
-        .status()
-        .unwrap()
-        .success());
+    let station = elf("STATION_IO_ELF", "libstation_io.so");
+    let bin = elf("STATION_IO_CMD", "station-io-cmd");
+    let plant = paired_source(&Path::new(env!("CARGO_TARGET_TMPDIR")).join("station-eight-fixture"));
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
     let _peer = peer(&endpoint);
@@ -251,7 +213,7 @@ fn eight_hosts_keep_stepping_inside_ten_milliseconds() {
     let mut replies = Vec::new();
     if failures.is_empty() {
         for (_, socket, _, _) in &children {
-            let output = Command::new(&bin).args([socket, "command", "prepare"]).output().unwrap();
+            let output = Command::new(&bin).args([socket, "command", "takeoff"]).output().unwrap();
             replies.push((socket.clone(), output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned()));
         }
         thread::sleep(Duration::from_millis(300));

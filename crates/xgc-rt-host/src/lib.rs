@@ -4,7 +4,6 @@
 pub mod clock_service;
 pub mod clock_source;
 pub mod clock_source_abi;
-pub mod deployment;
 pub mod endpoint;
 pub mod host;
 pub mod plugin;

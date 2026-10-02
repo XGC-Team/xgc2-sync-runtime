@@ -1520,7 +1520,7 @@ impl Host {
         let mut last_round: Option<u64> = None;
         let mut rounds = 0u64;
         let mut wakeups = 0u64;
-        let mut last_liveness = Instant::now();
+        let mut last_liveness = Instant::now() - Duration::from_secs(1);
         loop {
             if let Some(reason) = rt.clock_guard.as_ref().and_then(|gate| gate.failure()) {
                 aborted = Some(reason);
@@ -1529,11 +1529,32 @@ impl Host {
                 source.check_health();
                 source.clock.commit_host_time();
                 if let Some(reason) = source.clock.snapshot().fault { aborted = Some(reason); }
-                if last_liveness.elapsed() >= Duration::from_secs(1) {
-                    let snapshot = source.clock.snapshot();
-                    rt.health.event(serde_json::json!({"event":"host_liveness", "clock_runnable":snapshot.runnable, "clock_generation":snapshot.generation}));
-                    last_liveness = Instant::now();
-                }
+            }
+            // A generic observation of the actual lifecycle, not a product
+            // readiness decision. Product probes also check generation/PID
+            // identity and their workspace's data readiness requirements.
+            if last_liveness.elapsed() >= Duration::from_secs(1) {
+                let source = rt.clock.dispatch_stamp();
+                let modules: Vec<_> = rt.modules.iter().map(|module| {
+                    let status = module.status.lock().unwrap();
+                    serde_json::json!({
+                        "name": module.name, "state": status.fsm.state().name(),
+                        "last_error": status.last_error, "abandons": status.abandons,
+                        "steps": module.steps.load(Ordering::Relaxed),
+                        "published": module.published.load(Ordering::Relaxed),
+                        "consumed": module.consumed.load(Ordering::Relaxed),
+                    })
+                }).collect();
+                let wall_unix_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos().min(i64::MAX as u128) as i64).unwrap_or(0);
+                rt.health.event(serde_json::json!({
+                    "event": "host_liveness", "pid": std::process::id(),
+                    "session": self.manifest.session.id, "node": self.manifest.session.node,
+                    "epoch_ns": e0, "wall_unix_ns": wall_unix_ns, "valid_for_ms": 3000,
+                    "clock_runnable": rt.clock_runnable() && source.as_ref().map_or(true, |s| s.runnable),
+                    "clock_generation": source.map(|s| s.generation), "modules": modules,
+                }));
+                last_liveness = Instant::now();
             }
             let now = rt.clock.now();
             if stop.load(Ordering::Relaxed) || stop_at.is_some_and(|t| now >= t) || aborted.is_some() {

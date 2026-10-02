@@ -24,9 +24,5 @@ libc = "0.2"
 name = "xgc-rt-host"
 path = "src/main.rs"
 
-[[bin]]
-name = "xgc-rt-render"
-path = "src/bin/xgc-rt-render.rs"
-
 [dev-dependencies]
 xgc-rt-impair.workspace = true

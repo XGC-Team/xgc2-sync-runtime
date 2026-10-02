@@ -4,8 +4,10 @@
 //!   XGC_LIGHTWEIGHT_BENCH=1 cargo test --release -p xgc-rt-host \
 //!       --test lightweight_bench -- --nocapture
 //!
+//! Required environment:
+//!   XGC_LIGHTWEIGHT_ELF            independent owner's installed plugin
+//!
 //! Optional environment:
-//!   XGC_LIGHTWEIGHT_ELF            prebuilt plugin (default: build this tree's)
 //!   XGC_LIGHTWEIGHT_BENCH_SECONDS  measured seconds per run (default 5)
 //!   XGC_LIGHTWEIGHT_BENCH_ROBOTS   robot counts (default 1,32,100)
 //!   XGC_LIGHTWEIGHT_BENCH_SHAPES   per-robot-round,per-robot-dirty,batch,
@@ -19,7 +21,7 @@
 //!
 //! Shapes: `per-robot-round` is one instance per robot stepped on every 1 ms
 //! round (today's manifests); `per-robot-dirty` keeps one instance per robot
-//! but wakes it on input or every output period; `batch` puts up to 8 robots
+//! but wakes it on input or every output period; `batch` puts up to 6 robots
 //! in one instance with the same wake rule (needs the 64-port plugin);
 //! `batch-round10` is a dedicated plant host whose 10 ms rounds (the output
 //! period) wake each batch instance, and inputs never do.
@@ -58,7 +60,7 @@ use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 const OUTPUT_MS: u64 = 10;
 const WARMUP_MS: u64 = 1000;
 const STARTUP_MS: i64 = 3000;
-const BATCH: usize = 8;
+const BATCH: usize = 6;
 const OUTPUTS: [&str; 5] = ["pose", "velocity", "imu", "fcu_state", "paired_state"];
 /// Core's lightweight plant timing and step-log bound (DefaultTiming,
 /// StepLogLinesPerSecond).
@@ -71,15 +73,13 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 fn plugin_elf() -> PathBuf {
-    if let Ok(path) = std::env::var("XGC_LIGHTWEIGHT_ELF") {
-        return PathBuf::from(path);
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let output = root.join("target/plugin-tests/cpp/liblightweight_vehicle.so");
-    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
-    let status = Command::new(root.join("scripts/build-lightweight-vehicle.sh")).arg(&output).status().unwrap();
-    assert!(status.success(), "building lightweight-vehicle ELF failed");
-    output
+    let path = std::env::var_os("XGC_LIGHTWEIGHT_ELF")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .expect("set XGC_LIGHTWEIGHT_ELF to the independent lightweight-sim owner's installed ELF");
+    assert!(path.is_absolute() && path.is_file(),
+            "XGC_LIGHTWEIGHT_ELF must name an existing absolute installed artifact: {}", path.display());
+    path
 }
 
 /// The ROS-free ros_io stand-in for the `platform` shape.
@@ -229,7 +229,7 @@ impl Layout {
 }
 
 /// Core's deployment graph for `robots` FS150 (manifest.go HostManifest):
-/// channels `uavN/<port>`, plants `plant-fs150-<i>` of up to 8 robots stepped
+/// channels `uavN/<port>`, plants `plant-fs150-<i>` of up to 6 robots stepped
 /// on the 10 ms round, and edges `ros-uavN-mavros` / `ros-uavN-mocap`.
 fn platform_manifest(robots: usize, commanded: bool, plant: &Path, edge: &Path, epoch: i64, run_for_ms: u64) -> String {
     let body = |r: usize| format!("uav{}", r + 1);
