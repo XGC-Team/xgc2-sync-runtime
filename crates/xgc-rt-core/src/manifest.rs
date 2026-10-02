@@ -157,7 +157,20 @@ pub struct ClockSpec {
     pub gate_timeout_ms: u64,
     #[serde(default = "default_probe_window")]
     pub window: usize,
+    /// HIL admission: fail before activation, and latch failure on lost validity.
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default = "default_probe_stale_ms")]
+    pub stale_after_ms: u64,
+    /// Exact selected source from the existing external chrony service.
+    pub chrony_source: Option<String>,
+    #[serde(default = "default_gate_ms")]
+    pub chrony_max_offset_ms: f64,
+    #[serde(default = "default_gate_ms")]
+    pub chrony_max_uncertainty_ms: f64,
 }
+
+fn default_probe_stale_ms() -> u64 { 3_000 }
 
 fn default_probe_interval_ms() -> u64 {
     1_000
@@ -186,6 +199,11 @@ pub struct ResolvedClock {
     pub gate_ns: i64,
     pub gate_timeout_ns: i64,
     pub window: usize,
+    pub required: bool,
+    pub stale_after_ns: i64,
+    pub chrony_source: Option<String>,
+    pub chrony_max_offset_ns: i64,
+    pub chrony_max_uncertainty_ns: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,6 +254,9 @@ pub struct PluginDecl {
     pub path: PathBuf,
     /// Hex sha256 of the library. When set, loading refuses any other bytes.
     pub sha256: Option<String>,
+    /// Exact values from the loaded library descriptor, checked before create.
+    pub expected_name: Option<String>,
+    pub expected_version: Option<String>,
     pub trigger: Trigger,
     #[serde(default)]
     pub restart: RestartPolicy,
@@ -366,8 +387,20 @@ impl Manifest {
                 if (c.role == ClockRole::Server) != (server == node_id) {
                     return err("clock role must be server exactly on the server node".into());
                 }
-                if c.interval_ms == 0 || !(c.gate_ms.is_finite() && c.gate_ms > 0.0) || c.window == 0 {
-                    return err("clock interval_ms, gate_ms and window must be positive".into());
+                if c.interval_ms == 0 || c.interval_ms > 60_000
+                    || c.gate_timeout_ms == 0 || c.gate_timeout_ms > 300_000
+                    || c.stale_after_ms <= c.interval_ms || c.stale_after_ms > 300_000
+                    || !(1..=1024).contains(&c.window)
+                    || [c.gate_ms, c.chrony_max_offset_ms, c.chrony_max_uncertainty_ms].iter()
+                        .any(|v| !v.is_finite() || *v <= 0.0 || *v > 4_000.0) {
+                    return err("clock requires positive finite gates, bounded interval/timeout/window, and stale_after_ms > interval_ms".into());
+                }
+                if c.chrony_source.as_ref().is_some_and(|v| v.is_empty() || v.len() > 255 || v.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())) {
+                    return err("clock.chrony_source must be a nonempty exact external source name".into());
+                }
+                if c.required && (c.chrony_source.is_none() || c.window < 3
+                    || !s.epoch_ns.is_some_and(|e| e > 0 && e <= i64::MAX - 10_000_000_000)) {
+                    return err("required clock needs chrony_source, window >= 3 and positive shared session.epoch_ns; synchronize externally and freeze a future Session epoch".into());
                 }
                 let mut add = |name: &str| -> Result<ChannelId, ManifestError> {
                     if channel_ids.contains_key(name) {
@@ -389,6 +422,11 @@ impl Manifest {
                     gate_ns: (c.gate_ms * 1e6) as i64,
                     gate_timeout_ns: c.gate_timeout_ms as i64 * 1_000_000,
                     window: c.window,
+                    required: c.required,
+                    stale_after_ns: c.stale_after_ms as i64 * 1_000_000,
+                    chrony_source: c.chrony_source.clone(),
+                    chrony_max_offset_ns: (c.chrony_max_offset_ms * 1e6) as i64,
+                    chrony_max_uncertainty_ns: (c.chrony_max_uncertainty_ms * 1e6) as i64,
                 })
             }
         };
@@ -396,6 +434,9 @@ impl Manifest {
         let mut plugin_names = BTreeSet::new();
         let mut bindings = Vec::new();
         for p in &self.plugins {
+            if [&p.expected_name, &p.expected_version].iter().any(|v| v.as_ref().is_some_and(|v| v.is_empty() || v.len() > 256 || v.bytes().any(|b| b.is_ascii_control()))) {
+                return err(format!("plugin {}: expected_name/expected_version must be nonempty descriptor strings", p.name));
+            }
             if !valid_name(&p.name) || !plugin_names.insert(&p.name) {
                 return err(format!("plugin {:?} is invalid or repeated", p.name));
             }
@@ -504,5 +545,49 @@ only_uav3 = { channel = "dmpc/plan", from = ["uav3"] }
         ] {
             assert!(Manifest::from_toml_str(&bad).unwrap().resolve().is_err(), "accepted:\n{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod required_clock_tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        Manifest::from_toml_str(r#"
+[session]
+id="test"
+node="client"
+roster=["server","client"]
+period_ms=10
+epoch_ns=1000000000
+[transport]
+kind="loopback"
+[audit]
+dir="audit"
+[clock]
+role="client"
+server="server"
+required=true
+chrony_source="station"
+interval_ms=100
+stale_after_ms=500
+"#).unwrap()
+    }
+
+    #[test]
+    fn required_clock_cannot_default_to_unknown_external_source_or_local_epoch() {
+        let good = manifest(); assert!(good.resolve().is_ok());
+        let mut bad = good.clone(); bad.clock.as_mut().unwrap().chrony_source = None;
+        assert!(bad.resolve().unwrap_err().0.contains("chrony_source"));
+        let mut bad = good.clone(); bad.session.epoch_ns = None;
+        assert!(bad.resolve().unwrap_err().0.contains("shared session.epoch_ns"));
+        let mut bad = good.clone(); bad.clock.as_mut().unwrap().window = 2;
+        assert!(bad.resolve().is_err());
+        let mut bad = good.clone(); bad.clock.as_mut().unwrap().stale_after_ms = 100;
+        assert!(bad.resolve().is_err());
+        let mut bad = good.clone(); bad.clock.as_mut().unwrap().gate_timeout_ms = u64::MAX;
+        assert!(bad.resolve().is_err());
+        let mut bad = good; bad.clock.as_mut().unwrap().chrony_source = Some("".into());
+        assert!(bad.resolve().is_err());
     }
 }

@@ -16,6 +16,9 @@
 //! window (the NTP clock filter idea): its interval is the tightest.
 
 use std::collections::VecDeque;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeSample {
@@ -50,31 +53,52 @@ pub struct Estimate {
 
 #[derive(Debug, Clone)]
 pub struct ProbeEstimator {
-    window: VecDeque<ProbeSample>,
+    window: VecDeque<(Instant, ProbeSample)>,
     capacity: usize,
+    stale_after: Duration,
 }
 
 impl ProbeEstimator {
     pub fn new(capacity: usize) -> Self {
-        Self { window: VecDeque::new(), capacity: capacity.max(1) }
+        Self::with_expiry(capacity, Duration::from_secs(3))
     }
 
-    /// Add a completed probe. A sample with negative delay is inconsistent
-    /// (a clock stepped mid-probe) and is rejected.
-    pub fn add(&mut self, s: ProbeSample) -> bool {
-        if s.delay_ns() < 0 || s.t3 < s.t2 || s.t4 < s.t1 {
+    pub fn with_expiry(capacity: usize, stale_after: Duration) -> Self {
+        assert!(!stale_after.is_zero());
+        Self { window: VecDeque::new(), capacity: capacity.max(1), stale_after }
+    }
+
+    /// Invalid/replayed replies must be rejected by the caller before add.
+    /// Individual samples expire on steady time, including an old minimum-delay
+    /// sample while newer, less accurate replies continue arriving.
+    pub fn add(&mut self, s: ProbeSample) -> bool { self.add_at(s, Instant::now()) }
+
+    pub fn add_at(&mut self, s: ProbeSample, received: Instant) -> bool {
+        // Validate with wide arithmetic before the public i64 metrics are used.
+        let delay = (s.t4 as i128 - s.t1 as i128) - (s.t3 as i128 - s.t2 as i128);
+        let offset_sum = (s.t2 as i128 - s.t1 as i128) + (s.t3 as i128 - s.t4 as i128);
+        if s.t3 < s.t2 || s.t4 < s.t1 || !(0..i64::MAX as i128).contains(&delay)
+            || offset_sum.abs() > i64::MAX as i128
+            || (offset_sum / 2).abs() + (delay + 1) / 2 > i64::MAX as i128
+            || [s.t2 as i128 - s.t1 as i128, s.t3 as i128 - s.t4 as i128,
+                s.t4 as i128 - s.t1 as i128, s.t3 as i128 - s.t2 as i128]
+                .iter().any(|v| v.abs() > i64::MAX as i128) {
             return false;
         }
-        if self.window.len() == self.capacity {
-            self.window.pop_front();
-        }
-        self.window.push_back(s);
+        self.window.retain(|(at, _)| received.saturating_duration_since(*at) < self.stale_after);
+        if self.window.len() == self.capacity { self.window.pop_front(); }
+        self.window.push_back((received, s));
         true
     }
 
-    pub fn estimate(&self) -> Option<Estimate> {
-        let best = self.window.iter().min_by_key(|s| s.delay_ns())?;
-        Some(Estimate { offset_ns: best.offset_ns(), delay_ns: best.delay_ns(), bound_ns: best.bound_ns(), samples: self.window.len() })
+    pub fn estimate(&self) -> Option<Estimate> { self.estimate_at(Instant::now()) }
+
+    pub fn estimate_at(&self, now: Instant) -> Option<Estimate> {
+        let fresh: Vec<_> = self.window.iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < self.stale_after)
+            .map(|(_, sample)| sample).collect();
+        let best = fresh.iter().min_by_key(|s| s.delay_ns())?;
+        Some(Estimate { offset_ns: best.offset_ns(), delay_ns: best.delay_ns(), bound_ns: best.bound_ns(), samples: fresh.len() })
     }
 }
 
@@ -98,13 +122,16 @@ impl ChronyTracking {
         if f.len() < 14 {
             return None;
         }
-        Some(Self {
+        let value = Self {
             reference: f[1].to_string(),
             system_offset_s: f[4].parse().ok()?,
             root_delay_s: f[10].parse().ok()?,
             root_dispersion_s: f[11].parse().ok()?,
             leap_status: f[13].to_string(),
-        })
+        };
+        if [value.system_offset_s, value.root_delay_s, value.root_dispersion_s].iter().any(|v| !v.is_finite())
+            || value.root_delay_s < 0.0 || value.root_dispersion_s < 0.0 { return None; }
+        Some(value)
     }
 
     /// chrony's maximum error: |offset| + root dispersion + root delay / 2.
@@ -112,13 +139,58 @@ impl ChronyTracking {
         ((self.system_offset_s.abs() + self.root_dispersion_s + self.root_delay_s / 2.0) * 1e9).ceil() as i64
     }
 
-    /// Run `chronyc -c tracking`; None when chrony is not installed or fails.
+    /// Read-only observation of the external service, bounded in wall time.
     pub fn read() -> Option<Self> {
-        let out = std::process::Command::new("chronyc").args(["-c", "tracking"]).output().ok()?;
-        if !out.status.success() {
-            return None;
+        Self::parse_csv(&chronyc(&["-c", "tracking"]).ok()?)
+    }
+
+    /// Existing external-clock contract: a selected frozen source, Normal leap,
+    /// and separate offset/uncertainty bounds. This never adjusts system time.
+    pub fn read_checked(source: &str, max_offset_ns: i64, max_uncertainty_ns: i64) -> Result<Self, String> {
+        let tracking = Self::parse_csv(&chronyc(&["-c", "tracking"])?).ok_or("invalid chronyc tracking fields")?;
+        tracking.check(&chronyc(&["sources", "-v"])?, source, max_offset_ns, max_uncertainty_ns)?;
+        Ok(tracking)
+    }
+
+    pub fn check(&self, sources: &str, source: &str, max_offset_ns: i64, max_uncertainty_ns: i64) -> Result<(), String> {
+        let selected = sources.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let state = fields.next()?;
+            (matches!(state, "^*" | "=*" | "#*")).then(|| fields.next()).flatten()
+        }).ok_or("chrony has no selected external source")?;
+        if source.is_empty() || selected != source { return Err(format!("chrony selected source {selected:?} differs from frozen chrony_source {source:?}")); }
+        if self.leap_status != "Normal" { return Err(format!("chrony leap status is {:?}, requires Normal", self.leap_status)); }
+        if [self.system_offset_s, self.root_delay_s, self.root_dispersion_s].iter().any(|v| !v.is_finite())
+            || self.root_delay_s < 0.0 || self.root_dispersion_s < 0.0 { return Err("invalid chrony clock measurements".into()); }
+        if self.system_offset_s.abs() * 1e9 > max_offset_ns as f64 { return Err("chrony offset exceeds frozen preflight gate".into()); }
+        if (self.root_dispersion_s + self.root_delay_s / 2.0) * 1e9 > max_uncertainty_ns as f64 { return Err("chrony uncertainty exceeds frozen preflight gate".into()); }
+        Ok(())
+    }
+}
+
+/// Run in the service's observation thread, never the module/round scheduler.
+/// Missing/hung chrony is failed evidence, not an implicit zero bound.
+fn chronyc(args: &[&str]) -> Result<String, String> {
+    let mut child = Command::new("chronyc").args(args).stdin(Stdio::null())
+        .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| format!("chronyc unavailable: {e}"))?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() { return Err(format!("chronyc failed: {status}")); }
+                let mut text = String::new();
+                child.stdout.take().ok_or("chronyc stdout unavailable")?.take(65_537)
+                    .read_to_string(&mut text).map_err(|e| format!("chronyc output: {e}"))?;
+                if text.len() > 65_536 { return Err("chronyc output exceeds limit".into()); }
+                return Ok(text);
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            state => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match state { Err(e) => format!("chronyc wait: {e}"), _ => "chronyc timed out".into() });
+            }
         }
-        Self::parse_csv(&String::from_utf8_lossy(&out.stdout))
     }
 }
 
@@ -171,5 +243,39 @@ mod tests {
         assert_eq!(t.leap_status, "Normal");
         assert_eq!(t.bound_ns(), 562_345);
         assert!(ChronyTracking::parse_csv("short,line").is_none());
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    #[test]
+    fn every_sample_expires_even_when_new_replies_keep_arriving() {
+        let start = Instant::now();
+        let mut estimator = ProbeEstimator::with_expiry(8, Duration::from_millis(100));
+        assert!(estimator.add_at(ProbeSample { t1: 0, t2: 1, t3: 1, t4: 2 }, start));
+        assert!(estimator.add_at(ProbeSample { t1: 100, t2: 120, t3: 120, t4: 140 }, start + Duration::from_millis(90)));
+        assert_eq!(estimator.estimate_at(start + Duration::from_millis(99)).unwrap().bound_ns, 1);
+        let fresh = estimator.estimate_at(start + Duration::from_millis(100)).unwrap();
+        assert_eq!((fresh.bound_ns, fresh.samples), (20, 1));
+        assert!(estimator.estimate_at(start + Duration::from_millis(190)).is_none());
+    }
+
+    #[test]
+    fn external_clock_requires_exact_selected_source_normal_leap_and_both_limits() {
+        let good = ChronyTracking { reference: "station".into(), system_offset_s: 0.00001,
+            root_delay_s: 0.00002, root_dispersion_s: 0.00003, leap_status: "Normal".into() };
+        assert!(good.check("^* station 2 6 377 1", "station", 2_000_000, 2_000_000).is_ok());
+        for sources in ["", "^? station 2 6 0 0", "^* station-copy 2 6 377 1"] {
+            assert!(good.check(sources, "station", 2_000_000, 2_000_000).is_err());
+        }
+        let mut bad = good.clone(); bad.leap_status = "Not synchronised".into();
+        assert!(bad.check("^* station", "station", 2_000_000, 2_000_000).is_err());
+        let mut bad = good.clone(); bad.system_offset_s = 0.003;
+        assert!(bad.check("^* station", "station", 2_000_000, 2_000_000).unwrap_err().contains("offset"));
+        let mut bad = good; bad.root_dispersion_s = 0.003;
+        assert!(bad.check("^* station", "station", 2_000_000, 2_000_000).unwrap_err().contains("uncertainty"));
+        assert!(ChronyTracking::parse_csv("x,station,3,0,NaN,0,0,0,0,0,0,0,1,Normal").is_none());
     }
 }
