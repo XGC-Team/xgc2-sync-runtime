@@ -1,8 +1,0 @@
-namespace: /uav1/mpc
-node_namespace: /uav1
-loads:
-  - {file: scenario.yaml}
-  - {file: formation_patterns.yaml, param: formation_patterns}
-params:
-  uav_id: 1
-  num_uavs: 3

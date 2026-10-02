@@ -8,11 +8,9 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::workspace_root;
 use sha2::{Digest, Sha256};
 
 /// Current plan-dmpc port indices (kPorts 0..15).
@@ -171,26 +169,11 @@ pub fn library_path(env: &Env) -> String {
     format!("{}:{}:{}", acados_lib.display(), core_lib.display(), prev)
 }
 
-pub fn plan_dmpc_lib(env: &Env) -> &'static PathBuf {
+pub fn plan_dmpc_lib(_env: &Env) -> &'static PathBuf {
     static LIB: OnceLock<PathBuf> = OnceLock::new();
     LIB.get_or_init(|| {
-        let build = workspace_root().join("target/plugin-tests/cpp/plan-dmpc-build");
-        std::fs::create_dir_all(&build).unwrap();
-        let status = Command::new(workspace_root().join("scripts/build-plan-dmpc.sh"))
-            .args([
-                "--core-prefix",
-                env.core_prefix.to_str().unwrap(),
-                "--acados-prefix",
-                env.acados_prefix.to_str().unwrap(),
-                "--build-dir",
-                build.to_str().unwrap(),
-            ])
-            .env("LD_LIBRARY_PATH", library_path(env))
-            .status()
-            .expect("run build-plan-dmpc.sh");
-        assert!(status.success(), "building plan-dmpc failed");
-        let lib = build.join("libplan_dmpc.so");
-        assert!(lib.is_file(), "missing {}", lib.display());
+        let lib = require_path("PLAN_DMPC_NATIVE_LIBRARY");
+        assert!(lib.is_absolute() && lib.is_file(), "PLAN_DMPC_NATIVE_LIBRARY must name the owning installed adapter");
         lib
     })
 }

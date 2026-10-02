@@ -26,7 +26,7 @@ pub fn plugin_dir() -> &'static Path {
         let target = root.join("target/plugin-tests");
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
-            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "-p", "dmpc-rounds", "-p", "transport-loopback", "-p", "transport-zenoh", "--target-dir"])
+            .args(["build", "-q", "-p", "stub-perception", "-p", "stub-estimation", "-p", "stub-planning", "-p", "stub-control", "-p", "dmpc-exchange-demo", "-p", "transport-loopback", "-p", "transport-zenoh", "--target-dir"])
             .arg(&target)
             .status()
             .expect("run cargo");
@@ -72,6 +72,12 @@ pub fn scratch(name: &str) -> PathBuf {
 }
 
 pub fn lib(name: &str) -> String {
+    if name == "dmpc_rounds" {
+        let path = std::env::var_os("DMPC_ROUNDS_NATIVE_LIBRARY").map(PathBuf::from)
+            .expect("set DMPC_ROUNDS_NATIVE_LIBRARY to the owning formation_generator installed adapter");
+        assert!(path.is_absolute() && path.is_file(), "DMPC_ROUNDS_NATIVE_LIBRARY must name an absolute installed artifact");
+        return path.display().to_string();
+    }
     plugin_dir().join(format!("lib{name}.so")).display().to_string()
 }
 
