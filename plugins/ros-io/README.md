@@ -25,6 +25,13 @@ checks same-step stamps, measured poses and body twists at zero and 90-degree
 yaw. `bash plugins/ros-io/run-odometry-test.sh` checks coordinate and rejection
 cases without ROS; neither test certifies an algorithm experiment.
 
+Each step services the plugin's ROS queue once without blocking and then
+keeps servicing it, in waits of at most 1 ms, for `slice_ms` (never past 1 ms
+before the round's deadline; without `slice_ms`, until then). A remainder
+shorter than the kernel's 50 us timer slack is not waited, so the lightweight
+plant's `slice_ms = 0.001` steps are one non-blocking pass.
+`bash plugins/ros-io/run-slice-test.sh` checks this arithmetic without ROS.
+
 ## Lightweight controller live check
 
 `lightweight_controller_live.py` runs the FS150 plant and the real ctl-px4 SMC controller in separate `xgc-rt-host` processes. It sends the plant/controller channels over Zenoh TCP and uses the existing ROS master only for test commands, PVA setpoints, and observed ROS outputs. Source the ROS environment and prepare a reachable ROS master first; this script does not start ROS, MAVROS, or Docker. It checks the existing takeoff, 10-second trajectory tracking, endpoint error, and landing sequence. It does not validate DMPC or a complete experiment.
