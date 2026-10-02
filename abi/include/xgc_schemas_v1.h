@@ -304,6 +304,28 @@ typedef struct xgc_fcu_extended_state_v1 {
   uint8_t reserved_tail[4];
 } xgc_fcu_extended_state_v1;
 
+/* World-owned simulation provider lifecycle. Actions: 0 observe, 1 start CAS, 2 stop.
+ * Start inactive requires expected current generation; active retry accepts
+ * current or its predecessor. Stop is fenced by current generation. Results
+ * always report current generation/enabled, including rejected old requests.
+ * Re-start after stop resets only this body at a model advance boundary. */
+typedef struct xgc_sim_provider_request_v1 {
+  double stamp;
+  uint64_t request_id;
+  uint64_t generation;
+  uint32_t robot_index;
+  uint32_t action;
+} xgc_sim_provider_request_v1;
+typedef struct xgc_sim_provider_result_v1 {
+  double stamp;
+  uint64_t request_id;
+  uint64_t generation;
+  uint32_t robot_index;
+  uint32_t accepted;
+  uint32_t enabled;
+  uint32_t reason; /* 0 accepted, 1 stale generation, 2 invalid action/slot */
+} xgc_sim_provider_result_v1;
+
 /* "xgc.controller_status/1": the controller's control-region state name. */
 typedef struct xgc_controller_status_v1 {
   double stamp;
@@ -413,6 +435,8 @@ XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_request_v1) == 48, "xgc_fcu_request_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_request_v2) == 64, "xgc_fcu_request_v2");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_result_v1) == 40, "xgc_fcu_result_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_fcu_extended_state_v1) == 32, "xgc_fcu_extended_state_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_sim_provider_request_v1) == 32, "xgc_sim_provider_request_v1");
+XGC_SCHEMA_ASSERT(sizeof(xgc_sim_provider_result_v1) == 40, "xgc_sim_provider_result_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_controller_status_v1) == 56, "xgc_controller_status_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_header_v1) == 48, "xgc_ref_header_v1");
 XGC_SCHEMA_ASSERT(sizeof(xgc_ref_analytic_v1) == 144, "xgc_ref_analytic_v1");
