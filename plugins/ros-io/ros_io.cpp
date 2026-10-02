@@ -71,6 +71,9 @@
 // and the plugin's `wake_ms` to the same value: each step then services ROS
 // for at most one slice, and module outputs (the planner's local
 // FormationTick) reach ROS within about a slice instead of a round.
+// `sim_mocap_position_stddev_m = [x,y,z]` enables publication-side mocap
+// position measurement noise on sim_pose only; absent means exact plant pose.
+// `sim_mocap_noise_seed` selects a reproducible per-robot stream (default 1).
 
 #include <algorithm>
 #include <cmath>
@@ -97,6 +100,7 @@
 #include <mavros_msgs/State.h>
 #include <nav_msgs/Odometry.h>
 #include "sim_odometry.hpp"
+#include "sim_mocap.hpp"
 #include <multirotor_reference_trajectory_msgs/AnalyticReference.h>
 #include <multirotor_reference_trajectory_msgs/ReferenceStatus.h>
 #include <multirotor_reference_trajectory_msgs/SampledReference.h>
@@ -220,6 +224,7 @@ struct RosIo {
   std::string sim_odometry_topic;
   std::string sim_odometry_child_frame;
   xgc_pose_v1 sim_pose_cache{};
+  std::unique_ptr<SimMocapMeasurement> sim_mocap;
   xgc_twist_v1 sim_velocity_cache{};
   bool have_sim_pose{false}, have_sim_velocity{false};
   double last_sim_odometry_stamp{0};
@@ -614,6 +619,9 @@ struct RosIo {
       if (v.len != sizeof(xgc_pose_v1)) continue;
       xgc_pose_v1 s;
       std::memcpy(&s, v.data, sizeof s);
+      // Only the explicitly configured mocap edge synthesizes a measurement.
+      // Other consumers of this plant sample retain the unmodified truth.
+      if (sim_mocap && !sim_mocap->sample(s, &s)) continue;
       geometry_msgs::PoseStamped m;
       m.header.stamp.fromSec(s.stamp);
       m.header.frame_id = frame_id;
@@ -1073,6 +1081,21 @@ xgc_status configure(void* p, const char* config) {
     }
     self->node_name = cfg::text_or(t, "node_name", "xgc_ros_io");
     self->frame_id = cfg::text_or(t, "frame_id", "world");
+    std::string noise_config;
+    if (cfg::value(t, "sim_mocap_position_stddev_m", &noise_config)) {
+      std::array<double, 3> stddev{};
+      double seed = 1.0;
+      if (self->topics[kSimPose].empty() || !self->sim_odometry_topic.empty() ||
+          !cfg::numbers(t, "sim_mocap_position_stddev_m", stddev.data(), stddev.size()) ||
+          !cfg::number(t, "sim_mocap_noise_seed", &seed) ||
+          !std::isfinite(seed) || seed < 0.0 || seed > UINT32_MAX || std::floor(seed) != seed)
+        throw std::invalid_argument("sim mocap requires sim_pose, no sim_odometry, and valid noise parameters");
+      self->sim_mocap = std::make_unique<SimMocapMeasurement>(stddev, static_cast<uint32_t>(seed));
+    } else {
+      if (cfg::value(t, "sim_mocap_noise_seed", &noise_config))
+        throw std::invalid_argument("sim_mocap_noise_seed requires sim_mocap_position_stddev_m");
+      self->sim_mocap.reset();
+    }
     if (!cfg::number(t, "slice_ms", &self->slice_ms) || self->slice_ms < 0.0) {
       self->log(XGC_LOG_ERROR, "ros_io: invalid slice_ms");
       return XGC_ERR;
