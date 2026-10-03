@@ -56,6 +56,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn check_pin(path: &Path, digest: &str, expected_sha256: Option<&str>) -> Result<(), LoadError> {
+    if let Some(want) = expected_sha256 {
+        if !want.eq_ignore_ascii_case(digest) {
+            return Err(LoadError(format!("{}: sha256 {digest} does not match the manifest pin {want}", path.display())));
+        }
+    }
+    Ok(())
+}
+
 fn text(ptr: *const std::ffi::c_char, what: &str) -> Result<String, LoadError> {
     if ptr.is_null() {
         return Err(LoadError(format!("{what} is null")));
@@ -70,11 +79,7 @@ fn text(ptr: *const std::ffi::c_char, what: &str) -> Result<String, LoadError> {
 pub fn load(path: &Path, expected_sha256: Option<&str>) -> Result<LoadedPlugin, LoadError> {
     let bytes = std::fs::read(path).map_err(|e| LoadError(format!("{}: {e}", path.display())))?;
     let digest = sha256_hex(&bytes);
-    if let Some(want) = expected_sha256 {
-        if !want.eq_ignore_ascii_case(&digest) {
-            return Err(LoadError(format!("{}: sha256 {digest} does not match the manifest pin {want}", path.display())));
-        }
-    }
+    check_pin(path, &digest, expected_sha256)?;
     // SAFETY: loading runs the library's initializers. Only manifest-listed
     // libraries are loaded, and they can be pinned by digest above.
     let library = unsafe { libloading::Library::new(path) }.map_err(|e| LoadError(format!("{}: {e}", path.display())))?;
@@ -129,6 +134,11 @@ pub fn load(path: &Path, expected_sha256: Option<&str>) -> Result<LoadedPlugin, 
 }
 
 impl LoadedPlugin {
+    /// Each instance declaration must agree with the already loaded library.
+    pub fn check_pin(&self, path: &Path, expected_sha256: Option<&str>) -> Result<(), LoadError> {
+        check_pin(path, &self.sha256, expected_sha256)
+    }
+
     /// Resolve the separate clock-source ABI from this already hash-checked
     /// library. The owning Arc must outlive all copied function pointers.
     pub fn clock_source_vtable(&self) -> Result<crate::clock_source_abi::VTable, LoadError> {

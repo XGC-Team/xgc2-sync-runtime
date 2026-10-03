@@ -1137,11 +1137,22 @@ impl Host {
             .and_then(|file| LineLog::spawn(BufWriter::new(file), false, "xgc-steps"))
             .map_err(|e| HostError(format!("step log: {e}")))?;
 
-        // Load and validate every plugin before opening the transport.
+        // A Host loads each actual library once; instance declarations still
+        // validate their own pins, descriptor expectations and port bindings.
         let mut loaded = Vec::new();
+        let mut libraries = BTreeMap::<_, Arc<LoadedPlugin>>::new();
         for (decl, bindings) in manifest.plugins.iter().zip(&resolved.bindings) {
-            let path = base_dir.join(&decl.path);
-            let lib = plugin::load(&path, decl.sha256.as_deref()).map_err(|e| HostError(e.0))?;
+            let declared_path = base_dir.join(&decl.path);
+            // Normalize the identity only; preserve the loader's $ORIGIN path.
+            let path = declared_path.canonicalize().map_err(|e| HostError(format!("{}: {e}", declared_path.display())))?;
+            let lib = if let Some(lib) = libraries.get(&path) {
+                lib.check_pin(&declared_path, decl.sha256.as_deref()).map_err(|e| HostError(e.0))?;
+                lib.clone()
+            } else {
+                let lib = Arc::new(plugin::load(&declared_path, decl.sha256.as_deref()).map_err(|e| HostError(e.0))?);
+                libraries.insert(path, lib.clone());
+                lib
+            };
             if decl.expected_name.as_ref().is_some_and(|v| v != &lib.name)
                 || decl.expected_version.as_ref().is_some_and(|v| v != &lib.version) {
                 return herr(format!("plugin {}: loaded descriptor {}/{} differs from expected_name {:?}, expected_version {:?}; install the frozen bundle", decl.name, lib.name, lib.version, decl.expected_name, decl.expected_version));
@@ -1271,7 +1282,7 @@ impl Host {
             modules.push(Module {
                 name: decl.name.clone(),
                 name_json: serde_json::to_string(&decl.name).map_err(|e| HostError(format!("plugin {} name: {e}", decl.name)))?,
-                lib: Arc::new(lib),
+                lib,
                 trigger: decl.trigger,
                 wake: decl.wake_ms.map(|ms| Duration::from_secs_f64(ms / 1e3)),
                 restart: decl.restart,
@@ -1693,6 +1704,105 @@ impl Host {
 
 fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
+}
+
+#[cfg(test)]
+mod loader_tests {
+    use super::*;
+    use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
+
+    #[test]
+    fn shared_libraries_keep_instance_configuration_and_declaration_checks() {
+        // Use the same Rust perception fixture as the existing Host tests,
+        // with its own target directory so nested Cargo cannot take our lock.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target")).join("plugin-tests");
+        let status = std::process::Command::new(env!("CARGO")).current_dir(&root)
+            .args(["build", "--offline", "--locked", "-q", "-p", "stub-perception", "--target-dir"])
+            .arg(&target).status().expect("build the existing perception fixture");
+        assert!(status.success(), "building the perception fixture failed");
+        let library = target.join("debug/libstub_perception.so");
+        let dir = target.join(format!("shared-library-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::copy(&library, dir.join("plugin.so")).unwrap();
+        std::os::unix::fs::symlink("plugin.so", dir.join("alias.so")).unwrap();
+        let pin = plugin::sha256_hex(&std::fs::read(&library).unwrap());
+        let text = format!(r#"
+[session]
+id = "shared-library"
+node = "node"
+roster = ["node"]
+period_ms = 10
+start_delay_ms = 50
+run_for_ms = 120
+[transport]
+kind = "loopback"
+[audit]
+dir = "audit"
+"#);
+        let mut manifest = Manifest::from_toml_str(&text).unwrap();
+        for (name, path, config) in [("left", "plugin.so", "payload_bytes = 32"),
+                                     ("right", "nested/../alias.so", "payload_bytes = 128"),
+                                     ("broken", "./plugin.so", "payload_bytes = 'invalid'")] {
+            let part = format!(r#"
+[[channel]]
+name = "{name}"
+qos = "state"
+[[plugin]]
+name = "{name}"
+path = "{path}"
+sha256 = "{pin}"
+expected_name = "stub-perception"
+expected_version = "0.1.0"
+trigger = "on_round"
+config = {{ {config} }}
+bind = {{ detections = {{ channel = "{name}" }} }}
+"#);
+            let part = Manifest::from_toml_str(&(text.clone() + &part)).unwrap();
+            manifest.channels.extend(part.channels);
+            manifest.plugins.extend(part.plugins);
+        }
+        let build = |manifest| Host::new(manifest, &dir,
+            Box::new(LoopbackTransport::new(LoopbackBus::new())),
+            Arc::new(xgc_rt_core::clock::WallClock::new(0)), HostOptions::default());
+        let host = build(manifest.clone()).unwrap();
+        let modules = &host.rt.modules;
+        assert!(Arc::ptr_eq(&modules[0].lib, &modules[1].lib));
+        assert!(Arc::ptr_eq(&modules[0].lib, &modules[2].lib));
+        assert_ne!(modules[0].config, modules[1].config);
+        assert!(!Arc::ptr_eq(&modules[0].current.read().unwrap(), &modules[1].current.read().unwrap()));
+        let summary = host.run(&AtomicBool::new(false)).unwrap();
+        for name in ["left", "right"] {
+            let instance = summary.plugins.iter().find(|p| p.name == name).unwrap();
+            assert!(instance.steps > 0 && instance.last_error.is_none(), "{instance:?}");
+        }
+        let broken = summary.plugins.iter().find(|p| p.name == "broken").unwrap();
+        assert_eq!(broken.state, "error");
+        assert!(broken.last_error.as_ref().unwrap().contains("configure returned"));
+
+        for (field, message) in [("sha256", "does not match the manifest pin"),
+                                  ("name", "differs from expected_name"),
+                                  ("version", "differs from expected_name"),
+                                  ("port", "manifest binds unknown port")] {
+            let mut changed = manifest.clone();
+            let second = &mut changed.plugins[1];
+            match field {
+                "sha256" => second.sha256 = Some("0".repeat(64)),
+                "name" => second.expected_name = Some("other-library".into()),
+                "version" => second.expected_version = Some("9.9.9".into()),
+                _ => { let binding = second.bind["detections"].clone(); second.bind.insert("unknown".into(), binding); }
+            }
+            let error = build(changed).err().expect("each reused declaration must be checked");
+            assert!(error.0.contains(message), "{field}: {error}");
+        }
+        // Identical bytes at a different actual path are separate libraries.
+        std::fs::copy(&library, dir.join("other.so")).unwrap();
+        manifest.plugins[1].path = PathBuf::from("other.so");
+        let other = build(manifest).unwrap();
+        assert!(!Arc::ptr_eq(&other.rt.modules[0].lib, &other.rt.modules[1].lib));
+        assert!(Arc::ptr_eq(&other.rt.modules[0].lib, &other.rt.modules[2].lib));
+    }
 }
 
 #[cfg(test)]
