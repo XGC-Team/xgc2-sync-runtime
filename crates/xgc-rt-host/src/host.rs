@@ -1340,6 +1340,7 @@ impl Host {
     /// Deliver link frames to every input that listens for their channel
     /// and origin.
     fn route(&mut self, frames: Vec<RxFrame>) {
+        if frames.is_empty() { return; }
         let rt = &self.rt;
         if rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable) { return; }
         let mut batches: Vec<Vec<(u32, Arc<Sample>)>> = vec![Vec::new(); rt.modules.len()];
