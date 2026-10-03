@@ -14,8 +14,8 @@
 //!                                  batch-round10,platform
 //!   XGC_LIGHTWEIGHT_BENCH_LOADS    idle,commanded
 //!   XGC_LIGHTWEIGHT_BENCH_OUT      JSON lines results file
-//!   XGC_ROS_EDGE_STANDIN_ELF       prebuilt ROS edge stand-in (default: build
-//!                                  tests/bench/ros_edge_standin.cpp with $CXX)
+//!   XGC_ROS_EDGE_STANDIN_ELF       installed ROS edge stand-in; required for
+//!                                  the platform shape (no source-build fallback)
 //!   XGC_ROS_EDGE_STANDIN_SLICE     `legacy`: the edges wait out every slice
 //!                                  remainder, as ros_io did before ros_slice.hpp
 //!
@@ -43,7 +43,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -84,28 +83,13 @@ fn plugin_elf() -> PathBuf {
 
 /// The ROS-free ros_io stand-in for the `platform` shape.
 fn edge_elf() -> PathBuf {
-    if let Ok(path) = std::env::var("XGC_ROS_EDGE_STANDIN_ELF") {
-        return PathBuf::from(path);
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let output = root.join("target/plugin-tests/cpp/libros_edge_standin.so");
-    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
-    let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
-    let status = Command::new(cxx)
-        .args(["-std=c++17", "-O2", "-fPIC", "-fvisibility=hidden", "-shared", "-Wall", "-Wextra", "-Werror"])
-        .arg("-I")
-        .arg(root.join("abi/include"))
-        .arg("-I")
-        .arg(root.join("plugins/common"))
-        .arg("-I")
-        .arg(root.join("plugins/ros-io"))
-        .arg(root.join("crates/xgc-rt-host/tests/bench/ros_edge_standin.cpp"))
-        .arg("-o")
-        .arg(&output)
-        .status()
-        .unwrap();
-    assert!(status.success(), "building the ROS edge stand-in failed");
-    output
+    let path = std::env::var_os("XGC_ROS_EDGE_STANDIN_ELF")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .expect("set XGC_ROS_EDGE_STANDIN_ELF to the installed owner-built stand-in for the platform shape");
+    assert!(path.is_absolute() && path.is_file(),
+            "XGC_ROS_EDGE_STANDIN_ELF must name an existing absolute installed artifact: {}", path.display());
+    path
 }
 
 #[derive(Clone, Copy, PartialEq)]

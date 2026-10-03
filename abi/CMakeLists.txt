@@ -22,8 +22,6 @@ target_include_directories(xgc_runtime_sdk INTERFACE
 install(FILES
   include/xgc_rt.h
   include/xgc_clock_source.h
-  include/xgc_schemas_v1.h
-  include/xgc_dmpc_planner_v1.h
   ../plugins/common/flat_config.hpp
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/xgc-runtime"
 )

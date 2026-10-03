@@ -81,22 +81,19 @@ pub fn lib(name: &str) -> String {
     plugin_dir().join(format!("lib{name}.so")).display().to_string()
 }
 
-/// Build `libctl_dfbc.so` and its replay reference (needs `$CXX` and
-/// `$EIGEN_INCLUDE`, default /usr/include/eigen3).
+/// Consume the owning math product's installed DFBC adapter and replay oracle.
 pub fn ctl_dfbc() -> &'static (PathBuf, PathBuf) {
     static OUT: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     OUT.get_or_init(|| {
-        let root = workspace_root();
-        let out = root.join("target/plugin-tests/cpp");
-        std::fs::create_dir_all(&out).unwrap();
-        let (lib, reference) = (out.join("libctl_dfbc.so"), out.join("dfbc_reference"));
-        let status = Command::new(root.join("scripts/build-ctl-dfbc.sh"))
-            .arg(&lib)
-            .arg(&reference)
-            .status()
-            .expect("run build-ctl-dfbc.sh (needs $CXX and Eigen headers in $EIGEN_INCLUDE)");
-        assert!(status.success(), "building ctl-dfbc failed");
-        (lib, reference)
+        let installed = |name: &str| {
+            let path = std::env::var_os(name).filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| panic!("set {name} to the owning math product's installed artifact"));
+            assert!(path.is_absolute() && path.is_file(),
+                    "{name} must name an existing absolute installed artifact: {}", path.display());
+            path
+        };
+        (installed("DFBC_NATIVE_LIBRARY"), installed("DFBC_REFERENCE_BIN"))
     })
 }
 
@@ -154,22 +151,15 @@ pub fn ctl_px4_lib(_prefix: &std::path::Path) -> &'static PathBuf {
     })
 }
 
-/// ref-trajectory built against the ROS-free reference trajectory core
-/// (REF_CORE_LIB_DIR and the other build-ref-trajectory.sh variables), with
-/// the toolchain that built the core (RoboStack's, when present).
-pub fn ref_trajectory_lib(prefix: &std::path::Path) -> &'static PathBuf {
+/// Consume the owning reference product's installed native adapter.
+pub fn ref_trajectory_lib(_prefix: &std::path::Path) -> &'static PathBuf {
     static LIB: OnceLock<PathBuf> = OnceLock::new();
     LIB.get_or_init(|| {
-        let out = workspace_root().join("target/plugin-tests/cpp");
-        std::fs::create_dir_all(&out).unwrap();
-        let lib = out.join("libref_trajectory.so");
-        let mut c = Command::new(workspace_root().join("scripts/build-ref-trajectory.sh"));
-        c.arg(&lib);
-        let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
-        if std::env::var_os("CXX").is_none() && conda_cxx.is_file() {
-            c.env("CXX", conda_cxx);
-        }
-        assert!(c.status().unwrap().success(), "building ref-trajectory failed");
+        let lib = std::env::var_os("REFERENCE_TRAJECTORY_NATIVE_LIBRARY")
+            .filter(|value| !value.is_empty()).map(PathBuf::from)
+            .expect("set REFERENCE_TRAJECTORY_NATIVE_LIBRARY to the owning reference product's installed libref_trajectory.so");
+        assert!(lib.is_absolute() && lib.is_file(),
+                "REFERENCE_TRAJECTORY_NATIVE_LIBRARY must name an existing absolute installed artifact: {}", lib.display());
         lib
     })
 }

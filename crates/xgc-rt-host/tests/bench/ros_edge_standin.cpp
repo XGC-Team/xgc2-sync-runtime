@@ -1,4 +1,4 @@
-// ROS-free stand-in for plugins/ros-io, used only by the lightweight plant
+// ROS-free stand-in for the owning ROS edge, used only by the lightweight plant
 // hosting benchmark (tests/lightweight_bench.rs, shape `platform`).
 //
 // It declares ros_io's 41 ports (names, directions, schemas, QoS) and repeats
@@ -21,8 +21,9 @@
 //   standin_slice = "legacy" ros_io's service loop before the timer-slack
 //                            rule: it waited out any remainder of the slice.
 //
-// Build: $CXX -std=c++17 -O2 -fPIC -shared -I abi/include -I plugins/common \
-//          -I plugins/ros-io ros_edge_standin.cpp -o libros_edge_standin.so
+// The owner benchmark build supplies installed Runtime SDK, robotics wire
+// and ROS helper interfaces. The generic Rust runner only consumes the
+// explicit XGC_ROS_EDGE_STANDIN_ELF; it never compiles domain sources.
 
 #include <algorithm>
 #include <chrono>
@@ -35,9 +36,10 @@
 #include "flat_config.hpp"
 #include "ros_slice.hpp"
 #include "sim_odometry.hpp"
-#include "xgc_dmpc_planner_v1.h"
 #include "xgc_rt.h"
-#include "xgc_schemas_v1.h"
+#include <xgc-robotics-interfaces/robotics_interfaces_v1.h>
+#include <xgc-robotics-interfaces/control_records_v1.h>
+#include <xgc-robotics-interfaces/paired_state_v1.h>
 
 namespace {
 

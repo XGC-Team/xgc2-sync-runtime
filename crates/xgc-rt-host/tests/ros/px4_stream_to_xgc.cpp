@@ -28,8 +28,12 @@
 #include <sensor_msgs/Imu.h>
 #include <std_msgs/String.h>
 
-#include "reference_wire.hpp"
-#include "xgc_schemas_v1.h"
+#include <xgc-robotics-interfaces/robotics_interfaces_v1.h>
+#include <hover_thrust_estimator/native/hover_thrust_wire.h>
+#include <estimator_vrpn_px4_rotor_state/native/rigid_state_wire_v1.h>
+#include <multirotor_reference_trajectory/reference_wire.hpp>
+
+using hover_thrust_native::xgc_hover_thrust_v1;
 
 namespace {
 

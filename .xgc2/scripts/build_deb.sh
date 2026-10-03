@@ -30,7 +30,7 @@ Priority: optional
 Architecture: all
 Maintainer: XGC2 <apt@example.com>
 Description: XGC Runtime header-only C and C++ SDK
- Plugin ABI, clock-source ABI, current wire headers and a flat config reader.
+ Plugin ABI, clock-source ABI and a flat config reader.
  Exports the XgcRuntime::SDK CMake INTERFACE target; no runtime or domain plugin.
 CONTROL
 # Build exactly one all-architecture artifact. A release orchestrator may later

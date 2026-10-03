@@ -51,15 +51,19 @@ def main():
     (consumer / 'CMakeLists.txt').write_text(tests.CONSUMER)
     (consumer / 'c_smoke.c').write_text(tests.C_SMOKE)
     (consumer / 'cxx_smoke.cpp').write_text(tests.CXX_SMOKE)
-    canonical = {path.name: path for path in (source / 'abi/include').glob('*.h')}
-    canonical['flat_config.hpp'] = source / 'plugins/common/flat_config.hpp'
-    require(set(canonical) == {'xgc_rt.h', 'xgc_clock_source.h', 'xgc_schemas_v1.h',
-                               'xgc_dmpc_planner_v1.h', 'flat_config.hpp'}, 'unexpected canonical SDK headers')
+    canonical = {
+        'xgc_rt.h': source / 'abi/include/xgc_rt.h',
+        'xgc_clock_source.h': source / 'abi/include/xgc_clock_source.h',
+        'flat_config.hpp': source / 'plugins/common/flat_config.hpp',
+    }
+    forbidden_headers = ('xgc_dmpc_planner_v1.h', 'xgc_schemas_v1.h')
     config_names = {'XgcRuntimeSDKConfig.cmake', 'XgcRuntimeSDKConfigVersion.cmake', 'XgcRuntimeSDKTargets.cmake'}
 
     def payload(prefix):
         headers = prefix / 'include/xgc-runtime'
         require({path.name for path in headers.iterdir()} == set(canonical), 'SDK header set mismatch')
+        for name in forbidden_headers:
+            require(not (headers / name).exists(), 'business header exported by SDK: ' + name)
         for name, original in canonical.items():
             require((headers / name).read_bytes() == original.read_bytes(), 'noncanonical SDK header: ' + name)
         configs = prefix / 'share/cmake/XgcRuntimeSDK'
@@ -93,6 +97,15 @@ def main():
     relocated = work / 'relocated'
     shutil.copytree(extracted / 'usr', relocated)
     consume('relocated', relocated)
+    # Prove SDK-only installed consumption cannot silently obtain a business
+    # header from this package. Domain consumers must name their owning input.
+    for prefix_name, prefix in [('installed', Path('/usr')), ('relocated', relocated)]:
+        for name in forbidden_headers:
+            negative = work / ('forbidden-' + prefix_name + '-' + name + '.c')
+            negative.write_text('#include <' + name + '>\nint main(void) { return 0; }\n')
+            diagnostic = run('cc', '-std=c11', '-I', prefix / 'include/xgc-runtime',
+                             '-c', negative, '-o', negative.with_suffix('.o'), success=False)
+            require(name in diagnostic, 'business-header negative failed for an unrelated reason')
     run('cmake', '-S', consumer, '-B', work / 'wrong-version',
         '-DSDK_PREFIX=' + str(relocated), '-DSDK_VERSION=99.0.0', success=False)
     for name in sorted(canonical):
@@ -109,6 +122,7 @@ def main():
         '-DSDK_PREFIX=' + str(relocated), '-DSDK_VERSION=0.1.0', success=False)
     checks.extend(['canonical header-only Deb payload and installed dpkg ownership',
                    'source/installed/relocated XgcRuntime::SDK C11/C++11 ABI and config smoke',
+                   'SDK-only installed/relocated consumers refuse both old business headers',
                    'wrong SDK version, each missing header and missing package config refused'])
     print(json.dumps({'checks': checks, 'package_fields': fields,
                       'deb_sha256': hashlib.sha256(args.deb.read_bytes()).hexdigest(),

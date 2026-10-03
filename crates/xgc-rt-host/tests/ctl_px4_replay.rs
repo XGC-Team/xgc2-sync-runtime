@@ -64,18 +64,25 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn convert_stream(prefix: &std::path::Path, stream: &std::path::Path) -> Vec<(u64, u32, Vec<u8>)> {
-    // The converter reuses ros_io's generated message headers (verbatim .msg).
-    let ros_io = common::ros_io_lib(prefix);
-    let gen = ros_io.parent().unwrap().join("ros-io-gen");
+    // Consume installed owner DTO/codec and already-generated owning ROS message
+    // headers. Do not build a second ros_io plugin just to obtain those headers.
+    let robotics = PathBuf::from(std::env::var_os("XGC_ROBOTICS_INTERFACES_PREFIX").unwrap()).join("include");
+    let hte = PathBuf::from(std::env::var_os("XGC_HOVER_THRUST_WIRE_PREFIX").unwrap()).join("include");
+    let rigid = PathBuf::from(std::env::var_os("XGC_RIGID_STATE_WIRE_PREFIX").unwrap()).join("include");
+    let reference = PathBuf::from(std::env::var_os("XGC_REFERENCE_WIRE_PREFIX").unwrap()).join("include");
+    let messages = PathBuf::from(std::env::var_os("XGC_ROS_REPLAY_MSGS_INCLUDE").unwrap());
     let out = common::workspace_root().join("target/plugin-tests/ros");
+    std::fs::create_dir_all(&out).unwrap();
     let tool = out.join("px4_stream_to_xgc");
     let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
     let cxx = if conda_cxx.is_file() { conda_cxx } else { PathBuf::from("c++") };
     let status = Command::new(cxx)
         .args(["-std=c++17", "-O2"])
-        .arg("-I").arg(common::workspace_root().join("abi/include"))
-        .arg("-I").arg(common::workspace_root().join("plugins/common"))
-        .arg("-I").arg(&gen)
+        .arg("-I").arg(&robotics)
+        .arg("-I").arg(&hte)
+        .arg("-I").arg(&rigid)
+        .arg("-I").arg(&reference)
+        .arg("-I").arg(&messages)
         .arg("-isystem").arg(prefix.join("include"))
         .arg(common::workspace_root().join("crates/xgc-rt-host/tests/ros/px4_stream_to_xgc.cpp"))
         .arg("-o").arg(&tool)

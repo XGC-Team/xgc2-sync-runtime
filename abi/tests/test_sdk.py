@@ -16,8 +16,6 @@ C_SMOKE = r'''
 #include <stddef.h>
 #include <xgc_rt.h>
 #include <xgc_clock_source.h>
-#include <xgc_schemas_v1.h>
-#include <xgc_dmpc_planner_v1.h>
 _Static_assert(XGC_RT_ABI_VERSION == 1 && XGC_RT_ABI_MINOR == 2, "plugin ABI");
 _Static_assert(XGC_RT_MAX_PORTS == 64, "port capacity");
 _Static_assert(sizeof(xgc_step_ctx) == 48, "step layout");
@@ -26,9 +24,6 @@ _Static_assert(sizeof(xgc_plugin_descriptor) == 40, "64-bit descriptor");
 _Static_assert(sizeof(xgc_clock_observation_v1) == 544, "clock observation");
 _Static_assert(offsetof(xgc_clock_observation_v1, publisher) == 32, "clock publisher");
 _Static_assert(XGC_CLOCK_SOURCE_ABI_VERSION == 1, "clock ABI");
-_Static_assert(sizeof(xgc_attitude_target_v2) == 80, "attitude payload");
-_Static_assert(sizeof(xgc_fcu_request_v2) == 64, "FCU request payload");
-_Static_assert(sizeof(xgc_dmpc_paired_state_v1) == 96, "paired measurement");
 int main(void) { return XGC_OK; }
 '''
 
@@ -37,14 +32,10 @@ CXX_SMOKE = r'''
 #include <type_traits>
 #include <xgc_rt.h>
 #include <xgc_clock_source.h>
-#include <xgc_schemas_v1.h>
-#include <xgc_dmpc_planner_v1.h>
 #include <flat_config.hpp>
 static_assert(std::is_standard_layout<xgc_host_api>::value, "host API layout");
 static_assert(sizeof(xgc_step_ctx) == 48, "step layout");
 static_assert(sizeof(xgc_clock_source_descriptor_v1) == 16, "clock descriptor");
-static_assert(sizeof(xgc_dmpc_timeline_ack_v1) == 56, "timeline ACK");
-static_assert(offsetof(xgc_attitude_target_v2, type_mask) == 72, "attitude mask");
 int main() {
   int rate = 0; bool enabled = false;
   const std::string config = "rate = 5\nenabled = true\nname = \"SDK\"\n";
@@ -74,6 +65,12 @@ endif()
 get_target_property(sdk_links XgcRuntime::SDK INTERFACE_LINK_LIBRARIES)
 if(sdk_links)
   message(FATAL_ERROR "SDK unexpectedly brings runtime/domain libraries: ${sdk_links}")
+endif()
+if(DEFINED SDK_RETIRED_HEADER)
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/retired.c" "#include <${SDK_RETIRED_HEADER}>\nint main(void) { return 0; }\n")
+  add_executable(retired_header "${CMAKE_CURRENT_BINARY_DIR}/retired.c")
+  target_link_libraries(retired_header PRIVATE XgcRuntime::SDK)
+  return()
 endif()
 add_executable(c_smoke c_smoke.c)
 set_target_properties(c_smoke PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS NO)
@@ -114,22 +111,30 @@ def main():
         settings = ['-DXGC_RUNTIME_SDK_SOURCE_ROOT=' + str(source)] if source_mode else [
             '-DSDK_PREFIX=' + str(prefix), '-DSDK_VERSION=0.1.0']
         run('cmake', '-S', consumer, '-B', build, *settings)
-        run('cmake', '--build', build, '--parallel', '2')
+        run('cmake', '--build', build, '--parallel', '1')
         run(build / 'c_smoke')
         run(build / 'cxx_smoke')
-        checks.append(name + ': C11/C++11 compile and ABI/config smoke passed')
+        checks.append(name + ': C11/C++11 generic Host/clock ABI/config smoke passed')
+        for header in ('xgc_schemas_v1.h', 'xgc_dmpc_planner_v1.h'):
+            negative = work / ('negative-' + name + '-' + header)
+            run('cmake', '-S', consumer, '-B', negative, *settings, '-DSDK_RETIRED_HEADER=' + header)
+            run('cmake', '--build', negative, '--parallel', '1', success=False)
+        checks.append(name + ': retired domain headers refused through SDK-only target')
 
     consume('source', source_mode=True)
     installed = work / 'installed'
     run('cmake', '-S', source / 'abi', '-B', work / 'sdk-build', '-DCMAKE_INSTALL_PREFIX=' + str(installed))
     run('cmake', '--install', work / 'sdk-build')
-    canonical = {path.name: path for path in (source / 'abi/include').glob('*.h')}
+    assert {path.name for path in (source / 'abi/include').glob('*.h')} == {'xgc_rt.h', 'xgc_clock_source.h'}, 'domain source headers must be retired'
+    canonical = {name: source / 'abi/include' / name for name in ('xgc_rt.h', 'xgc_clock_source.h')}
     canonical['flat_config.hpp'] = source / 'plugins/common/flat_config.hpp'
-    assert set(canonical) == {'xgc_rt.h', 'xgc_clock_source.h', 'xgc_schemas_v1.h', 'xgc_dmpc_planner_v1.h', 'flat_config.hpp'}
+    assert set(canonical) == {'xgc_rt.h', 'xgc_clock_source.h', 'flat_config.hpp'}
 
     def check_payload(prefix):
         headers = prefix / 'include/xgc-runtime'
         assert {path.name for path in headers.iterdir()} == set(canonical)
+        assert not (headers / 'xgc_dmpc_planner_v1.h').exists()
+        assert not (headers / 'xgc_schemas_v1.h').exists()
         for name, original in canonical.items():
             assert (headers / name).read_bytes() == original.read_bytes(), name + ' differs from its canonical source'
         for config in (prefix / 'share/cmake/XgcRuntimeSDK').glob('*.cmake'):
@@ -152,7 +157,10 @@ def main():
     fields = {}
     for field in ['Package', 'Version', 'Architecture', 'Depends']:
         fields[field] = run('dpkg-deb', '-f', deb, field).strip()
-    assert fields == {'Package': 'libxgc2-runtime-sdk-dev', 'Version': '0.1.0-1~focal', 'Architecture': 'all', 'Depends': ''}, fields
+    expected_version = next(line.split(':', 1)[1].strip()
+                            for line in (source / '.xgc2/product.yml').read_text().splitlines()
+                            if line.strip().startswith('focal:'))
+    assert fields == {'Package': 'libxgc2-runtime-sdk-dev', 'Version': expected_version, 'Architecture': 'all', 'Depends': ''}, fields
     before = hashlib.sha256(deb.read_bytes()).hexdigest()
     run('bash', source / '.xgc2/scripts/build_deb.sh', '--output', deb_dir, success=False)
     assert hashlib.sha256(deb.read_bytes()).hexdigest() == before
