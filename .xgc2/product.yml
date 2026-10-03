@@ -12,7 +12,8 @@ apt:
   - libxgc2-runtime-sdk-dev
   package_architectures:
     libxgc2-runtime-sdk-dev:
-    - all
+    - amd64
+    - arm64
   depends: []
 usage:
   install: dpkg -i libxgc2-runtime-sdk-dev_0.1.0-1~focal_all.deb
