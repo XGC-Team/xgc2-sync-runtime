@@ -25,6 +25,14 @@
 //! every step, or with `audit.steps_every = N` every step of one round in N
 //! and every step that failed or overran its budget.
 //!
+//! **A step's outputs reach each reader as one batch.** Deliveries a module
+//! makes inside `step` are held in its outbox and handed over when the step
+//! returns: one lock and at most one notify per reader, and the reader's first
+//! step reads every sample the writer's step produced. Without this a reader
+//! woken by the first of six outputs stepped on a partial set and was woken
+//! again for the rest. Outside `step` (create, configure, activate, destroy)
+//! a delivery is immediate. A step the watchdog abandoned delivers nothing.
+//!
 //! **Each step sees one consistent snapshot.** At step start the module
 //! thread takes every sample queued at that moment; `next` reads only from
 //! that snapshot. Samples that arrive during the step wait for the next one,
@@ -243,6 +251,9 @@ struct Instance {
     /// Deliveries that notified the module thread.
     #[cfg(test)]
     notified: AtomicU64,
+    /// `deliver_all` calls, each one lock acquisition of this reader.
+    #[cfg(test)]
+    batches: AtomicU64,
 }
 
 impl Instance {
@@ -257,6 +268,8 @@ impl Instance {
             done: AtomicBool::new(false),
             #[cfg(test)]
             notified: AtomicU64::new(0),
+            #[cfg(test)]
+            batches: AtomicU64::new(0),
         })
     }
 
@@ -267,6 +280,8 @@ impl Instance {
     /// Put a batch into the inputs under one lock with at most one notify,
     /// so the module never steps on half of a batch that arrived together.
     fn deliver_all(&self, batch: impl IntoIterator<Item = (u32, Arc<Sample>)>, audit: &dyn AuditSink, now: i64) {
+        #[cfg(test)]
+        self.batches.fetch_add(1, Ordering::Relaxed);
         let mut g = self.inner.lock().unwrap();
         let mut any = false;
         for (port, sample) in batch {
@@ -330,6 +345,41 @@ impl Instance {
         self.inner.lock().unwrap().stop = true;
         self.wake.notify_one();
     }
+}
+
+/// One same-process delivery held until its writer's step returns:
+/// (reader module, reader in-port, sample). The sample is taken when handed over.
+type Pending = (usize, u32, Option<Arc<Sample>>);
+
+/// Hand a finished step's deliveries to their readers, one `deliver_all` per
+/// reader in order of first appearance. Samples of one reader keep their
+/// write order, so a port's queue stays in sequence. No allocation: readers
+/// are few, so each pass scans the outbox for its own entries.
+fn flush_deliveries(outbox: &mut Vec<Pending>, instance_of: impl Fn(usize) -> Arc<Instance>, audit: &dyn AuditSink, now: i64) {
+    let mut first = 0;
+    while first < outbox.len() {
+        if outbox[first].2.is_none() {
+            first += 1;
+            continue;
+        }
+        let reader = outbox[first].0;
+        let mut next = first;
+        let batch = std::iter::from_fn(|| {
+            while next < outbox.len() {
+                let entry = &mut outbox[next];
+                next += 1;
+                if entry.0 == reader {
+                    if let Some(sample) = entry.2.take() {
+                        return Some((entry.1, sample));
+                    }
+                }
+            }
+            None
+        });
+        instance_of(reader).deliver_all(batch, audit, now);
+        first += 1;
+    }
+    outbox.clear();
 }
 
 // --- modules ----------------------------------------------------------------
@@ -457,6 +507,10 @@ struct Slot {
     current: Option<Arc<Sample>>,
     /// This step's snapshot of each input, by port.
     staged: Vec<VecDeque<Arc<Sample>>>,
+    /// True while the module is inside `step`: same-process deliveries wait in
+    /// `outbox` for the step to return (`flush_deliveries`).
+    deferring: bool,
+    outbox: Vec<Pending>,
     local_seq: Vec<u64>,
     /// Samples read during the current step: (port, origin, seq).
     reads: Vec<(u32, OriginId, u64)>,
@@ -510,7 +564,11 @@ unsafe extern "C" fn api_publish(host: *mut c_void, port: u32, round: u64, data:
             link_header: None,
         });
         for &(reader, in_port) in &route.readers {
-            rt.modules[reader].instance().deliver(in_port, sample.clone(), rt.endpoint.audit().as_ref(), t_produce);
+            if s.deferring {
+                s.outbox.push((reader, in_port, Some(sample.clone())));
+            } else {
+                rt.modules[reader].instance().deliver(in_port, sample.clone(), rt.endpoint.audit().as_ref(), t_produce);
+            }
         }
     }
     module.published.fetch_add(1, Ordering::Relaxed);
@@ -630,6 +688,8 @@ fn spawn_module(rt: &Arc<Runtime>, m: usize, instance: Arc<Instance>, ready: Opt
         },
         current: None,
         staged: vec![VecDeque::new(); module.inputs.len()],
+        deferring: false,
+        outbox: Vec::new(),
         local_seq: vec![0; module.outputs.len()],
         reads: Vec::new(),
         round: 0,
@@ -895,9 +955,20 @@ impl ModuleThread {
         let t0 = source_time.unwrap_or_else(|| rt.clock.now());
         let began = Instant::now();
         self.inst().in_step.store(true, Ordering::Release);
+        self.s().deferring = true;
         let status = self.call(|| unsafe { f(instance, &ctx) });
+        self.s().deferring = false;
         self.inst().in_step.store(false, Ordering::Release);
-        let Some(status) = status else { return false };
+        let Some(status) = status else {
+            self.s().outbox.clear();
+            return false;
+        };
+        {
+            // The step finished inside its hang time: its outputs, including
+            // those of a step that returned an error, are delivered once.
+            let now = rt.clock.now();
+            flush_deliveries(&mut self.s().outbox, |reader| rt.modules[reader].instance(), rt.endpoint.audit().as_ref(), now);
+        }
         let took = began.elapsed();
         let t1 = rt.clock.now();
         {
@@ -1935,6 +2006,64 @@ mod wake_tests {
         reader.join().unwrap();
         let queued: usize = inst.inner.lock().unwrap().inputs.iter().flatten().map(|i| i.queue.len()).sum();
         assert_eq!(queued, 80, "every sample stays queued for the step");
+    }
+
+    /// A writer step's outputs reach each reader as one batch: one lock and one
+    /// notify per reader, and the woken reader's first look sees every port.
+    /// Deterministic: the readers are asleep before the flush, and a reader
+    /// can only wake after the flush released its lock.
+    #[test]
+    fn a_steps_outputs_reach_each_reader_as_one_batch_and_one_notify() {
+        let readers = [instance(3), instance(3)];
+        let woke: Vec<_> = readers
+            .iter()
+            .map(|reader| {
+                let reader = reader.clone();
+                let (tx, rx) = mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let g = reader.wait(reader.inner.lock().unwrap(), Duration::from_secs(30), true, None);
+                    let seen = (g.dirty, g.inputs.iter().flatten().map(|i| i.queue.len()).sum::<usize>());
+                    drop(g);
+                    tx.send(seen).unwrap();
+                });
+                (handle, rx)
+            })
+            .collect();
+        for reader in &readers {
+            until_waiting(reader);
+        }
+        // Interleaved, with a second sample on reader 0's port 0.
+        let mut outbox: Vec<Pending> = vec![
+            (0, 0, Some(sample(1))),
+            (1, 0, Some(sample(2))),
+            (0, 1, Some(sample(3))),
+            (1, 1, Some(sample(4))),
+            (0, 2, Some(sample(5))),
+            (1, 2, Some(sample(6))),
+            (0, 0, Some(sample(7))),
+        ];
+        flush_deliveries(&mut outbox, |reader| readers[reader].clone(), &NullAudit, 0);
+        assert!(outbox.is_empty());
+        for (index, (handle, rx)) in woke.into_iter().enumerate() {
+            let (dirty, queued) = rx.recv_timeout(Duration::from_secs(10)).expect("the reader did not wake");
+            handle.join().unwrap();
+            assert_eq!(dirty, 0b111, "reader {index} woke on a partial batch");
+            assert_eq!(queued, if index == 0 { 4 } else { 3 });
+            assert_eq!(readers[index].notified.load(Ordering::Relaxed), 1, "reader {index}: one notify per step");
+            assert_eq!(readers[index].batches.load(Ordering::Relaxed), 1, "reader {index}: one lock per step");
+        }
+        // A port's queue keeps write order.
+        let g = readers[0].inner.lock().unwrap();
+        let seqs: Vec<u64> = g.inputs[0].as_ref().unwrap().queue.iter().map(|s| s.seq).collect();
+        assert_eq!(seqs, [1, 7]);
+    }
+
+    #[test]
+    fn flushing_nothing_touches_no_reader() {
+        let reader = instance(1);
+        let mut outbox: Vec<Pending> = Vec::new();
+        flush_deliveries(&mut outbox, |_| reader.clone(), &NullAudit, 0);
+        assert_eq!(reader.batches.load(Ordering::Relaxed), 0);
     }
 
     #[test]
