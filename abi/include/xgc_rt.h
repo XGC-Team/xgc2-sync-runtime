@@ -7,9 +7,11 @@
  * shared library that exports `xgc_rt_plugin_v1`.
  *
  * Rules:
- *  - The host owns threads, the clock, transports and audit. A plugin never
- *    opens sockets or spawns threads for IPC; it publishes and reads through
- *    `xgc_host_api`.
+ *  - The host owns scheduling, the Session clock, transports and audit.
+ *    Ordinary domain plugins use `xgc_host_api` for sample exchange. Declared
+ *    ROS I/O owners (including a simulation World owning its ROS boundary)
+ *    may own ingress/service/egress threads; this does not permit arbitrary
+ *    domain threads to call ordinary Host API functions.
  *  - Every vtable call happens on the aggregator's thread for that plugin
  *    (one thread per plugin), never concurrently. `step` is called only on a
  *    round boundary or when an in-port is dirty, as the manifest trigger
@@ -17,12 +19,12 @@
  *  - "Ports" are module inputs and outputs in memory, not network ports.
  *    Between plugins of one aggregator, `publish` hands the sample over in
  *    memory; it is sent over the link (Zenoh) only to other processes.
- *  - ROS edge rule: a domain plugin (estimation, control, planning, DMPC)
- *    never calls ROS: no ros::init/rospy, no publish/subscribe, no ROS
- *    libraries. Only the aggregator's `ros_io` plugin talks ROS, with ordinary
- *    subscribe and publish: inbound topics become input samples, output
- *    samples become outbound topics. It is not the ros1_bridge package.
- *    VRPN, simulators and third-party ROS stacks stay ROS nodes.
+ *  - ROS edge rule: ordinary domain mathematics (estimation, control,
+ *    planning, DMPC) never calls ROS. Only declared ROS I/O owning modules
+ *    provide subscribe/publish/service boundaries; a World may own its
+ *    simulation ROS boundary without forwarding it through another plugin.
+ *    This is not ros1_bridge and does not move external controller/estimator
+ *    mathematics into the World. Third-party ROS stacks stay ROS nodes.
  *  - Times are Session nanoseconds (see docs/time-model.md).
  *  - Strings are UTF-8, NUL-terminated, and owned by whoever returned them;
  *    descriptor strings must stay valid for the lifetime of the library.
@@ -101,13 +103,38 @@ typedef struct xgc_step_ctx {
   uint32_t reserved;
 } xgc_step_ctx;
 
-/* Minor revisions only append functions to xgc_host_api. A plugin checks
- * `abi_minor` before calling a function added in that minor. */
-#define XGC_RT_ABI_MINOR 2u
+/* Minor revisions only append functions to xgc_host_api. Before touching an
+ * appended field, check abi_version/abi_minor through the existing 8-byte
+ * prefix. An old table may physically end before that field. The descriptor
+ * stays ABI v1: its major-only loader check is not a Host minor capability gate.
+ * The Rust SDK create shim rejects an old prefix before user create code can
+ * borrow the current full table, including plugins that do not need a reader.
+ * Ordinary Host API functions are module-thread services inside vtable calls.
+ * Only an acquired owned reader's now operation is an asynchronous pure read.
+ */
+#define XGC_RT_ABI_MINOR 3u
+#define XGC_RT_CLOCK_READER_ABI_MINOR 3u
+
+/* One owned reference to the SAME live Session Clock used by Host::now.
+ * Acquire once during cold create; do not acquire/retain per body or read.
+ * now is thread-safe and only reads that Clock: no Slot/ctx/input queue, clock
+ * source poll, allocation, Arc clone or alternate time policy. It preserves
+ * the Clock's existing locking and accepted-time/initial-zero semantics; it
+ * is not promised lock-free. On error now leaves *out_time_ns unchanged.
+ * The I/O owner fences readers and joins ALL reading threads before release.
+ * release consumes opaque exactly once, then this whole handle is invalid.
+ * A handle is unique ownership, not a memcpy-copyable second owner. All calls
+ * and release must finish before plugin destroy / Host library unload.
+ */
+typedef struct xgc_clock_reader_v1 {
+  void* opaque;
+  xgc_status (*now)(void* opaque, int64_t* out_time_ns);
+  void (*release)(void* opaque);
+} xgc_clock_reader_v1;
 
 typedef struct xgc_host_api {
   uint32_t abi_version;
-  uint32_t abi_minor;     /* 0: through request_recover; 1: + port_origins, node_id */
+  uint32_t abi_minor;     /* 0: base; 1: roster; 2: optional ports; 3: owned reader */
   void* host;
   /* Publish on an out-port for `round`. The host stamps, audits and sends. */
   xgc_status (*publish)(void* host, uint32_t port, uint64_t round,
@@ -125,7 +152,39 @@ typedef struct xgc_host_api {
   uint32_t (*port_origins)(void* host, uint32_t port, uint16_t* out, uint32_t cap);
   /* This node's roster id. */
   uint16_t (*node_id)(void* host);
+  /* abi_minor >= 3; cold module-thread call only. reader_size must equal
+   * sizeof(xgc_clock_reader_v1), and out must be a fresh zeroed handle.
+   * OK returns all three non-NULL fields; failure acquires no reference.
+   * Of the reader operations, only this call touches the module Slot. Later
+   * now/release calls use opaque independently of the API table / Slot lifetime.
+   */
+  xgc_status (*acquire_clock_reader)(void* host, uint32_t reader_size,
+                                    xgc_clock_reader_v1* out);
 } xgc_host_api;
+
+/* Strict consumer gate. No Host::now / ROS time / cached-clock fallback.
+ * Do not inspect acquire_clock_reader until the old prefix admits minor 3.
+ * World cold create must reject an error instead of starting ingress with an
+ * absent reader. The output must be zero-initialized and not already owned.
+ */
+static inline xgc_status xgc_acquire_clock_reader_v1(
+    const xgc_host_api* api, xgc_clock_reader_v1* out) {
+  xgc_status status;
+  if (api == 0 || out == 0 || out->opaque != 0 || out->now != 0 || out->release != 0)
+    return XGC_ERR_INVALID;
+  if (api->abi_version != XGC_RT_ABI_VERSION ||
+      api->abi_minor < XGC_RT_CLOCK_READER_ABI_MINOR)
+    return XGC_ERR_INVALID;
+  if (api->acquire_clock_reader == 0) return XGC_ERR_INVALID;
+  status = api->acquire_clock_reader(api->host, (uint32_t)sizeof(*out), out);
+  if (status != XGC_OK) return status;
+  if (out->opaque == 0 || out->now == 0 || out->release == 0) {
+    if (out->opaque != 0 && out->release != 0) out->release(out->opaque);
+    out->opaque = 0; out->now = 0; out->release = 0;
+    return XGC_ERR_INVALID;
+  }
+  return XGC_OK;
+}
 
 typedef struct xgc_plugin_vtbl {
   /* Allocate the instance. `host` stays valid until `destroy`. */

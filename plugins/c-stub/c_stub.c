@@ -26,6 +26,9 @@ _Static_assert(sizeof(xgc_step_ctx) == 48, "xgc_step_ctx layout");
 _Static_assert(offsetof(xgc_step_ctx, dirty_ports) == 32, "xgc_step_ctx.dirty_ports");
 _Static_assert(sizeof(xgc_port_decl) == 32, "xgc_port_decl layout");
 _Static_assert(sizeof(xgc_plugin_descriptor) == 40, "xgc_plugin_descriptor layout");
+_Static_assert(sizeof(xgc_host_api) == 88, "minor-3 host API layout");
+_Static_assert(offsetof(xgc_host_api, acquire_clock_reader) == 80, "minor-3 append offset");
+_Static_assert(sizeof(xgc_clock_reader_v1) == 24, "owned clock reader layout");
 
 enum { PORT_CMD = 0 };
 

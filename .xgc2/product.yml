@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: libxgc2-runtime-sdk-dev
 name: XGC Runtime SDK
-version: 0.1.0-2
+version: 0.1.0-3
 kind: toolchain-apt
 summary: Header-only C/C++ plugin, clock-source and flat-config SDK for XGC Runtime consumers.
 apt:
@@ -16,7 +16,7 @@ apt:
     - arm64
   depends: []
 usage:
-  install: dpkg -i libxgc2-runtime-sdk-dev_0.1.0-2~focal_all.deb
+  install: dpkg -i libxgc2-runtime-sdk-dev_0.1.0-3~focal_all.deb
   smoke_test: python3 abi/tests/test_sdk.py --work-dir /tmp/xgc-runtime-sdk-check
   notes: >-
     Consumers use find_package(XgcRuntimeSDK CONFIG REQUIRED) and link
@@ -37,4 +37,4 @@ release:
   ci_workflow: ci.yml
   workflow: release.yml
   apt_versions:
-    focal: 0.1.0-2~focal
+    focal: 0.1.0-3~focal

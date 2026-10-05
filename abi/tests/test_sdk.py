@@ -16,15 +16,56 @@ C_SMOKE = r'''
 #include <stddef.h>
 #include <xgc_rt.h>
 #include <xgc_clock_source.h>
-_Static_assert(XGC_RT_ABI_VERSION == 1 && XGC_RT_ABI_MINOR == 2, "plugin ABI");
+_Static_assert(XGC_RT_ABI_VERSION == 1 && XGC_RT_ABI_MINOR == 3, "plugin ABI");
 _Static_assert(XGC_RT_MAX_PORTS == 64, "port capacity");
 _Static_assert(sizeof(xgc_step_ctx) == 48, "step layout");
 _Static_assert(offsetof(xgc_step_ctx, dirty_ports) == 32, "step mask offset");
 _Static_assert(sizeof(xgc_plugin_descriptor) == 40, "64-bit descriptor");
+_Static_assert(sizeof(xgc_host_api) == 88, "minor-3 host API");
+_Static_assert(offsetof(xgc_host_api, node_id) == 72, "old prefix intact");
+_Static_assert(offsetof(xgc_host_api, acquire_clock_reader) == 80, "minor-3 append");
+_Static_assert(sizeof(xgc_clock_reader_v1) == 24, "owned reader size");
+_Static_assert(offsetof(xgc_clock_reader_v1, now) == 8, "reader now offset");
+_Static_assert(offsetof(xgc_clock_reader_v1, release) == 16, "reader release offset");
 _Static_assert(sizeof(xgc_clock_observation_v1) == 544, "clock observation");
 _Static_assert(offsetof(xgc_clock_observation_v1, publisher) == 32, "clock publisher");
 _Static_assert(XGC_CLOCK_SOURCE_ABI_VERSION == 1, "clock ABI");
-int main(void) { return XGC_OK; }
+static int64_t live_time = 0;
+static unsigned acquires = 0, releases = 0;
+static xgc_status reader_now(void* opaque, int64_t* out) {
+  if (opaque == 0 || out == 0) return XGC_ERR_INVALID;
+  *out = *(int64_t*)opaque;
+  return XGC_OK;
+}
+static void reader_release(void* opaque) { if (opaque == &live_time) ++releases; }
+static xgc_status acquire(void* host, uint32_t size, xgc_clock_reader_v1* out) {
+  (void)host;
+  if (size != sizeof(*out) || out == 0 || out->opaque != 0) return XGC_ERR_INVALID;
+  ++acquires;
+  out->opaque = &live_time; out->now = reader_now; out->release = reader_release;
+  return XGC_OK;
+}
+int main(void) {
+  /* An old host can be physically shorter than the new API, even 8 bytes
+   * for this prefix-only negative. The union preserves LP64 alignment. */
+  union { struct { uint32_t version, minor; } prefix; uint64_t alignment; } old;
+  xgc_clock_reader_v1 reader = {0};
+  xgc_host_api api = {0};
+  int64_t time = -1;
+  old.prefix.version = 1; old.prefix.minor = 2;
+  if (xgc_acquire_clock_reader_v1((const xgc_host_api*)&old, &reader) != XGC_ERR_INVALID) return 1;
+  if (acquires != 0 || reader.opaque != 0) return 2;
+  api.abi_version = 1; api.abi_minor = 3;
+  if (xgc_acquire_clock_reader_v1(&api, &reader) != XGC_ERR_INVALID) return 3;
+  api.acquire_clock_reader = acquire;
+  if (xgc_acquire_clock_reader_v1(&api, &reader) != XGC_OK) return 4;
+  if (reader.now(reader.opaque, &time) != XGC_OK || time != 0) return 5;
+  live_time = 123456789;
+  if (reader.now(reader.opaque, &time) != XGC_OK || time != live_time || acquires != 1) return 6;
+  if (xgc_acquire_clock_reader_v1(&api, &reader) != XGC_ERR_INVALID || acquires != 1) return 7;
+  reader.release(reader.opaque);
+  return releases == 1 ? XGC_OK : 8;
+}
 '''
 
 CXX_SMOKE = r'''
@@ -34,6 +75,8 @@ CXX_SMOKE = r'''
 #include <xgc_clock_source.h>
 #include <flat_config.hpp>
 static_assert(std::is_standard_layout<xgc_host_api>::value, "host API layout");
+static_assert(std::is_standard_layout<xgc_clock_reader_v1>::value, "reader layout");
+static_assert(sizeof(xgc_host_api) == 88 && sizeof(xgc_clock_reader_v1) == 24, "reader ABI");
 static_assert(sizeof(xgc_step_ctx) == 48, "step layout");
 static_assert(sizeof(xgc_clock_source_descriptor_v1) == 16, "clock descriptor");
 int main() {

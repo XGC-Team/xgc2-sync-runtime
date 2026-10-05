@@ -12,7 +12,8 @@ pub mod neighbor;
 
 pub const XGC_RT_ABI_VERSION: u32 = 1;
 pub const XGC_RT_MAX_PORTS: u32 = 64;
-pub const XGC_RT_ABI_MINOR: u32 = 2;
+pub const XGC_RT_ABI_MINOR: u32 = 3;
+pub const XGC_RT_CLOCK_READER_ABI_MINOR: u32 = 3;
 
 /// `xgc_status`. It is kept as a plain integer so that an out-of-range value
 /// from a foreign plugin is a checked error, never undefined behaviour.
@@ -77,6 +78,19 @@ pub struct XgcStepCtx {
 }
 
 #[repr(C)]
+pub struct XgcClockReaderV1 {
+    pub opaque: *mut c_void,
+    pub now: Option<unsafe extern "C" fn(*mut c_void, *mut i64) -> XgcStatus>,
+    pub release: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+impl Default for XgcClockReaderV1 {
+    fn default() -> Self {
+        Self { opaque: std::ptr::null_mut(), now: None, release: None }
+    }
+}
+
+#[repr(C)]
 pub struct XgcHostApi {
     pub abi_version: u32,
     pub abi_minor: u32,
@@ -91,6 +105,10 @@ pub struct XgcHostApi {
     pub port_origins: unsafe extern "C" fn(*mut c_void, u32, *mut u16, u32) -> u32,
     /// abi_minor >= 1
     pub node_id: unsafe extern "C" fn(*mut c_void) -> u16,
+    /// abi_minor >= 3: acquire once in cold create, never from an I/O thread.
+    pub acquire_clock_reader: Option<unsafe extern "C" fn(
+        *mut c_void, u32, *mut XgcClockReaderV1,
+    ) -> XgcStatus>,
 }
 
 /// Entries are `Option` because a C plugin may leave one NULL. The host
@@ -129,6 +147,36 @@ unsafe impl<T> Sync for StaticAbi<T> {}
 // Plugin-side SDK
 // ---------------------------------------------------------------------------
 
+/// Unique ownership of one reference to the Host's live Session Clock.
+/// Unlike ordinary Host API services, reads may run on declared I/O owner
+/// threads. The reader does not retain a Host API/Slot pointer. Fence and join
+/// every reader thread before dropping this handle and before plugin destroy.
+pub struct ClockReader {
+    raw: XgcClockReaderV1,
+}
+
+// SAFETY: the minor-3 Host contract owns a Clock: Send + Sync. Only immutable
+// reads are shared, and Rust ownership/borrowing prevents concurrent Drop.
+unsafe impl Send for ClockReader {}
+unsafe impl Sync for ClockReader {}
+
+impl ClockReader {
+    pub fn now(&self) -> Result<i64, XgcStatus> {
+        let mut time = std::mem::MaybeUninit::<i64>::uninit();
+        // SAFETY: acquire validated all fields; an OK call initializes time.
+        let status = unsafe { (self.raw.now.unwrap())(self.raw.opaque, time.as_mut_ptr()) };
+        if status == XGC_OK { Ok(unsafe { time.assume_init() }) } else { Err(status) }
+    }
+}
+
+impl Drop for ClockReader {
+    fn drop(&mut self) {
+        // SAFETY: this is unique ownership, consumed only here after readers
+        // have relinquished their borrows. The Host code remains loaded.
+        unsafe { (self.raw.release.unwrap())(self.raw.opaque) };
+    }
+}
+
 /// One received sample, borrowed until the next `Host::next` call.
 #[derive(Debug, Clone, Copy)]
 pub struct Sample<'a> {
@@ -148,9 +196,41 @@ pub struct Host {
 
 impl Host {
     /// # Safety
-    /// `api` must be the pointer the host passed to `create`.
+    /// `api` must point to the Host API supplied during a live cold create.
+    /// Ordinary methods need the full table admitted by the SDK create gate.
+    /// A prefix-only old table may only be passed to acquire_clock_reader,
+    /// which rejects it before creating any reference to the enlarged table.
     pub unsafe fn from_raw(api: *const XgcHostApi) -> Self {
         Self { api }
+    }
+
+    /// Cold-create capability gate. Old Hosts are rejected, never emulated
+    /// through Host::now, ROS time, a step stamp or another clock cache.
+    pub fn acquire_clock_reader(&self) -> Result<ClockReader, XgcStatus> {
+        if self.api.is_null() { return Err(XGC_ERR_INVALID); }
+        // IMPORTANT: do not call self.api() or form &XgcHostApi here. A minor-2
+        // Host table is only 80 bytes. Read only its original 8-byte prefix
+        // before accessing the appended function at offset 80.
+        let (version, minor) = unsafe {
+            (std::ptr::addr_of!((*self.api).abi_version).read(),
+             std::ptr::addr_of!((*self.api).abi_minor).read())
+        };
+        if version != XGC_RT_ABI_VERSION || minor < XGC_RT_CLOCK_READER_ABI_MINOR {
+            return Err(XGC_ERR_INVALID);
+        }
+        let acquire = unsafe { std::ptr::addr_of!((*self.api).acquire_clock_reader).read() }
+            .ok_or(XGC_ERR_INVALID)?;
+        let host = unsafe { std::ptr::addr_of!((*self.api).host).read() };
+        let mut raw = XgcClockReaderV1::default();
+        let status = unsafe { acquire(host, std::mem::size_of::<XgcClockReaderV1>() as u32, &mut raw) };
+        if status != XGC_OK { return Err(status); }
+        if raw.opaque.is_null() || raw.now.is_none() || raw.release.is_none() {
+            if !raw.opaque.is_null() {
+                if let Some(release) = raw.release { unsafe { release(raw.opaque) }; }
+            }
+            return Err(XGC_ERR_INVALID);
+        }
+        Ok(ClockReader { raw })
     }
 
     fn api(&self) -> &XgcHostApi {
@@ -267,11 +347,24 @@ fn guarded(f: impl FnOnce() -> Result<(), String>) -> XgcStatus {
     }
 }
 
+unsafe fn admits_current_host_api(api: *const XgcHostApi) -> bool {
+    if api.is_null() { return false; }
+    // No &XgcHostApi until the original prefix admits the current full table.
+    let version = std::ptr::addr_of!((*api).abi_version).read();
+    let minor = std::ptr::addr_of!((*api).abi_minor).read();
+    if version != XGC_RT_ABI_VERSION || minor < XGC_RT_ABI_MINOR { return false; }
+    std::ptr::addr_of!((*api).acquire_clock_reader).read().is_some()
+}
+
 #[doc(hidden)]
 pub mod shim {
     use super::*;
 
     pub unsafe extern "C" fn create<P: Plugin>(api: *const XgcHostApi) -> *mut c_void {
+        // A major-only descriptor loader can still load this library on an
+        // old 80-byte Host. Reject BEFORE any user code can call Host::api()
+        // and form an 88-byte reference, even if it never acquires a reader.
+        if !admits_current_host_api(api) { return std::ptr::null_mut(); }
         match catch_unwind(AssertUnwindSafe(|| Box::new(P::create(Host::from_raw(api))))) {
             Ok(plugin) => Box::into_raw(plugin).cast(),
             Err(_) => std::ptr::null_mut(),

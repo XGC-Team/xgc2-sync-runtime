@@ -554,6 +554,60 @@ unsafe extern "C" fn api_now(host: *mut c_void) -> i64 {
     slot(host).rt.clock.now()
 }
 
+// One thin opaque pointer to a boxed Arc, NOT a cast of the Arc<dyn Clock>
+// fat pointer itself. The only retain/allocation is the cold acquisition.
+unsafe fn acquire_clock_reader(
+    clock: &Arc<dyn Clock>, reader_size: u32, out: *mut XgcClockReaderV1,
+) -> XgcStatus {
+    if out.is_null() || reader_size as usize != std::mem::size_of::<XgcClockReaderV1>() {
+        return XGC_ERR_INVALID;
+    }
+    if !(*out).opaque.is_null() || (*out).now.is_some() || (*out).release.is_some() {
+        return XGC_ERR_INVALID;
+    }
+    let owned = Box::new(Arc::clone(clock));
+    out.write(XgcClockReaderV1 {
+        opaque: Box::into_raw(owned).cast(),
+        now: Some(clock_reader_now),
+        release: Some(clock_reader_release),
+    });
+    XGC_OK
+}
+
+unsafe extern "C" fn api_acquire_clock_reader(
+    host: *mut c_void, reader_size: u32, out: *mut XgcClockReaderV1,
+) -> XgcStatus {
+    if host.is_null() || out.is_null() ||
+        reader_size as usize != std::mem::size_of::<XgcClockReaderV1>() {
+        return XGC_ERR_INVALID;
+    }
+    // Module thread, cold create only. Async now/release below never use Slot.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        acquire_clock_reader(&slot(host).rt.clock, reader_size, out)
+    })).unwrap_or(XGC_ERR)
+}
+
+unsafe extern "C" fn clock_reader_now(opaque: *mut c_void, out_time: *mut i64) -> XgcStatus {
+    if opaque.is_null() || out_time.is_null() { return XGC_ERR_INVALID; }
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Immutable borrow only: no from_raw, retain, allocation, Slot/ctx or
+        // source polling. Clock::now keeps its existing mathematical semantics.
+        (&*opaque.cast::<Arc<dyn Clock>>()).now()
+    }));
+    match value {
+        Ok(time) => { out_time.write(time); XGC_OK }
+        Err(_) => XGC_ERR, // leave output untouched; never invent a zero stamp
+    }
+}
+
+unsafe extern "C" fn clock_reader_release(opaque: *mut c_void) {
+    if opaque.is_null() { return; }
+    // Exclusive exactly-once call after the owning I/O threads have joined.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(Box::from_raw(opaque.cast::<Arc<dyn Clock>>()));
+    }));
+}
+
 unsafe fn c_text(ptr: *const c_char) -> String {
     if ptr.is_null() {
         String::new()
@@ -627,6 +681,7 @@ fn spawn_module(rt: &Arc<Runtime>, m: usize, instance: Arc<Instance>, ready: Opt
             request_recover: api_request_recover,
             port_origins: api_port_origins,
             node_id: api_node_id,
+            acquire_clock_reader: Some(api_acquire_clock_reader),
         },
         current: None,
         staged: vec![VecDeque::new(); module.inputs.len()],
@@ -1711,6 +1766,66 @@ fn ms_since(t: Instant) -> f64 {
 mod loader_tests {
     use super::*;
     use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
+
+    #[test]
+    fn owned_clock_reader_uses_live_clock_and_releases_only_after_reader_join() {
+        use xgc_rt_core::clock::SourceClock;
+        let source = Arc::new(SourceClock::new(Duration::from_secs(5), 1_000_000_000));
+        let clock: Arc<dyn Clock> = source.clone();
+        let mut reader = XgcClockReaderV1::default();
+        assert_eq!(unsafe { acquire_clock_reader(&clock, 24, &mut reader) }, XGC_OK);
+        assert_eq!(Arc::strong_count(&source), 3); // source + cold clock + one lease
+        drop(clock); // reader no longer depends on the acquisition scope
+        let opaque = reader.opaque as usize;
+        let now = reader.now.unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let mut time = -1;
+            assert_eq!(unsafe { now(opaque as *mut c_void, &mut time) }, XGC_OK);
+            assert_eq!(time, 0); // preserve SourceClock's genuine initial zero
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            for _ in 0..32 {
+                assert_eq!(unsafe { now(opaque as *mut c_void, &mut time) }, XGC_OK);
+                assert_eq!(time, 123_456_789);
+            }
+        });
+        ready_rx.recv().unwrap();
+        source.observe(123_456_789).unwrap(); // update the same accepted Clock
+        resume_tx.send(()).unwrap();
+        reading.join().unwrap(); // fence/finish reads before consuming the lease
+        assert_eq!(Arc::strong_count(&source), 2); // reads did not retain the Arc
+        unsafe { reader.release.unwrap()(reader.opaque) };
+        assert_eq!(Arc::strong_count(&source), 1);
+    }
+
+    #[test]
+    fn owned_clock_reader_rejects_wrong_size_and_preserves_output_on_error() {
+        struct PanickingClock;
+        impl Clock for PanickingClock {
+            fn now(&self) -> i64 { panic!("clock read fixture"); }
+            fn bound_ns(&self) -> u32 { 0 }
+            fn domain(&self) -> ClockDomain { ClockDomain::Sim }
+        }
+        let clock: Arc<dyn Clock> = Arc::new(PanickingClock);
+        let mut reader = XgcClockReaderV1::default();
+        assert_eq!(unsafe { acquire_clock_reader(&clock, 23, &mut reader) }, XGC_ERR_INVALID);
+        assert!(reader.opaque.is_null() && reader.now.is_none() && reader.release.is_none());
+        assert_eq!(Arc::strong_count(&clock), 1);
+        assert_eq!(unsafe { acquire_clock_reader(&clock, 24, &mut reader) }, XGC_OK);
+        assert_eq!(unsafe { acquire_clock_reader(&clock, 24, &mut reader) }, XGC_ERR_INVALID);
+        assert_eq!(Arc::strong_count(&clock), 2); // no second retain on an owned output
+        let mut time = 999;
+        assert_eq!(unsafe { reader.now.unwrap()(reader.opaque, &mut time) }, XGC_ERR);
+        assert_eq!(time, 999); // no fabricated zero/fallback timestamp
+        assert_eq!(unsafe { reader.now.unwrap()(reader.opaque, std::ptr::null_mut()) }, XGC_ERR_INVALID);
+        assert_eq!(unsafe { clock_reader_now(std::ptr::null_mut(), &mut time) }, XGC_ERR_INVALID);
+        assert_eq!(time, 999);
+        unsafe { reader.release.unwrap()(reader.opaque) };
+        assert_eq!(Arc::strong_count(&clock), 1);
+        assert_eq!(unsafe { api_acquire_clock_reader(std::ptr::null_mut(), 24, &mut XgcClockReaderV1::default()) }, XGC_ERR_INVALID);
+    }
 
     #[test]
     fn shared_libraries_keep_instance_configuration_and_declaration_checks() {
