@@ -104,5 +104,7 @@ The [September 2026 native validation](validation/native-20260926/README.md)
 uses one host and a software plant. CPU tests with local transports and fake
 chrony observations likewise do not establish onboard or radio clock bounds.
 The external-clock/Session policy follows runtime-sync's existing ClockMonitor
-and shared-epoch/local-cycle contract. Decisions live in the academic knowledge
-base: lxk36/academic, `docs/architecture/xgc2-sync-runtime/time-model.md`.
+and shared-epoch/local-cycle contract. The September 2026 timing record is preserved
+in lxk36/academic, [memory/archive/sync-runtime/time-model.md](https://github.com/lxk36/academic/blob/main/memory/archive/sync-runtime/time-model.md).
+The [academic topic](https://github.com/lxk36/academic/blob/main/memory/now/sync-runtime.md)
+records its source and historical scope; the present-tense behavior is described above.

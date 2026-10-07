@@ -61,6 +61,6 @@ lists source identities, replay hashes, software-plant results and limitations.
 
 The runtime-owned [deployment renderer](docs/native-deployment.md) binds an actual Session, robot namespace, topics, calibration provenance and artifact hashes into a private manifest generation. Use its target-local `run` entry with the ordinary managed-process definition; `prepare` alone does not establish module readiness.
 
-## Design and plan
+## Author sources and design history
 
-Decisions, rationale and the development plan for this runtime are kept in the academic knowledge base: lxk36/academic, `docs/architecture/xgc2-sync-runtime/`. This repository keeps only present-tense how-to.
+The [academic topic](https://github.com/lxk36/academic/blob/main/memory/now/sync-runtime.md) links the frozen author brief and the [September 2026 design pack](https://github.com/lxk36/academic/blob/main/memory/archive/sync-runtime/design-pack-2026-09-25.md). Historical stages, PR states and plans remain dated records. This repository documents the current code and its how-to.
