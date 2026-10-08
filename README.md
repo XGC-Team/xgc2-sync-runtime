@@ -51,7 +51,7 @@ cargo test                       # unit tests + Z1 exit tests (needs a C compile
 examples/z1-pipeline/run.sh      # release build, 5-plugin host for 5 s, merged audit in out/z1-pipeline/merged
 ```
 
-Rust ≥ 1.75 (matches the pinned zenoh 1.9.0).
+Rust ≥ 1.85 (workspace resolver 3 and the shared XRPC SDK require it).
 
 Some native integration tests return early when ROS/core dependencies are
 absent. A successful default `cargo test` run alone does not show they ran.

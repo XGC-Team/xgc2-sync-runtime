@@ -16,6 +16,8 @@ name = "station-io-cmd"
 path = "src/main.rs"
 
 [dependencies]
+xgc2-xrpc = { path = "../../../xrpc/rust" }
+tokio = { version = "1", features = ["sync", "time"] }
 libc = "0.2"
 xgc-rt-abi.workspace = true
 serde_json.workspace = true
@@ -23,6 +25,7 @@ toml.workspace = true
 zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "unstable"] }
 
 [dev-dependencies]
+tempfile = "3"
 xgc-rt-host = { path = "../../crates/xgc-rt-host" }
 xgc-rt-core.workspace = true
 xgc-rt-transport-loopback.workspace = true

@@ -47,7 +47,10 @@ pub fn interval(hz: f64) -> u64 {
 }
 
 pub fn parse_rate(value: &toml::Value, ceiling: f64) -> Result<u64, String> {
-    let hz = value.as_float().or_else(|| value.as_integer().map(|n| n as f64)).ok_or("rate is not a number")?;
+    let hz = value
+        .as_float()
+        .or_else(|| value.as_integer().map(|n| n as f64))
+        .ok_or("rate is not a number")?;
     if !hz.is_finite() || hz <= 0.0 || hz > ceiling {
         return Err(format!("rate {hz} is outside (0, {ceiling}]"));
     }
@@ -65,7 +68,10 @@ pub fn valid_robot_id(robot_id: &str) -> bool {
     if !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
         return false;
     }
-    if !bytes[1..bytes.len() - 1].iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-') {
+    if !bytes[1..bytes.len() - 1]
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
         return false;
     }
     let alias = bytes.len() > 3
@@ -84,7 +90,10 @@ pub fn valid_endpoint(endpoint: &str) -> bool {
     if host.is_empty() || host.len() > 253 || !host.as_bytes()[0].is_ascii_alphanumeric() {
         return false;
     }
-    if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
         return false;
     }
     match port.parse::<u16>() {
@@ -98,13 +107,17 @@ pub fn valid_frame(frame: &str) -> bool {
     if bytes.len() < 2 || bytes.len() > 128 {
         return false;
     }
-    if !bytes[0].is_ascii_alphabetic() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() && bytes[bytes.len() - 1] != b'_' {
+    if !bytes[0].is_ascii_alphabetic()
+        || !bytes[bytes.len() - 1].is_ascii_alphanumeric() && bytes[bytes.len() - 1] != b'_'
+    {
         return false;
     }
     if frame.contains("//") || frame.contains("..") {
         return false;
     }
-    bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'.' | b'/' | b'-'))
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'.' | b'/' | b'-'))
 }
 
 /// Control-region name in `xgc_controller_status_v1.state[48]`.
@@ -116,10 +129,9 @@ pub fn valid_controller_state(text: &str) -> bool {
 }
 
 const COMMAND_TOKENS: &[&str] = &[
-    "prepare", "custom1", "start", "hold", "hover", "stop",
-    "takeoff", "Takeoff", "TAKEOFF", "land", "Land", "LAND",
-    "Hover", "HOVER", "Custom1", "CUSTOM1", "Start", "START",
-    "track", "Track", "TRACK",
+    "prepare", "custom1", "start", "hold", "hover", "stop", "takeoff", "Takeoff", "TAKEOFF",
+    "land", "Land", "LAND", "Hover", "HOVER", "Custom1", "CUSTOM1", "Start", "START", "track",
+    "Track", "TRACK",
 ];
 
 pub fn valid_command_token(text: &str) -> bool {
@@ -172,19 +184,35 @@ fn dump(value: Value, limit: usize) -> Option<String> {
     (text.len() <= limit).then_some(text)
 }
 
-pub fn pose_json(sequence: u64, stamp_s: f64, frame_id: &str, child_frame_id: &str, position: &[f64; 3], q_wxyz: &[f64; 4]) -> Option<String> {
+pub fn pose_json(
+    sequence: u64,
+    stamp_s: f64,
+    frame_id: &str,
+    child_frame_id: &str,
+    position: &[f64; 3],
+    q_wxyz: &[f64; 4],
+) -> Option<String> {
     let t_ms = stamp_ms(stamp_s)?;
     if sequence == 0 || !finite3(position) || !quat_ok(q_wxyz) {
         return None;
     }
-    dump(json!({
-        "v": 1, "sequence": sequence, "t_ms": t_ms,
-        "frame_id": frame_id, "child_frame_id": child_frame_id,
-        "position": vec3(position), "orientation": xyzw(q_wxyz),
-    }), POSE_MAX)
+    dump(
+        json!({
+            "v": 1, "sequence": sequence, "t_ms": t_ms,
+            "frame_id": frame_id, "child_frame_id": child_frame_id,
+            "position": vec3(position), "orientation": xyzw(q_wxyz),
+        }),
+        POSE_MAX,
+    )
 }
 
-pub fn twist_json(sequence: u64, stamp_s: f64, frame_id: &str, linear: &[f64; 3], angular: Option<&[f64; 3]>) -> Option<String> {
+pub fn twist_json(
+    sequence: u64,
+    stamp_s: f64,
+    frame_id: &str,
+    linear: &[f64; 3],
+    angular: Option<&[f64; 3]>,
+) -> Option<String> {
     let t_ms = stamp_ms(stamp_s)?;
     if sequence == 0 || !finite3(linear) {
         return None;
@@ -194,24 +222,36 @@ pub fn twist_json(sequence: u64, stamp_s: f64, frame_id: &str, linear: &[f64; 3]
         Some(_) => return None,
         None => Value::Null,
     };
-    dump(json!({
-        "v": 1, "sequence": sequence, "t_ms": t_ms, "frame_id": frame_id,
-        "linear": vec3(linear), "angular": angular,
-    }), TWIST_MAX)
+    dump(
+        json!({
+            "v": 1, "sequence": sequence, "t_ms": t_ms, "frame_id": frame_id,
+            "linear": vec3(linear), "angular": angular,
+        }),
+        TWIST_MAX,
+    )
 }
 
-pub fn imu_json(sequence: u64, stamp_s: f64, frame_id: &str, gyro: &[f64; 3], accel: &[f64; 3]) -> Option<String> {
+pub fn imu_json(
+    sequence: u64,
+    stamp_s: f64,
+    frame_id: &str,
+    gyro: &[f64; 3],
+    accel: &[f64; 3],
+) -> Option<String> {
     let t_ms = stamp_ms(stamp_s)?;
     if sequence == 0 || !finite3(gyro) || !finite3(accel) {
         return None;
     }
-    dump(json!({
-        "v": 1, "sequence": sequence, "t_ms": t_ms, "frame_id": frame_id,
-        "orientation": Value::Null,
-        "angular_velocity": vec3(gyro),
-        "linear_acceleration": vec3(accel),
-        "covariance": {"orientation": Value::Null, "angular_velocity": Value::Null, "linear_acceleration": Value::Null},
-    }), IMU_MAX)
+    dump(
+        json!({
+            "v": 1, "sequence": sequence, "t_ms": t_ms, "frame_id": frame_id,
+            "orientation": Value::Null,
+            "angular_velocity": vec3(gyro),
+            "linear_acceleration": vec3(accel),
+            "covariance": {"orientation": Value::Null, "angular_velocity": Value::Null, "linear_acceleration": Value::Null},
+        }),
+        IMU_MAX,
+    )
 }
 
 pub fn power_json(sequence: u64, stamp_s: f64, percentage: f64, voltage: f64) -> Option<String> {
@@ -219,24 +259,43 @@ pub fn power_json(sequence: u64, stamp_s: f64, percentage: f64, voltage: f64) ->
     if sequence == 0 || !percentage.is_finite() || !(-1.0..=1.0).contains(&percentage) {
         return None;
     }
-    let voltage_v = if voltage.is_finite() { json!(voltage) } else { Value::Null };
-    dump(json!({
-        "v": 1, "sequence": sequence, "t_ms": t_ms,
-        "percentage": percentage, "voltage_v": voltage_v,
-        "current_a": Value::Null, "temperature_c": Value::Null, "charging": Value::Null,
-    }), POWER_MAX)
+    let voltage_v = if voltage.is_finite() {
+        json!(voltage)
+    } else {
+        Value::Null
+    };
+    dump(
+        json!({
+            "v": 1, "sequence": sequence, "t_ms": t_ms,
+            "percentage": percentage, "voltage_v": voltage_v,
+            "current_a": Value::Null, "temperature_c": Value::Null, "charging": Value::Null,
+        }),
+        POWER_MAX,
+    )
 }
 
-pub fn flight_json(sequence: u64, stamp_s: f64, connected: bool, armed: bool, guided: bool, manual_input: bool, mode: &str, system_status: u32) -> Option<String> {
+pub fn flight_json(
+    sequence: u64,
+    stamp_s: f64,
+    connected: bool,
+    armed: bool,
+    guided: bool,
+    manual_input: bool,
+    mode: &str,
+    system_status: u32,
+) -> Option<String> {
     let t_ms = stamp_ms(stamp_s)?;
     if sequence == 0 || mode.len() > 64 {
         return None;
     }
-    dump(json!({
-        "v": 1, "sequence": sequence, "t_ms": t_ms,
-        "connected": connected, "armed": armed, "guided": guided, "manual_input": manual_input,
-        "mode": mode, "system_status": system_status, "landed_state": Value::Null, "faults": [],
-    }), FLIGHT_MAX)
+    dump(
+        json!({
+            "v": 1, "sequence": sequence, "t_ms": t_ms,
+            "connected": connected, "armed": armed, "guided": guided, "manual_input": manual_input,
+            "mode": mode, "system_status": system_status, "landed_state": Value::Null, "faults": [],
+        }),
+        FLIGHT_MAX,
+    )
 }
 
 pub struct HeartbeatChannel {
@@ -247,7 +306,17 @@ pub struct HeartbeatChannel {
     pub text: Option<String>,
 }
 
-pub fn heartbeat_json(robot_id: &str, sequence: u64, t_ms: i64, uptime_ms: i64, channels: &[HeartbeatChannel], publish_success: u64, publish_failure: u64, throttled: u64, rejected_source: u64) -> Option<String> {
+pub fn heartbeat_json(
+    robot_id: &str,
+    sequence: u64,
+    t_ms: i64,
+    uptime_ms: i64,
+    channels: &[HeartbeatChannel],
+    publish_success: u64,
+    publish_failure: u64,
+    throttled: u64,
+    rejected_source: u64,
+) -> Option<String> {
     if sequence == 0 || t_ms <= 0 || uptime_ms < 0 {
         return None;
     }
@@ -260,11 +329,14 @@ pub fn heartbeat_json(robot_id: &str, sequence: u64, t_ms: i64, uptime_ms: i64, 
         }
         item
     }).collect();
-    dump(json!({
-        "v": 1, "sequence": sequence, "t_ms": t_ms, "robot_id": robot_id,
-        "transport": "zenoh", "uptime_ms": uptime_ms, "channels": channels,
-        "stats": {"publish_success": publish_success, "publish_failure": publish_failure, "throttled": throttled, "rejected_source": rejected_source},
-    }), HEARTBEAT_MAX)
+    dump(
+        json!({
+            "v": 1, "sequence": sequence, "t_ms": t_ms, "robot_id": robot_id,
+            "transport": "zenoh", "uptime_ms": uptime_ms, "channels": channels,
+            "stats": {"publish_success": publish_success, "publish_failure": publish_failure, "throttled": throttled, "rejected_source": rejected_source},
+        }),
+        HEARTBEAT_MAX,
+    )
 }
 
 fn f64_at(data: &[u8], offset: usize) -> f64 {
@@ -274,7 +346,11 @@ fn f64_at(data: &[u8], offset: usize) -> f64 {
 }
 
 fn f64_3(data: &[u8], offset: usize) -> [f64; 3] {
-    [f64_at(data, offset), f64_at(data, offset + 8), f64_at(data, offset + 16)]
+    [
+        f64_at(data, offset),
+        f64_at(data, offset + 8),
+        f64_at(data, offset + 16),
+    ]
 }
 
 #[derive(Clone, Copy)]
@@ -291,7 +367,12 @@ pub fn parse_pose(data: &[u8]) -> Option<NativePose> {
     Some(NativePose {
         stamp_s: f64_at(data, 0),
         position: f64_3(data, 8),
-        q_wxyz: [f64_at(data, 32), f64_at(data, 40), f64_at(data, 48), f64_at(data, 56)],
+        q_wxyz: [
+            f64_at(data, 32),
+            f64_at(data, 40),
+            f64_at(data, 48),
+            f64_at(data, 56),
+        ],
     })
 }
 
@@ -306,7 +387,11 @@ pub fn parse_twist(data: &[u8]) -> Option<NativeTwist> {
     if data.len() != 56 {
         return None;
     }
-    Some(NativeTwist { stamp_s: f64_at(data, 0), linear: f64_3(data, 8), angular: f64_3(data, 32) })
+    Some(NativeTwist {
+        stamp_s: f64_at(data, 0),
+        linear: f64_3(data, 8),
+        angular: f64_3(data, 32),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -320,7 +405,11 @@ pub fn parse_imu(data: &[u8]) -> Option<NativeImu> {
     if data.len() != 56 {
         return None;
     }
-    Some(NativeImu { stamp_s: f64_at(data, 0), accel: f64_3(data, 8), gyro: f64_3(data, 32) })
+    Some(NativeImu {
+        stamp_s: f64_at(data, 0),
+        accel: f64_3(data, 8),
+        gyro: f64_3(data, 32),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -334,7 +423,11 @@ pub fn parse_battery(data: &[u8]) -> Option<NativeBattery> {
     if data.len() != 24 {
         return None;
     }
-    Some(NativeBattery { stamp_s: f64_at(data, 0), voltage: f64_at(data, 8), percentage: f64_at(data, 16) })
+    Some(NativeBattery {
+        stamp_s: f64_at(data, 0),
+        voltage: f64_at(data, 8),
+        percentage: f64_at(data, 16),
+    })
 }
 
 #[derive(Clone)]
@@ -386,7 +479,12 @@ pub fn parse_paired(data: &[u8]) -> Option<NativePaired> {
         pose_stamp_s,
         twist_stamp_s,
         position: f64_3(data, 16),
-        q_xyzw: [f64_at(data, 40), f64_at(data, 48), f64_at(data, 56), f64_at(data, 64)],
+        q_xyzw: [
+            f64_at(data, 40),
+            f64_at(data, 48),
+            f64_at(data, 56),
+            f64_at(data, 64),
+        ],
         linear: f64_3(data, 72),
     })
 }
@@ -457,8 +555,21 @@ mod tests {
         raw[64..72].copy_from_slice(&1.0f64.to_le_bytes());
         raw[72..80].copy_from_slice(&0.5f64.to_le_bytes());
         let paired = parse_paired(&raw).unwrap();
-        let q_wxyz = [paired.q_xyzw[3], paired.q_xyzw[0], paired.q_xyzw[1], paired.q_xyzw[2]];
-        let text = pose_json(1, paired.pose_stamp_s, "world", "base_link", &paired.position, &q_wxyz).unwrap();
+        let q_wxyz = [
+            paired.q_xyzw[3],
+            paired.q_xyzw[0],
+            paired.q_xyzw[1],
+            paired.q_xyzw[2],
+        ];
+        let text = pose_json(
+            1,
+            paired.pose_stamp_s,
+            "world",
+            "base_link",
+            &paired.position,
+            &q_wxyz,
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["t_ms"], 1250);
         assert_eq!(v["position"]["x"], 4.0);
@@ -468,11 +579,27 @@ mod tests {
 
     #[test]
     fn pose_stamp_stays_session_milliseconds() {
-        let text = pose_json(1, 12.5, "world", "base_link", &[1.0, 2.0, 3.0], &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        let text = pose_json(
+            1,
+            12.5,
+            "world",
+            "base_link",
+            &[1.0, 2.0, 3.0],
+            &[1.0, 0.0, 0.0, 0.0],
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["t_ms"], 12500);
         assert_eq!(v["orientation"]["w"], 1.0);
-        assert!(pose_json(1, 0.0, "world", "base_link", &[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert!(pose_json(
+            1,
+            0.0,
+            "world",
+            "base_link",
+            &[0.0, 0.0, 0.0],
+            &[1.0, 0.0, 0.0, 0.0]
+        )
+        .is_none());
     }
 
     #[test]
@@ -481,7 +608,14 @@ mod tests {
         let twist_value: Value = serde_json::from_str(&twist).unwrap();
         assert!(twist_value["angular"].is_null());
         assert_eq!(twist_value["linear"]["x"], 0.5);
-        let measured = twist_json(1, 1.5, "base_link", &[0.5, 0.0, 0.0], Some(&[0.0, 0.0, 0.1])).unwrap();
+        let measured = twist_json(
+            1,
+            1.5,
+            "base_link",
+            &[0.5, 0.0, 0.0],
+            Some(&[0.0, 0.0, 0.1]),
+        )
+        .unwrap();
         let measured_value: Value = serde_json::from_str(&measured).unwrap();
         assert_eq!(measured_value["angular"]["z"], 0.1);
         let power = power_json(1, 1.0, 0.4, 15.5).unwrap();

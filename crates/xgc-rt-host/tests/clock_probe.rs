@@ -252,7 +252,8 @@ fn production_unknown_bound_and_loaded_descriptor_checks_are_consumed() {
     let tx: Vec<_> = records.chunks_exact(RECORD_LEN).map(|b| Record::decode(b).unwrap()).filter(|r| r.kind == Kind::Tx).collect();
     assert!(!tx.is_empty()); assert!(tx.iter().all(|r| r.bound_a == u32::MAX));
     for (key, wanted, bad) in [("expected_name", "stub-perception", "legacy-plant"), ("expected_version", "0.1.0", "0.2.0")] {
-        let wrong = text.replace(&format!("{key} = \"{wanted}\""), &format!("{key} = \"{bad}\""));
+        let wrong = text.replace(&format!("{key} = \"{wanted}\""), &format!("{key} = \"{bad}\""))
+            .replace("dir = \"audit\"", &format!("dir = \"audit-{key}\""));
         let out = host_process(&dir, "wrong.toml", &wrong, &dir).wait_with_output().unwrap();
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains("loaded descriptor"));

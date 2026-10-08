@@ -63,6 +63,64 @@ struct Fixture {
     manifest: Manifest,
     text: String,
 }
+
+#[test]
+fn aggregate_control_loads_clock_source_by_module_instance_name() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use xgc2_xrpc::{BlockingClient, Runtime, RuntimeOptions};
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let fixture = Fixture::new("aggregate-control-name");
+    let endpoint = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(endpoint.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = endpoint.path().join("control.sock");
+    let audit = fixture.dir.join("audit");
+    std::fs::create_dir(&audit).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_xgc-rt-host"))
+        .arg("--control-socket").arg(&socket)
+        .arg("--module-root").arg(&fixture.dir)
+        .arg("--document-root").arg(&fixture.dir)
+        .arg("--audit-root").arg(&audit)
+        .stdout(Stdio::piped()).stderr(Stdio::inherit())
+        .spawn().unwrap();
+    let mut child = OwnedChild(child);
+    let mut output = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let reference: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let client = BlockingClient::unix(&runtime, &socket,
+        reference["service_ref"]["instance_id"].as_str().unwrap()).unwrap();
+    let loaded = client.call("/v1/load", serde_json::json!({
+        "manifest_toml":fixture.text, "base_dir":fixture.dir,
+    }), Duration::from_secs(2)).unwrap();
+    assert_eq!(loaded["state"], "loaded");
+    assert_eq!(loaded["modules"][0], "ros_io");
+    assert!(loaded["configuration"]["applied_revision"].is_null());
+    client.call("/v1/unload", serde_json::json!({"expected_revision":1}),
+        Duration::from_secs(2)).unwrap();
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < until, "aggregate clock fixture did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!socket.exists());
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("clock-source-{name}"));

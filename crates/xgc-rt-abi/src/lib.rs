@@ -12,7 +12,7 @@ pub mod neighbor;
 
 pub const XGC_RT_ABI_VERSION: u32 = 1;
 pub const XGC_RT_MAX_PORTS: u32 = 64;
-pub const XGC_RT_ABI_MINOR: u32 = 2;
+pub const XGC_RT_ABI_MINOR: u32 = 3;
 
 /// `xgc_status`. It is kept as a plain integer so that an out-of-range value
 /// from a foreign plugin is a checked error, never undefined behaviour.
@@ -91,6 +91,26 @@ pub struct XgcHostApi {
     pub port_origins: unsafe extern "C" fn(*mut c_void, u32, *mut u16, u32) -> u32,
     /// abi_minor >= 1
     pub node_id: unsafe extern "C" fn(*mut c_void) -> u16,
+    /// abi_minor >= 3. Borrowed official XRPC RuntimeApiV1; nullable.
+    pub rpc_runtime: Option<unsafe extern "C" fn(*mut c_void) -> *const c_void>,
+}
+
+// A minor-0 host allocated only this prefix. Forming &XgcHostApi would require
+// the entire current table to exist even if no new field were subsequently
+// read. The plugin facade copies only this guaranteed prefix and reads each
+// extension field through a raw pointer after its minor check.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HostApiPrefix {
+    abi_version: u32,
+    abi_minor: u32,
+    host: *mut c_void,
+    publish: unsafe extern "C" fn(*mut c_void, u32, u64, *const u8, u32) -> XgcStatus,
+    next: unsafe extern "C" fn(*mut c_void, u32, *mut XgcSampleView) -> XgcStatus,
+    now: unsafe extern "C" fn(*mut c_void) -> i64,
+    log: unsafe extern "C" fn(*mut c_void, XgcLogLevel, *const c_char),
+    request_degrade: unsafe extern "C" fn(*mut c_void, *const c_char),
+    request_recover: unsafe extern "C" fn(*mut c_void),
 }
 
 /// Entries are `Option` because a C plugin may leave one NULL. The host
@@ -148,14 +168,19 @@ pub struct Host {
 
 impl Host {
     /// # Safety
-    /// `api` must be the pointer the host passed to `create`.
+    /// `api` must be the pointer the host passed to `create`, with the storage
+    /// for its declared ABI minor alive until `destroy`. Host methods may only
+    /// be used on the module's vtable thread while a vtable call is in progress.
     pub unsafe fn from_raw(api: *const XgcHostApi) -> Self {
         Self { api }
     }
 
-    fn api(&self) -> &XgcHostApi {
-        // SAFETY: the host keeps the api table alive until `destroy`.
-        unsafe { &*self.api }
+    fn api(&self) -> HostApiPrefix {
+        // SAFETY: every supported minor includes this prefix; a previous host
+        // need not allocate the appended fields of the current XgcHostApi.
+        // Copy the small valid prefix: host callbacks take a mutable Slot
+        // containing this table, so no table borrow may live across a callback.
+        unsafe { self.api.cast::<HostApiPrefix>().read() }
     }
 
     pub fn publish(&self, port: u32, round: u64, data: &[u8]) -> Result<(), XgcStatus> {
@@ -218,9 +243,12 @@ impl Host {
         if api.abi_minor < 1 {
             return Vec::new();
         }
+        // SAFETY: minor >= 1 guarantees this extension's storage and callback.
+        let port_origins = unsafe { std::ptr::addr_of!((*self.api).port_origins).read() };
         let mut ids = vec![0u16; 16];
         loop {
-            let n = unsafe { (api.port_origins)(api.host, port, ids.as_mut_ptr(), ids.len() as u32) } as usize;
+            let n = unsafe { port_origins(api.host, port, ids.as_mut_ptr(), ids.len() as u32) }
+                as usize;
             if n <= ids.len() {
                 ids.truncate(n);
                 return ids;
@@ -232,7 +260,28 @@ impl Host {
     /// This node's roster id, or None on a host older than ABI minor 1.
     pub fn node_id(&self) -> Option<u16> {
         let api = self.api();
-        (api.abi_minor >= 1).then(|| unsafe { (api.node_id)(api.host) })
+        if api.abi_minor < 1 {
+            return None;
+        }
+        // SAFETY: checked the minor before reading this extension field.
+        let node_id = unsafe { std::ptr::addr_of!((*self.api).node_id).read() };
+        Some(unsafe { node_id(api.host) })
+    }
+
+    /// Borrow the official XRPC C runtime table on a minor-3 host. Available
+    /// only during create/activate on the module's vtable thread. A plugin
+    /// must copy and retain it in that call before storing it, for example via
+    /// `ForeignRuntime::from_api(pointer.cast())`. The pointer is not a Rust
+    /// Runtime, and older hosts or a disabled getter return None.
+    pub fn rpc_runtime_api(&self) -> Option<*const c_void> {
+        let api = self.api();
+        if api.abi_minor < 3 {
+            return None;
+        }
+        // SAFETY: minor >= 3 declares the optional getter field's storage.
+        let getter = unsafe { std::ptr::addr_of!((*self.api).rpc_runtime).read() }?;
+        let pointer = unsafe { getter(api.host) };
+        (!pointer.is_null()).then_some(pointer)
     }
 
     pub fn request_recover(&self) {
@@ -272,13 +321,18 @@ pub mod shim {
     use super::*;
 
     pub unsafe extern "C" fn create<P: Plugin>(api: *const XgcHostApi) -> *mut c_void {
-        match catch_unwind(AssertUnwindSafe(|| Box::new(P::create(Host::from_raw(api))))) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            Box::new(P::create(Host::from_raw(api)))
+        })) {
             Ok(plugin) => Box::into_raw(plugin).cast(),
             Err(_) => std::ptr::null_mut(),
         }
     }
 
-    pub unsafe extern "C" fn configure<P: Plugin>(this: *mut c_void, config: *const c_char) -> XgcStatus {
+    pub unsafe extern "C" fn configure<P: Plugin>(
+        this: *mut c_void,
+        config: *const c_char,
+    ) -> XgcStatus {
         let plugin = &mut *this.cast::<P>();
         let text = if config.is_null() {
             String::new()
@@ -293,7 +347,10 @@ pub mod shim {
         guarded(|| plugin.activate())
     }
 
-    pub unsafe extern "C" fn step<P: Plugin>(this: *mut c_void, ctx: *const XgcStepCtx) -> XgcStatus {
+    pub unsafe extern "C" fn step<P: Plugin>(
+        this: *mut c_void,
+        ctx: *const XgcStepCtx,
+    ) -> XgcStatus {
         let plugin = &mut *this.cast::<P>();
         let ctx = *ctx;
         guarded(|| plugin.step(&ctx))
@@ -312,7 +369,8 @@ pub mod shim {
 
     pub unsafe extern "C" fn domain_state<P: Plugin>(this: *mut c_void) -> *const c_char {
         let plugin = &*this.cast::<P>();
-        catch_unwind(AssertUnwindSafe(|| plugin.domain_state().as_ptr())).unwrap_or(b"panicked\0".as_ptr() as *const c_char)
+        catch_unwind(AssertUnwindSafe(|| plugin.domain_state().as_ptr()))
+            .unwrap_or(b"panicked\0".as_ptr() as *const c_char)
     }
 }
 

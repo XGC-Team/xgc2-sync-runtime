@@ -15,6 +15,7 @@
 //! [audit]
 //! dir = "out/audit"
 //! steps_every = 1   # steps.jsonl: every step of one round in N
+//! max_bytes = 268435456 # all audit files per node/attempt, including metadata
 //!
 //! [[channel]]
 //! name = "dmpc/plan"
@@ -70,7 +71,9 @@ pub struct ClockSourceSpec {
 }
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ClockSourceKind { Ros1Sim }
+pub enum ClockSourceKind {
+    Ros1Sim,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,12 +124,24 @@ pub struct TransportSpec {
 #[serde(deny_unknown_fields)]
 pub struct AuditSpec {
     pub dir: PathBuf,
+    /// Total disk allowance per node in this attempt. Includes records,
+    /// health/step/clock logs and a fixed 128 KiB metadata reservation.
+    /// Once exhausted, retain existing evidence and count discarded entries.
+    #[serde(default = "default_audit_max_bytes")]
+    pub max_bytes: u64,
     /// `steps.jsonl` keeps every step of one round in `steps_every`, and
     /// every step that failed or overran its budget. The default 1 keeps
     /// every step; a large graph samples, since a line per step is megabytes
     /// per second at 100 robots.
     #[serde(default = "default_steps_every")]
     pub steps_every: u64,
+}
+
+pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const AUDIT_METADATA_RESERVED_BYTES: u64 = 128 * 1024;
+
+fn default_audit_max_bytes() -> u64 {
+    DEFAULT_AUDIT_MAX_BYTES
 }
 
 fn default_steps_every() -> u64 {
@@ -170,7 +185,9 @@ pub struct ClockSpec {
     pub chrony_max_uncertainty_ms: f64,
 }
 
-fn default_probe_stale_ms() -> u64 { 3_000 }
+fn default_probe_stale_ms() -> u64 {
+    3_000
+}
 
 fn default_probe_interval_ms() -> u64 {
     1_000
@@ -245,7 +262,11 @@ pub struct RestartPolicy {
 
 impl Default for RestartPolicy {
     fn default() -> Self {
-        Self { policy: RestartKind::Never, max: 0, backoff_ms: 0 }
+        Self {
+            policy: RestartKind::Never,
+            max: 0,
+            backoff_ms: 0,
+        }
     }
 }
 
@@ -338,46 +359,103 @@ impl Manifest {
         if self.audit.steps_every == 0 {
             return err("audit.steps_every must be at least 1".into());
         }
+        if self.audit.max_bytes < AUDIT_METADATA_RESERVED_BYTES {
+            return err(format!("audit.max_bytes must be at least {AUDIT_METADATA_RESERVED_BYTES} (metadata reservation)"));
+        }
         let period_ns = (s.period_ms * 1e6).round() as i64;
         let publish_deadline_ns = match s.publish_deadline_ms {
             None => period_ns,
-            Some(ms) if ms.is_finite() && ms > 0.0 && ms * 1e6 <= period_ns as f64 => (ms * 1e6).round() as i64,
+            Some(ms) if ms.is_finite() && ms > 0.0 && ms * 1e6 <= period_ns as f64 => {
+                (ms * 1e6).round() as i64
+            }
             Some(_) => return err("publish_deadline_ms must be in (0, period_ms]".into()),
         };
 
         if let Some(c) = &self.clock_source {
-            if self.clock.is_some() { return err("clock_source cannot be combined with wall clock probes".into()); }
-            if !s.epoch_ns.is_some_and(|e| e > 0 && e <= i64::MAX - 10_000_000_000) { return err("clock_source requires a positive shared session.epoch_ns".into()); }
-            if period_ns <= 0 || period_ns > 10_000_000_000 || s.run_for_ms.is_some_and(|ms| i64::try_from(ms).ok().and_then(|v| v.checked_mul(1_000_000)).and_then(|v| s.epoch_ns.unwrap().checked_add(v)).is_none()) {
+            if self.clock.is_some() {
+                return err("clock_source cannot be combined with wall clock probes".into());
+            }
+            if !s
+                .epoch_ns
+                .is_some_and(|e| e > 0 && e <= i64::MAX - 10_000_000_000)
+            {
+                return err("clock_source requires a positive shared session.epoch_ns".into());
+            }
+            if period_ns <= 0
+                || period_ns > 10_000_000_000
+                || s.run_for_ms.is_some_and(|ms| {
+                    i64::try_from(ms)
+                        .ok()
+                        .and_then(|v| v.checked_mul(1_000_000))
+                        .and_then(|v| s.epoch_ns.unwrap().checked_add(v))
+                        .is_none()
+                })
+            {
                 return err("simulator schedule exceeds representable limits".into());
             }
-            if c.startup_timeout_wall_ms == 0 || c.startup_timeout_wall_ms > 300_000
-                || c.poll_wall_ms == 0 || c.poll_wall_ms > 50
-                || c.stale_after_wall_ms < c.poll_wall_ms * 2 || c.stale_after_wall_ms > 60_000
-                || c.max_advance_ns <= 0 || c.max_advance_ns > 10_000_000_000
-                || !(1..=65536).contains(&c.queue_capacity) {
+            if c.startup_timeout_wall_ms == 0
+                || c.startup_timeout_wall_ms > 300_000
+                || c.poll_wall_ms == 0
+                || c.poll_wall_ms > 50
+                || c.stale_after_wall_ms < c.poll_wall_ms * 2
+                || c.stale_after_wall_ms > 60_000
+                || c.max_advance_ns <= 0
+                || c.max_advance_ns > 10_000_000_000
+                || !(1..=65536).contains(&c.queue_capacity)
+            {
                 return err("clock_source timing/queue limits are invalid".into());
             }
-            let ros_name = |v: &str| v.starts_with('/') && v.len() <= 255 && v[1..].split('/').all(|p| !p.is_empty() && p.bytes().enumerate().all(|(i,b)| b.is_ascii_alphabetic() || b == b'_' || i > 0 && b.is_ascii_digit()));
-            if !ros_name(&c.topic) || !ros_name(&c.expected_publisher)
-                || c.world_instance_id.is_empty() || c.world_instance_id.len() > 256
-                || c.world_instance_id.trim() != c.world_instance_id || c.world_instance_id.bytes().any(|b| b.is_ascii_control()) {
+            let ros_name = |v: &str| {
+                v.starts_with('/')
+                    && v.len() <= 255
+                    && v[1..].split('/').all(|p| {
+                        !p.is_empty()
+                            && p.bytes().enumerate().all(|(i, b)| {
+                                b.is_ascii_alphabetic() || b == b'_' || i > 0 && b.is_ascii_digit()
+                            })
+                    })
+            };
+            if !ros_name(&c.topic)
+                || !ros_name(&c.expected_publisher)
+                || c.world_instance_id.is_empty()
+                || c.world_instance_id.len() > 256
+                || c.world_instance_id.trim() != c.world_instance_id
+                || c.world_instance_id.bytes().any(|b| b.is_ascii_control())
+            {
                 return err("clock_source authority identity is invalid".into());
             }
-            let Some(p) = self.plugins.iter().find(|p| p.name == c.plugin) else { return err("clock_source plugin is absent".into()); };
-            if !p.sha256.as_ref().is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
-                || !p.config.get("node_name").and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty() && !v.contains('\0')) {
-                return err("clock_source requires a SHA256-pinned plugin and its frozen node_name".into());
+            let Some(p) = self.plugins.iter().find(|p| p.name == c.plugin) else {
+                return err("clock_source plugin is absent".into());
+            };
+            if !p
+                .sha256
+                .as_ref()
+                .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                || !p
+                    .config
+                    .get("node_name")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.is_empty() && !v.contains('\0'))
+            {
+                return err(
+                    "clock_source requires a SHA256-pinned plugin and its frozen node_name".into(),
+                );
             }
         }
 
         let mut channels = Vec::new();
         let mut channel_ids = BTreeMap::new();
         for (i, c) in self.channels.iter().enumerate() {
-            if !valid_channel(&c.name) || channel_ids.insert(c.name.clone(), i as ChannelId).is_some() {
+            if !valid_channel(&c.name)
+                || channel_ids.insert(c.name.clone(), i as ChannelId).is_some()
+            {
                 return err(format!("channel {:?} is invalid or repeated", c.name));
             }
-            channels.push(ChannelSpec { id: i as ChannelId, name: c.name.clone(), qos: c.qos });
+            channels.push(ChannelSpec {
+                id: i as ChannelId,
+                name: c.name.clone(),
+                qos: c.qos,
+            });
         }
 
         let clock = match &self.clock {
@@ -389,31 +467,61 @@ impl Manifest {
                 if (c.role == ClockRole::Server) != (server == node_id) {
                     return err("clock role must be server exactly on the server node".into());
                 }
-                if c.interval_ms == 0 || c.interval_ms > 60_000
-                    || c.gate_timeout_ms == 0 || c.gate_timeout_ms > 300_000
-                    || c.stale_after_ms <= c.interval_ms || c.stale_after_ms > 300_000
+                if c.interval_ms == 0
+                    || c.interval_ms > 60_000
+                    || c.gate_timeout_ms == 0
+                    || c.gate_timeout_ms > 300_000
+                    || c.stale_after_ms <= c.interval_ms
+                    || c.stale_after_ms > 300_000
                     || !(1..=1024).contains(&c.window)
-                    || [c.gate_ms, c.chrony_max_offset_ms, c.chrony_max_uncertainty_ms].iter()
-                        .any(|v| !v.is_finite() || *v <= 0.0 || *v > 4_000.0) {
+                    || [
+                        c.gate_ms,
+                        c.chrony_max_offset_ms,
+                        c.chrony_max_uncertainty_ms,
+                    ]
+                    .iter()
+                    .any(|v| !v.is_finite() || *v <= 0.0 || *v > 4_000.0)
+                {
                     return err("clock requires positive finite gates, bounded interval/timeout/window, and stale_after_ms > interval_ms".into());
                 }
-                if c.required && c.stale_after_ms <= 2 * c.interval_ms.min(CLOCK_STARTUP_PROBE_MAX_INTERVAL_MS) {
+                if c.required
+                    && c.stale_after_ms
+                        <= 2 * c.interval_ms.min(CLOCK_STARTUP_PROBE_MAX_INTERVAL_MS)
+                {
                     return err("clock.stale_after_ms must strictly contain three startup probe samples: increase it above 2 * min(interval_ms, 100)".into());
                 }
-                if c.chrony_source.as_ref().is_some_and(|v| v.is_empty() || v.len() > 255 || v.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())) {
-                    return err("clock.chrony_source must be a nonempty exact external source name".into());
+                if c.chrony_source.as_ref().is_some_and(|v| {
+                    v.is_empty()
+                        || v.len() > 255
+                        || v.bytes()
+                            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                }) {
+                    return err(
+                        "clock.chrony_source must be a nonempty exact external source name".into(),
+                    );
                 }
-                if c.required && (c.chrony_source.is_none() || c.window < 3
-                    || !s.epoch_ns.is_some_and(|e| e > 0 && e <= i64::MAX - 10_000_000_000)) {
+                if c.required
+                    && (c.chrony_source.is_none()
+                        || c.window < 3
+                        || !s
+                            .epoch_ns
+                            .is_some_and(|e| e > 0 && e <= i64::MAX - 10_000_000_000))
+                {
                     return err("required clock needs chrony_source, window >= 3 and positive shared session.epoch_ns; synchronize externally and freeze a future Session epoch".into());
                 }
                 let mut add = |name: &str| -> Result<ChannelId, ManifestError> {
                     if channel_ids.contains_key(name) {
-                        return Err(ManifestError(format!("channel {name} is reserved for the clock probe")));
+                        return Err(ManifestError(format!(
+                            "channel {name} is reserved for the clock probe"
+                        )));
                     }
                     let id = channels.len() as ChannelId;
                     channel_ids.insert(name.to_string(), id);
-                    channels.push(ChannelSpec { id, name: name.to_string(), qos: Qos::Control });
+                    channels.push(ChannelSpec {
+                        id,
+                        name: name.to_string(),
+                        qos: Qos::Control,
+                    });
                     Ok(id)
                 };
                 let req = add(CLOCK_REQ_CHANNEL)?;
@@ -439,14 +547,26 @@ impl Manifest {
         let mut plugin_names = BTreeSet::new();
         let mut bindings = Vec::new();
         for p in &self.plugins {
-            if [&p.expected_name, &p.expected_version].iter().any(|v| v.as_ref().is_some_and(|v| v.is_empty() || v.len() > 256 || v.bytes().any(|b| b.is_ascii_control()))) {
-                return err(format!("plugin {}: expected_name/expected_version must be nonempty descriptor strings", p.name));
+            if [&p.expected_name, &p.expected_version].iter().any(|v| {
+                v.as_ref().is_some_and(|v| {
+                    v.is_empty() || v.len() > 256 || v.bytes().any(|b| b.is_ascii_control())
+                })
+            }) {
+                return err(format!(
+                    "plugin {}: expected_name/expected_version must be nonempty descriptor strings",
+                    p.name
+                ));
             }
             if !valid_name(&p.name) || !plugin_names.insert(&p.name) {
                 return err(format!("plugin {:?} is invalid or repeated", p.name));
             }
-            if p.step_budget_ms.is_some_and(|ms| !(ms.is_finite() && ms > 0.0)) {
-                return err(format!("plugin {}: step_budget_ms must be positive", p.name));
+            if p.step_budget_ms
+                .is_some_and(|ms| !(ms.is_finite() && ms > 0.0))
+            {
+                return err(format!(
+                    "plugin {}: step_budget_ms must be positive",
+                    p.name
+                ));
             }
             if p.wake_ms.is_some_and(|ms| !(ms.is_finite() && ms > 0.0)) {
                 return err(format!("plugin {}: wake_ms must be positive", p.name));
@@ -454,16 +574,29 @@ impl Manifest {
             let mut ports = BTreeMap::new();
             for (port, b) in &p.bind {
                 let Some(&channel) = channel_ids.get(&b.channel) else {
-                    return err(format!("plugin {} port {port}: unknown channel {:?}", p.name, b.channel));
+                    return err(format!(
+                        "plugin {} port {port}: unknown channel {:?}",
+                        p.name, b.channel
+                    ));
                 };
                 let origins = match &b.from {
-                    None => (0..s.roster.len()).filter(|&i| i != node_id).map(|i| i as OriginId).collect(),
+                    None => (0..s.roster.len())
+                        .filter(|&i| i != node_id)
+                        .map(|i| i as OriginId)
+                        .collect(),
                     Some(from) => {
                         let mut ids = Vec::new();
                         for name in from {
                             match s.roster.iter().position(|n| n == name) {
-                                Some(i) if !ids.contains(&(i as OriginId)) => ids.push(i as OriginId),
-                                _ => return err(format!("plugin {} port {port}: bad origin {name:?}", p.name)),
+                                Some(i) if !ids.contains(&(i as OriginId)) => {
+                                    ids.push(i as OriginId)
+                                }
+                                _ => {
+                                    return err(format!(
+                                        "plugin {} port {port}: bad origin {name:?}",
+                                        p.name
+                                    ))
+                                }
                             }
                         }
                         ids
@@ -473,12 +606,22 @@ impl Manifest {
             }
             bindings.push(ports);
         }
-        Ok(Resolved { node_id: node_id as OriginId, channels, period_ns, publish_deadline_ns, bindings, clock })
+        Ok(Resolved {
+            node_id: node_id as OriginId,
+            channels,
+            period_ns,
+            publish_deadline_ns,
+            bindings,
+            clock,
+        })
     }
 }
 
 fn valid_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Channel names may use `/` between segments, and each segment is a valid
@@ -532,23 +675,53 @@ only_uav3 = { channel = "dmpc/plan", from = ["uav3"] }
     #[test]
     fn step_log_sampling_defaults_to_every_step_and_rejects_zero() {
         assert_eq!(Manifest::from_toml_str(BASE).unwrap().audit.steps_every, 1);
-        let sampled = Manifest::from_toml_str(&BASE.replace("dir = \"out\"", "dir = \"out\"\nsteps_every = 100")).unwrap();
+        let sampled = Manifest::from_toml_str(
+            &BASE.replace("dir = \"out\"", "dir = \"out\"\nsteps_every = 100"),
+        )
+        .unwrap();
         assert_eq!(sampled.audit.steps_every, 100);
         assert!(sampled.resolve().is_ok());
-        let zero = Manifest::from_toml_str(&BASE.replace("dir = \"out\"", "dir = \"out\"\nsteps_every = 0")).unwrap();
+        let zero = Manifest::from_toml_str(
+            &BASE.replace("dir = \"out\"", "dir = \"out\"\nsteps_every = 0"),
+        )
+        .unwrap();
         assert!(zero.resolve().is_err());
     }
 
     #[test]
+    fn audit_disk_quota_defaults_and_rejects_less_than_metadata_reservation() {
+        assert_eq!(
+            Manifest::from_toml_str(BASE).unwrap().audit.max_bytes,
+            DEFAULT_AUDIT_MAX_BYTES
+        );
+        let small = Manifest::from_toml_str(
+            &BASE.replace("dir = \"out\"", "dir = \"out\"\nmax_bytes = 1024"),
+        )
+        .unwrap();
+        assert!(small.resolve().unwrap_err().0.contains("audit.max_bytes"));
+        let bounded = Manifest::from_toml_str(
+            &BASE.replace("dir = \"out\"", "dir = \"out\"\nmax_bytes = 131072"),
+        )
+        .unwrap();
+        assert!(bounded.resolve().is_ok());
+    }
+
+    #[test]
     fn rejects_unknown_fields_bad_names_and_references() {
-        assert!(Manifest::from_toml_str(&BASE.replace("period_ms = 50", "period_ms = 50\nbogus = 1")).is_err());
+        assert!(Manifest::from_toml_str(
+            &BASE.replace("period_ms = 50", "period_ms = 50\nbogus = 1")
+        )
+        .is_err());
         for bad in [
             BASE.replace("node = \"uav1\"", "node = \"uav9\""),
             BASE.replace("name = \"dmpc/plan\"", "name = \"dmpc/*\""),
             BASE.replace("from = [\"uav3\"]", "from = [\"uav7\"]"),
             BASE.replace("period_ms = 50", "period_ms = 50\npublish_deadline_ms = 60"),
         ] {
-            assert!(Manifest::from_toml_str(&bad).unwrap().resolve().is_err(), "accepted:\n{bad}");
+            assert!(
+                Manifest::from_toml_str(&bad).unwrap().resolve().is_err(),
+                "accepted:\n{bad}"
+            );
         }
     }
 }
@@ -558,7 +731,8 @@ mod required_clock_tests {
     use super::*;
 
     fn manifest() -> Manifest {
-        Manifest::from_toml_str(r#"
+        Manifest::from_toml_str(
+            r#"
 [session]
 id="test"
 node="client"
@@ -576,7 +750,9 @@ required=true
 chrony_source="station"
 interval_ms=100
 stale_after_ms=500
-"#).unwrap()
+"#,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -586,7 +762,11 @@ stale_after_ms=500
             let clock = value.clock.as_mut().unwrap();
             clock.interval_ms = interval_ms;
             clock.stale_after_ms = 2 * interval_ms;
-            assert!(value.resolve().unwrap_err().0.contains("three startup probe samples"));
+            assert!(value
+                .resolve()
+                .unwrap_err()
+                .0
+                .contains("three startup probe samples"));
             value.clock.as_mut().unwrap().stale_after_ms += 1;
             assert!(value.resolve().is_ok());
         }
@@ -598,18 +778,29 @@ stale_after_ms=500
 
     #[test]
     fn required_clock_cannot_default_to_unknown_external_source_or_local_epoch() {
-        let good = manifest(); assert!(good.resolve().is_ok());
-        let mut bad = good.clone(); bad.clock.as_mut().unwrap().chrony_source = None;
+        let good = manifest();
+        assert!(good.resolve().is_ok());
+        let mut bad = good.clone();
+        bad.clock.as_mut().unwrap().chrony_source = None;
         assert!(bad.resolve().unwrap_err().0.contains("chrony_source"));
-        let mut bad = good.clone(); bad.session.epoch_ns = None;
-        assert!(bad.resolve().unwrap_err().0.contains("shared session.epoch_ns"));
-        let mut bad = good.clone(); bad.clock.as_mut().unwrap().window = 2;
+        let mut bad = good.clone();
+        bad.session.epoch_ns = None;
+        assert!(bad
+            .resolve()
+            .unwrap_err()
+            .0
+            .contains("shared session.epoch_ns"));
+        let mut bad = good.clone();
+        bad.clock.as_mut().unwrap().window = 2;
         assert!(bad.resolve().is_err());
-        let mut bad = good.clone(); bad.clock.as_mut().unwrap().stale_after_ms = 100;
+        let mut bad = good.clone();
+        bad.clock.as_mut().unwrap().stale_after_ms = 100;
         assert!(bad.resolve().is_err());
-        let mut bad = good.clone(); bad.clock.as_mut().unwrap().gate_timeout_ms = u64::MAX;
+        let mut bad = good.clone();
+        bad.clock.as_mut().unwrap().gate_timeout_ms = u64::MAX;
         assert!(bad.resolve().is_err());
-        let mut bad = good; bad.clock.as_mut().unwrap().chrony_source = Some("".into());
+        let mut bad = good;
+        bad.clock.as_mut().unwrap().chrony_source = Some("".into());
         assert!(bad.resolve().is_err());
     }
 }

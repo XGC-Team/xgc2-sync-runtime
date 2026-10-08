@@ -9,21 +9,31 @@ use std::time::{Duration, Instant};
 
 use xgc_rt_core::clock::WallClock;
 use xgc_rt_core::manifest::Manifest;
-use xgc_rt_host::{Host, HostOptions};
+use xgc_rt_host::{Host, HostOptions, RpcBinding};
 use xgc_rt_transport_loopback::{LoopbackBus, LoopbackTransport};
 use zenoh::Wait;
 
 fn elf(variable: &str, name: &str) -> PathBuf {
-    if let Some(path) = std::env::var_os(variable) { return PathBuf::from(path); }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug").join(name)
+    if let Some(path) = std::env::var_os(variable) {
+        return PathBuf::from(path);
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug")
+        .join(name)
 }
 
 fn peer(endpoint: &str) -> zenoh::Session {
     let mut config = zenoh::Config::default();
     config.insert_json5("mode", "\"peer\"").unwrap();
-    config.insert_json5("listen/endpoints", &format!("[\"{endpoint}\"]")).unwrap();
-    config.insert_json5("scouting/multicast/enabled", "false").unwrap();
-    config.insert_json5("scouting/gossip/enabled", "false").unwrap();
+    config
+        .insert_json5("listen/endpoints", &format!("[\"{endpoint}\"]"))
+        .unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
+    config
+        .insert_json5("scouting/gossip/enabled", "false")
+        .unwrap();
     zenoh::open(config).wait().unwrap()
 }
 
@@ -37,18 +47,32 @@ fn plugin_line(name: &str, path: &Path, config: &str, bind: &str) -> String {
 
 fn run(manifest: String, dir: &Path, stop: &AtomicBool) -> xgc_rt_host::RunSummary {
     std::fs::create_dir_all(dir).unwrap();
+    let mut runtime = xgc2_xrpc::Runtime::new(xgc2_xrpc::RuntimeOptions::default()).unwrap();
+    let rpc = RpcBinding::new(runtime.handle(), xgc2_xrpc::Limits::default()).unwrap();
     let host = Host::new(
         Manifest::from_toml_str(&manifest).unwrap(),
         dir,
         Box::new(LoopbackTransport::new(LoopbackBus::new())),
         Arc::new(WallClock::new(0)),
-        HostOptions::default(),
+        HostOptions {
+            rpc: Some(rpc),
+            ..HostOptions::default()
+        },
     )
     .unwrap_or_else(|e| panic!("{e}\n{manifest}"));
-    host.run(stop).unwrap()
+    let summary = host.run(stop).unwrap();
+    runtime.close(Duration::from_secs(2)).unwrap();
+    summary
 }
 
-fn station_manifest(robot: &str, endpoint: &str, socket: &str, station: &Path, plant: &Path, command: bool) -> String {
+fn station_manifest(
+    robot: &str,
+    endpoint: &str,
+    socket: &str,
+    station: &Path,
+    plant: &Path,
+    command: bool,
+) -> String {
     let mut text = r#"[session]
 id="station-10ms"
 node="n1"
@@ -83,7 +107,12 @@ qos="control"
         &config,
         r#"{paired_state={channel="paired",from=["n1"]},controller_status={channel="status",from=["n1"]},command={channel="command"}}"#,
     );
-    text += &plugin_line("paired-source", plant, "{}", r#"{paired_state={channel="paired"}}"#);
+    text += &plugin_line(
+        "paired-source",
+        plant,
+        "{}",
+        r#"{paired_state={channel="paired"}}"#,
+    );
     text
 }
 
@@ -92,8 +121,15 @@ fn paired_source(dir: &Path) -> PathBuf {
     let output = dir.join("paired-source.so");
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../abi/include");
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/paired_source.c");
-    assert!(Command::new("cc").args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC", "-I"])
-        .arg(include).arg(source).arg("-o").arg(&output).status().unwrap().success());
+    assert!(Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC", "-I"])
+        .arg(include)
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .unwrap()
+        .success());
     output
 }
 
@@ -102,13 +138,27 @@ fn one_host_at_one_millisecond_answers_command_without_abandon() {
     let station = elf("STATION_IO_ELF", "libstation_io.so");
     let bin = elf("STATION_IO_CMD", "station-io-cmd");
     assert!(station.is_file() && bin.is_file());
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
     let _peer = peer(&endpoint);
-    let socket = format!("/tmp/xgc-sio-1ms-{}.sock", std::process::id());
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("station-1ms");
+    let private = tempfile::tempdir().unwrap();
+    let dir = private.path().to_owned();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.join("station.sock").to_str().unwrap().to_owned();
     let source = paired_source(&dir);
-    let manifest = station_manifest("xgc2e-0123456789abcdef0001", &endpoint, &socket, &station, &source, true);
+    let manifest = station_manifest(
+        "xgc2e-0123456789abcdef0001",
+        &endpoint,
+        &socket,
+        &station,
+        &source,
+        true,
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let stop_host = Arc::clone(&stop);
     let host_dir = dir.clone();
@@ -120,7 +170,19 @@ fn one_host_at_one_millisecond_answers_command_without_abandon() {
         thread::sleep(Duration::from_millis(5));
     }
     // Queue acceptance is the IPC assertion; this fixture has no controller.
-    let output = Command::new(&bin).args([&socket, "command", "takeoff"]).output().unwrap();
+    if !socket_path.exists() {
+        stop.store(true, Ordering::Relaxed);
+        let summary = runner.join().unwrap();
+        panic!(
+            "station endpoint not active: {}\n{}",
+            serde_json::to_string_pretty(&summary).unwrap(),
+            std::fs::read_to_string(dir.join("audit/n1/health.jsonl")).unwrap_or_default()
+        );
+    }
+    let output = Command::new(&bin)
+        .args([&socket, "command", "takeoff"])
+        .output()
+        .unwrap();
     thread::sleep(Duration::from_millis(400));
     stop.store(true, Ordering::Relaxed);
     let summary = runner.join().unwrap();
@@ -128,16 +190,29 @@ fn one_host_at_one_millisecond_answers_command_without_abandon() {
     assert!(!stderr.contains("os error 11"), "{stderr}");
     assert!(output.status.success(), "{stderr}");
     assert_eq!(output.stdout, b"queued\n");
-    let station_summary = summary.plugins.iter().find(|p| p.name == "station-io").unwrap();
+    let station_summary = summary
+        .plugins
+        .iter()
+        .find(|p| p.name == "station-io")
+        .unwrap();
     assert_eq!(station_summary.abandons, 0, "{station_summary:?}");
-    assert!(station_summary.steps > 200, "steps {}", station_summary.steps);
+    assert!(
+        station_summary.steps > 200,
+        "steps {}",
+        station_summary.steps
+    );
     assert!(summary.aborted.is_none(), "{:?}", summary.aborted);
-    assert!(!socket_path.exists(), "station did not release the fixture socket");
+    assert!(
+        !socket_path.exists(),
+        "station did not release the fixture socket"
+    );
 }
 
 #[test]
 fn eight_host_child() {
-    let Ok(index) = std::env::var("STATION_EIGHT_CHILD") else { return };
+    let Ok(index) = std::env::var("STATION_EIGHT_CHILD") else {
+        return;
+    };
     let index: usize = index.parse().unwrap();
     let endpoint = std::env::var("STATION_EIGHT_ENDPOINT").unwrap();
     let socket = std::env::var("STATION_EIGHT_SOCKET").unwrap();
@@ -156,10 +231,17 @@ fn eight_host_child() {
         stop_host.store(true, Ordering::Relaxed);
     });
     let summary = run(manifest, &dir, &stop);
-    let station_summary = summary.plugins.iter().find(|p| p.name == "station-io").unwrap();
+    let station_summary = summary
+        .plugins
+        .iter()
+        .find(|p| p.name == "station-io")
+        .unwrap();
     let text = format!(
         "steps={} abandons={} aborted={:?} err={:?}",
-        station_summary.steps, station_summary.abandons, summary.aborted, station_summary.last_error
+        station_summary.steps,
+        station_summary.abandons,
+        summary.aborted,
+        station_summary.last_error
     );
     std::fs::write(dir.join("result.txt"), &text).unwrap();
     assert_eq!(station_summary.abandons, 0, "{text}");
@@ -171,18 +253,31 @@ fn eight_host_child() {
 fn eight_hosts_keep_stepping_inside_ten_milliseconds() {
     let station = elf("STATION_IO_ELF", "libstation_io.so");
     let bin = elf("STATION_IO_CMD", "station-io-cmd");
-    let plant = paired_source(&Path::new(env!("CARGO_TARGET_TMPDIR")).join("station-eight-fixture"));
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let plant =
+        paired_source(&Path::new(env!("CARGO_TARGET_TMPDIR")).join("station-eight-fixture"));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let endpoint = format!("tcp/127.0.0.1:{port}");
     let _peer = peer(&endpoint);
     let mut children = Vec::new();
+    let private = tempfile::tempdir().unwrap();
     for index in 0..8 {
-        let socket = format!("/tmp/xgc-sio-8p-{index}-{}.sock", std::process::id());
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("station-8p-{index}"));
+        let dir = private.path().join(format!("station-8p-{index}"));
         std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("station.sock").to_str().unwrap().to_owned();
         let _ = std::fs::remove_file(dir.join("stop"));
         let child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "eight_host_child", "--test-threads=1", "--nocapture"])
+            .args([
+                "--exact",
+                "eight_host_child",
+                "--test-threads=1",
+                "--nocapture",
+            ])
             .env("STATION_EIGHT_CHILD", index.to_string())
             .env("STATION_EIGHT_ENDPOINT", &endpoint)
             .env("STATION_EIGHT_SOCKET", &socket)
@@ -197,7 +292,9 @@ fn eight_hosts_keep_stepping_inside_ten_milliseconds() {
     }
     let mut failures = Vec::new();
     for (index, socket, _, child) in &mut children {
-        let Some(child) = child.as_mut() else { continue };
+        let Some(child) = child.as_mut() else {
+            continue;
+        };
         let deadline = Instant::now() + Duration::from_secs(8);
         while !Path::new(&*socket).exists() && Instant::now() < deadline {
             if let Some(status) = child.try_wait().unwrap() {
@@ -213,8 +310,15 @@ fn eight_hosts_keep_stepping_inside_ten_milliseconds() {
     let mut replies = Vec::new();
     if failures.is_empty() {
         for (_, socket, _, _) in &children {
-            let output = Command::new(&bin).args([socket, "command", "takeoff"]).output().unwrap();
-            replies.push((socket.clone(), output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned()));
+            let output = Command::new(&bin)
+                .args([socket, "command", "takeoff"])
+                .output()
+                .unwrap();
+            replies.push((
+                socket.clone(),
+                output.status.success(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
         }
         thread::sleep(Duration::from_millis(300));
     }
@@ -227,12 +331,18 @@ fn eight_hosts_keep_stepping_inside_ten_milliseconds() {
         let result = std::fs::read_to_string(dir.join("result.txt")).unwrap_or_default();
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            failures.push(format!("host {index} status={} result={result} stderr={stderr}", output.status));
+            failures.push(format!(
+                "host {index} status={} result={result} stderr={stderr}",
+                output.status
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     for (socket, ok, stderr) in replies {
         assert!(!stderr.contains("os error 11"), "{socket} {stderr}");
-        assert!(!ok && stderr.contains("command capability is not configured"), "{socket} {stderr}");
+        assert!(
+            !ok && stderr.contains("command capability is not configured"),
+            "{socket} {stderr}"
+        );
     }
 }

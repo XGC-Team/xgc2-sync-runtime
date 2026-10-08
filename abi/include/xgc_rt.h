@@ -103,11 +103,12 @@ typedef struct xgc_step_ctx {
 
 /* Minor revisions only append functions to xgc_host_api. A plugin checks
  * `abi_minor` before calling a function added in that minor. */
-#define XGC_RT_ABI_MINOR 2u
+#define XGC_RT_ABI_MINOR 3u
 
 typedef struct xgc_host_api {
   uint32_t abi_version;
-  uint32_t abi_minor;     /* 0: through request_recover; 1: + port_origins, node_id */
+  uint32_t abi_minor;     /* 0: through request_recover; 1: + port_origins, node_id;
+                             2: unchanged table; 3: + rpc_runtime */
   void* host;
   /* Publish on an out-port for `round`. The host stamps, audits and sends. */
   xgc_status (*publish)(void* host, uint32_t port, uint64_t round,
@@ -125,6 +126,16 @@ typedef struct xgc_host_api {
   uint32_t (*port_origins)(void* host, uint32_t port, uint16_t* out, uint32_t cap);
   /* This node's roster id. */
   uint16_t (*node_id)(void* host);
+  /* abi_minor >= 3; nullable. Only call on this module's vtable thread from
+   * create or activate. Returns a borrowed official xgc2_xrpc_runtime_api_v1
+   * table (see xgc2/xrpc.h), valid only during that vtable call. Copy and retain
+   * it there before keeping it; Rust modules use ForeignRuntime::from_api.
+   * The retained context pins this module's actual dynamic library and uses
+   * the process owner's existing runtime. Never cast it to a Rust Runtime or
+   * invoke thread-affine host callbacks from an RPC handler. Close/release
+   * all module endpoints before destroy; retaining does not authorize unload
+   * while callbacks or their release are still executing. */
+  const void* (*rpc_runtime)(void* host);
 } xgc_host_api;
 
 typedef struct xgc_plugin_vtbl {

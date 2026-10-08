@@ -16,7 +16,7 @@ C_SMOKE = r'''
 #include <stddef.h>
 #include <xgc_rt.h>
 #include <xgc_clock_source.h>
-_Static_assert(XGC_RT_ABI_VERSION == 1 && XGC_RT_ABI_MINOR == 2, "plugin ABI");
+_Static_assert(XGC_RT_ABI_VERSION == 1 && XGC_RT_ABI_MINOR == 3, "plugin ABI");
 _Static_assert(XGC_RT_MAX_PORTS == 64, "port capacity");
 _Static_assert(sizeof(xgc_step_ctx) == 48, "step layout");
 _Static_assert(offsetof(xgc_step_ctx, dirty_ports) == 32, "step mask offset");

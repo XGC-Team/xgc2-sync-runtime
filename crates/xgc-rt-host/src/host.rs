@@ -57,8 +57,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -68,17 +68,21 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use xgc_rt_abi::*;
+use xgc_rt_audit::recorder::{
+    AuditBudget, StorageSnapshot, WriterSnapshot, WriterState, QUEUE_RECORDS,
+};
 use xgc_rt_audit::{FileAudit, NodeMeta};
 use xgc_rt_core::audit::{AuditSink, OverflowSite};
 use xgc_rt_core::clock::{Clock, ClockDomain, RoundSchedule};
 use xgc_rt_core::envelope::Header;
 use xgc_rt_core::lifecycle::{Event, Lifecycle, State};
-use xgc_rt_core::manifest::{Manifest, RestartKind, RestartPolicy, Resolved, Trigger};
+use xgc_rt_core::manifest::{Manifest, Resolved, RestartKind, RestartPolicy, Trigger};
 use xgc_rt_core::transport::{Transport, TransportContext};
 use xgc_rt_core::{ChannelId, OriginId};
 
 use crate::endpoint::{Endpoint, RxFrame, DEFAULT_RX_QUEUE};
 use crate::plugin::{self, LoadedPlugin};
+use crate::rpc::RpcBinding;
 
 pub const INBOX_CAPACITY: usize = 1024;
 /// A step this many budgets long is a hang.
@@ -111,61 +115,239 @@ pub struct HealthLog {
     output: LineLog,
     clock: Arc<dyn Clock>,
     started: Instant,
+    latest: Mutex<Option<serde_json::Value>>,
+    configuration: Mutex<Option<serde_json::Value>>,
+    notifications: Mutex<Option<tokio::sync::watch::Sender<u64>>>,
 }
 
 impl HealthLog {
-    fn open(path: &Path, clock: Arc<dyn Clock>, echo: bool) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { output: LineLog::spawn(file, echo, "xgc-health")?, clock, started: Instant::now() })
+    fn open(
+        path: &Path,
+        clock: Arc<dyn Clock>,
+        echo: bool,
+        budget: Arc<AuditBudget>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            output: LineLog::open(path, echo, "health", budget)?,
+            clock,
+            started: Instant::now(),
+            latest: Mutex::new(None),
+            configuration: Mutex::new(None),
+            notifications: Mutex::new(None),
+        })
+    }
+
+    pub fn snapshot(&self) -> Option<serde_json::Value> {
+        self.latest.lock().unwrap().clone().map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("audit".into(), self.audit_snapshot());
+            }
+            value
+        })
+    }
+    pub fn configuration_snapshot(&self) -> Option<serde_json::Value> {
+        self.configuration.lock().unwrap().clone()
+    }
+    /// Available even when there is no current live/configuration observation.
+    pub fn audit_snapshot(&self) -> serde_json::Value {
+        serde_json::to_value(self.output.budget.snapshot()).unwrap()
+    }
+
+    /// Configure one in-process observation channel before module execution.
+    /// Receivers clone the revision and release their watch borrow before await.
+    pub fn set_event_notifications(&self, sender: tokio::sync::watch::Sender<u64>) {
+        *self.notifications.lock().unwrap() = Some(sender);
     }
 
     pub fn event(&self, value: serde_json::Value) {
+        let notify = matches!(
+            value["event"].as_str(),
+            Some(
+                "host_liveness"
+                    | "configuration_applied"
+                    | "transition"
+                    | "abandoned"
+                    | "aborted"
+                    | "stopped"
+                    | "clock_gate_timeout"
+                    | "clock_source_startup_failed"
+            )
+        );
+        if value["event"] == "host_liveness" {
+            *self.latest.lock().unwrap() = Some(value.clone());
+        }
+        if value["event"] == "configuration_applied" {
+            *self.configuration.lock().unwrap() = Some(value.clone());
+        }
+        if matches!(
+            value["event"].as_str(),
+            Some("transition" | "abandoned" | "aborted" | "stopped" | "clock_gate_timeout")
+        ) {
+            *self.latest.lock().unwrap() = None;
+        }
         let mut line = serde_json::json!({ "t": self.clock.now(), "steady_elapsed_ns": self.started.elapsed().as_nanos() as u64 });
         if let (Some(obj), serde_json::Value::Object(extra)) = (line.as_object_mut(), value) {
             obj.extend(extra);
         }
-        let _ = self.output.tx.send(Some(line.to_string()));
+        self.output.push_json(&line);
+        if notify {
+            let notifications = self.notifications.lock().unwrap().clone();
+            if let Some(sender) = notifications {
+                sender.send_modify(|revision| *revision = revision.saturating_add(1));
+            }
+        }
     }
 }
 
-/// Shared writer for health and step logs. Neither disk nor stderr backpressure
-/// belongs on a module thread.
-struct LineLog {
-    tx: mpsc::Sender<Option<String>>,
+pub(crate) const LOG_QUEUE_LINES: usize = 1024;
+pub(crate) const LOG_MAX_ENTRY_BYTES: usize = 64 * 1024;
+
+/// Clones retain only this shared admission gate, never a raw channel sender.
+/// Closing the gate disconnects the channel even if an abandoned module lives.
+#[derive(Clone)]
+struct LineSender {
+    tx: Arc<RwLock<Option<mpsc::SyncSender<Box<str>>>>>,
+    state: Arc<WriterState>,
+}
+
+impl LineSender {
+    fn push_json(&self, value: &serde_json::Value) {
+        struct LimitedText(Vec<u8>);
+        impl Write for LimitedText {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > (LOG_MAX_ENTRY_BYTES - 1) - self.0.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "log entry exceeds 64 KiB",
+                    ));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut text = LimitedText(Vec::with_capacity(1024));
+        if serde_json::to_writer(&mut text, value).is_err() {
+            self.state.oversize_drop();
+            return;
+        }
+        self.push(String::from_utf8(text.0).expect("serde_json emits UTF-8"));
+    }
+
+    fn push(&self, mut line: String) {
+        if line.len() >= LOG_MAX_ENTRY_BYTES {
+            self.state.oversize_drop();
+            return;
+        }
+        line.push('\n');
+        let Ok(guard) = self.tx.try_read() else {
+            self.state.contention_drop();
+            return;
+        };
+        let Some(tx) = guard.as_ref() else {
+            self.state.closed_drop();
+            return;
+        };
+        match tx.try_send(line.into_boxed_str()) {
+            Ok(()) => self.state.accepted(),
+            Err(mpsc::TrySendError::Full(_)) => self.state.queue_drop(),
+            Err(mpsc::TrySendError::Disconnected(_)) => self.state.closed_drop(),
+        }
+    }
+}
+
+/// Fixed 1,024-line queue, 64 KiB including newline per entry. Disk writes and
+/// optional stderr echo belong to the writer, never the module/scheduler path.
+/// There are at most three such logs (health, steps, clock) in a host.
+pub(crate) struct LineLog {
+    sender: LineSender,
+    budget: Arc<AuditBudget>,
     writer: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl LineLog {
-    fn spawn<W: Write + Send + 'static>(mut out: W, echo: bool, name: &str) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::channel::<Option<String>>();
-        let writer = std::thread::Builder::new().name(name.into()).spawn(move || {
-            while let Ok(Some(line)) = rx.recv() {
-                let _ = writeln!(out, "{line}");
-                if echo {
-                    eprintln!("{line}");
-                }
-            }
-            let _ = out.flush();
-        })?;
-        Ok(Self { tx, writer: Mutex::new(Some(writer)) })
+    #[cfg(test)]
+    pub(crate) fn push(&self, line: String) {
+        self.sender.push(line);
     }
 
-    fn sender(&self) -> mpsc::Sender<Option<String>> {
-        self.tx.clone()
+    pub(crate) fn push_json(&self, value: &serde_json::Value) {
+        self.sender.push_json(value);
     }
 
-    /// Flush and stop, even if abandoned threads still hold senders.
-    fn finish(&self) {
-        let _ = self.tx.send(None);
-        if let Some(w) = self.writer.lock().unwrap().take() {
-            let _ = w.join();
+    pub(crate) fn open(
+        path: &Path,
+        echo: bool,
+        name: &str,
+        budget: Arc<AuditBudget>,
+    ) -> std::io::Result<Self> {
+        let out = OpenOptions::new().write(true).create_new(true).open(path)?;
+        Self::spawn(out, echo, name, budget, LOG_QUEUE_LINES)
+    }
+
+    pub(crate) fn spawn<W: Write + Send + 'static>(
+        mut out: W,
+        echo: bool,
+        name: &str,
+        budget: Arc<AuditBudget>,
+        capacity: usize,
+    ) -> std::io::Result<Self> {
+        if capacity == 0 || capacity > LOG_QUEUE_LINES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "log capacity must have 1..=1024 entries",
+            ));
         }
+        let state = budget.register_writer(name, capacity, LOG_MAX_ENTRY_BYTES)?;
+        let (tx, rx) = mpsc::sync_channel::<Box<str>>(capacity);
+        let writer_state = state.clone();
+        let writer_budget = budget.clone();
+        let writer = std::thread::Builder::new()
+            .name(format!("xgc-{name}"))
+            .spawn(move || {
+                for line in rx {
+                    if writer_state.write_entry(&mut out, line.as_bytes(), &writer_budget) && echo {
+                        eprint!("{line}");
+                    }
+                }
+                writer_state.flush(&mut out);
+            })?;
+        Ok(Self {
+            sender: LineSender {
+                tx: Arc::new(RwLock::new(Some(tx))),
+                state,
+            },
+            budget,
+            writer: Mutex::new(Some(writer)),
+        })
+    }
+
+    fn sender(&self) -> LineSender {
+        self.sender.clone()
+    }
+
+    /// Close admission, drain all admitted entries, join, then report a real
+    /// write/flush failure. Safe to call again, including after an error.
+    pub(crate) fn finish(&self) -> std::io::Result<WriterSnapshot> {
+        let mut writer = self.writer.lock().unwrap();
+        drop(self.sender.tx.write().unwrap().take());
+        if let Some(w) = writer.take() {
+            if w.join().is_err() {
+                self.sender
+                    .state
+                    .record_error(&std::io::Error::other("log writer panicked"));
+                self.sender.state.mark_finished();
+            }
+        }
+        self.sender.state.result()
     }
 }
 
 impl Drop for LineLog {
     fn drop(&mut self) {
-        self.finish();
+        let _ = self.finish();
     }
 }
 
@@ -247,9 +429,24 @@ struct Instance {
 
 impl Instance {
     fn new(inputs: &[Option<InputSpec>], schedule: Option<RoundSchedule>) -> Arc<Self> {
-        let inputs = inputs.iter().map(|s| s.clone().map(|spec| Input { spec, queue: VecDeque::new() })).collect();
+        let inputs = inputs
+            .iter()
+            .map(|s| {
+                s.clone().map(|spec| Input {
+                    spec,
+                    queue: VecDeque::new(),
+                })
+            })
+            .collect();
         Arc::new(Self {
-            inner: Mutex::new(Inner { inputs, dirty: 0, dropped: 0, schedule, stop: false, input_waiter: false }),
+            inner: Mutex::new(Inner {
+                inputs,
+                dirty: 0,
+                dropped: 0,
+                schedule,
+                stop: false,
+                input_waiter: false,
+            }),
             wake: Condvar::new(),
             call_started: AtomicU64::new(0),
             in_step: AtomicBool::new(false),
@@ -266,7 +463,12 @@ impl Instance {
 
     /// Put a batch into the inputs under one lock with at most one notify,
     /// so the module never steps on half of a batch that arrived together.
-    fn deliver_all(&self, batch: impl IntoIterator<Item = (u32, Arc<Sample>)>, audit: &dyn AuditSink, now: i64) {
+    fn deliver_all(
+        &self,
+        batch: impl IntoIterator<Item = (u32, Arc<Sample>)>,
+        audit: &dyn AuditSink,
+        now: i64,
+    ) {
         let mut g = self.inner.lock().unwrap();
         let mut any = false;
         for (port, sample) in batch {
@@ -293,14 +495,24 @@ impl Instance {
         g.input_waiter = wakes_on_input;
         let (mut g, _) = self
             .wake
-            .wait_timeout_while(g, timeout, |g| !g.stop && !(wakes_on_input && g.dirty != 0) && g.schedule == schedule)
+            .wait_timeout_while(g, timeout, |g| {
+                !g.stop && !(wakes_on_input && g.dirty != 0) && g.schedule == schedule
+            })
             .unwrap();
         g.input_waiter = false;
         g
     }
 
-    fn push(g: &mut Inner, port: u32, sample: Arc<Sample>, audit: &dyn AuditSink, now: i64) -> bool {
-        let Some(Some(input)) = g.inputs.get_mut(port as usize) else { return false };
+    fn push(
+        g: &mut Inner,
+        port: u32,
+        sample: Arc<Sample>,
+        audit: &dyn AuditSink,
+        now: i64,
+    ) -> bool {
+        let Some(Some(input)) = g.inputs.get_mut(port as usize) else {
+            return false;
+        };
         let mut lost = false;
         if input.spec.latest {
             input.queue.clear();
@@ -308,7 +520,11 @@ impl Instance {
             input.queue.pop_front();
             lost = true;
         }
-        let (channel, origin, link) = (input.spec.channel, sample.origin, sample.link_header.is_some());
+        let (channel, origin, link) = (
+            input.spec.channel,
+            sample.origin,
+            sample.link_header.is_some(),
+        );
         input.queue.push_back(sample);
         g.dirty |= 1u64 << port;
         if lost {
@@ -327,7 +543,7 @@ impl Instance {
     }
 
     fn stop(&self) {
-        self.inner.lock().unwrap().stop = true;
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
         self.wake.notify_one();
     }
 }
@@ -377,7 +593,10 @@ struct Module {
 
 impl Module {
     fn instance(&self) -> Arc<Instance> {
-        self.current.read().unwrap().clone()
+        self.current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn hang(&self) -> Duration {
@@ -396,6 +615,7 @@ impl Module {
 
 /// Shared by the main thread and every module thread.
 struct Runtime {
+    rpc: RpcBinding,
     node_id: OriginId,
     link: bool,
     clock: Arc<dyn Clock>,
@@ -407,11 +627,15 @@ struct Runtime {
     steps_every: u64,
     modules: Vec<Module>,
     started: Instant,
+    #[cfg(test)]
+    spawn_failure_at: std::sync::atomic::AtomicUsize,
 }
 
 impl Runtime {
     fn clock_runnable(&self) -> bool {
-        self.clock_guard.as_ref().map_or(true, |gate| gate.runnable())
+        self.clock_guard
+            .as_ref()
+            .map_or(true, |gate| gate.runnable())
     }
 
     fn mono_ns(&self) -> u64 {
@@ -444,6 +668,126 @@ impl Runtime {
             st.restart_at = Some(Instant::now() + Duration::from_millis(module.restart.backoff_ms));
         }
     }
+
+    /// Stop admission to each executor, then prove completion or explicitly
+    /// abandon it under the same native-call limits as orderly shutdown.
+    /// Poisoned Rust locks must not interrupt cleanup of the other modules.
+    fn stop_modules(&self) {
+        for module in &self.modules {
+            module.instance().stop();
+        }
+        let began = Instant::now();
+        loop {
+            let mut waiting = false;
+            let now_mono = self.mono_ns();
+            for (m, module) in self.modules.iter().enumerate() {
+                let inst = module.instance();
+                let finished = module
+                    .thread
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map_or(true, |h| h.is_finished());
+                if finished || inst.abandoned.load(Ordering::Acquire) {
+                    continue;
+                }
+                let started = inst.call_started.load(Ordering::Acquire);
+                let limit = module.limit(&inst);
+                let expired = if started == 0 {
+                    began.elapsed() > limit
+                } else {
+                    now_mono.saturating_sub(started) > limit.as_nanos() as u64
+                };
+                if expired {
+                    self.abandon_at_stop(m, &inst, "hung at stop; instance abandoned");
+                } else {
+                    waiting = true;
+                }
+            }
+            if !waiting {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for (m, module) in self.modules.iter().enumerate() {
+            let inst = module.instance();
+            let handle = {
+                let mut thread = module.thread.lock().unwrap_or_else(|e| e.into_inner());
+                if thread.as_ref().is_some_and(|h| h.is_finished()) {
+                    thread.take()
+                } else {
+                    // An unfinished abandoned executor retains its handle with
+                    // the Runtime; its Slot still owns callbacks and the DLL.
+                    None
+                }
+            };
+            if let Some(handle) = handle {
+                let panicked = handle.join().is_err();
+                if !inst.done.load(Ordering::Acquire) && !inst.abandoned.load(Ordering::Acquire) {
+                    let reason = if panicked {
+                        "module executor panicked; quiescence unproven, instance abandoned"
+                    } else {
+                        "module executor exited without destruction; instance abandoned"
+                    };
+                    self.abandon_at_stop(m, &inst, reason);
+                }
+            }
+        }
+    }
+
+    fn abandon_at_stop(&self, m: usize, inst: &Instance, reason: &str) {
+        if inst.abandoned.load(Ordering::Acquire) {
+            return;
+        }
+        let module = &self.modules[m];
+        {
+            let mut status = module.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.abandons = status.abandons.saturating_add(1);
+            status.last_error = Some(reason.into());
+            status.restart_at = None;
+            let _ = status.fsm.apply(Event::Fault);
+        }
+        // Cleanup must continue even if a Rust clock/logger panicked. The
+        // status is latched before the flag used by the stopping supervisor.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.health.event(serde_json::json!({
+                "event": "abandoned", "plugin": module.name,
+                "phase": "stop", "reason": reason,
+            }));
+        }));
+        inst.abandoned.store(true, Ordering::Release);
+    }
+}
+
+/// Own the actual native executors while the scheduler is unwinding. The
+/// outer manager's supervisor handle alone cannot account for these threads.
+struct ModuleStopGuard {
+    rt: Arc<Runtime>,
+    armed: bool,
+}
+
+impl ModuleStopGuard {
+    fn new(rt: Arc<Runtime>) -> Self {
+        Self { rt, armed: true }
+    }
+
+    fn stop(&mut self) {
+        if self.armed {
+            if let Some(gate) = &self.rt.clock_guard {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate.close()));
+            }
+            self.rt.stop_modules();
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ModuleStopGuard {
+    fn drop(&mut self) {
+        // A failure in error reporting must never turn scheduler unwind into
+        // a second panic or detach the remaining native module executors.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.stop()));
+    }
 }
 
 // --- host API callbacks (the module's own thread, inside a vtable call) ------
@@ -454,6 +798,8 @@ struct Slot {
     module: usize,
     instance: Arc<Instance>,
     api: XgcHostApi,
+    rpc_export: xgc2_xrpc::ffi::RuntimeExport,
+    rpc_getter_allowed: bool,
     current: Option<Arc<Sample>>,
     /// This step's snapshot of each input, by port.
     staged: Vec<VecDeque<Arc<Sample>>>,
@@ -463,17 +809,38 @@ struct Slot {
     round: u64,
     degrade_request: Option<String>,
     recover_request: bool,
-    steps_tx: mpsc::Sender<Option<String>>,
+    steps_tx: LineSender,
 }
 
 unsafe fn slot<'a>(host: *mut c_void) -> &'a mut Slot {
     &mut *host.cast::<Slot>()
 }
 
-unsafe extern "C" fn api_publish(host: *mut c_void, port: u32, round: u64, data: *const u8, len: u32) -> XgcStatus {
+unsafe extern "C" fn api_rpc_runtime(host: *mut c_void) -> *const c_void {
+    if host.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: the host API contract confines callbacks to this Slot's module
+    // vtable thread. RPC callbacks cannot use this thread-affine host pointer.
+    let s = slot(host);
+    if !s.rpc_getter_allowed {
+        return std::ptr::null();
+    }
+    (s.rpc_export.api() as *const xgc2_xrpc::ffi::RuntimeApiV1).cast()
+}
+
+unsafe extern "C" fn api_publish(
+    host: *mut c_void,
+    port: u32,
+    round: u64,
+    data: *const u8,
+    len: u32,
+) -> XgcStatus {
     let s = slot(host);
     let rt = s.rt.clone();
-    if !rt.clock_runnable() || rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable) { return XGC_OK; } // source stopped: discard, never re-stamp later
+    if !rt.clock_runnable() || rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable) {
+        return XGC_OK;
+    } // source stopped: discard, never re-stamp later
     let module = &rt.modules[s.module];
     if module.unbound.get(port as usize) == Some(&true) && module.lib.ports[port as usize].is_out {
         return XGC_OK; // an unbound optional output: dropped
@@ -484,10 +851,17 @@ unsafe extern "C" fn api_publish(host: *mut c_void, port: u32, round: u64, data:
     if len > 0 && data.is_null() {
         return XGC_ERR_INVALID;
     }
-    let payload = if len == 0 { &[][..] } else { std::slice::from_raw_parts(data, len as usize) };
+    let payload = if len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(data, len as usize)
+    };
     let t_produce = rt.clock.now();
     let seq = if rt.link {
-        match rt.endpoint.publish(route.channel, round, t_produce, payload) {
+        match rt
+            .endpoint
+            .publish(route.channel, round, t_produce, payload)
+        {
             Ok(header) => header.seq,
             Err(e) => {
                 rt.health.event(serde_json::json!({ "event": "publish_error", "plugin": module.name, "port": port, "error": e.0 }));
@@ -510,7 +884,12 @@ unsafe extern "C" fn api_publish(host: *mut c_void, port: u32, round: u64, data:
             link_header: None,
         });
         for &(reader, in_port) in &route.readers {
-            rt.modules[reader].instance().deliver(in_port, sample.clone(), rt.endpoint.audit().as_ref(), t_produce);
+            rt.modules[reader].instance().deliver(
+                in_port,
+                sample.clone(),
+                rt.endpoint.audit().as_ref(),
+                t_produce,
+            );
         }
     }
     module.published.fetch_add(1, Ordering::Relaxed);
@@ -524,8 +903,13 @@ unsafe extern "C" fn api_next(host: *mut c_void, port: u32, out: *mut XgcSampleV
     }
     let module = &s.rt.modules[s.module];
     if !matches!(module.inputs.get(port as usize), Some(Some(_))) {
-        let unbound_input = module.unbound.get(port as usize) == Some(&true) && !module.lib.ports[port as usize].is_out;
-        return if unbound_input { XGC_ERR_AGAIN } else { XGC_ERR_INVALID };
+        let unbound_input = module.unbound.get(port as usize) == Some(&true)
+            && !module.lib.ports[port as usize].is_out;
+        return if unbound_input {
+            XGC_ERR_AGAIN
+        } else {
+            XGC_ERR_INVALID
+        };
     }
     let Some(sample) = s.staged[port as usize].pop_front() else {
         return XGC_ERR_AGAIN;
@@ -533,7 +917,9 @@ unsafe extern "C" fn api_next(host: *mut c_void, port: u32, out: *mut XgcSampleV
     if let Some(header) = &sample.link_header {
         s.rt.endpoint.audit().consumed(header, s.rt.clock.now());
     }
-    s.rt.modules[s.module].consumed.fetch_add(1, Ordering::Relaxed);
+    s.rt.modules[s.module]
+        .consumed
+        .fetch_add(1, Ordering::Relaxed);
     s.reads.push((port, sample.origin, sample.seq));
     let current = s.current.insert(sample);
     *out = XgcSampleView {
@@ -562,6 +948,21 @@ unsafe fn c_text(ptr: *const c_char) -> String {
     }
 }
 
+/// A plugin log is scanned only through the admission limit. This avoids
+/// copying an arbitrarily long C string before checking the log queue bound.
+unsafe fn bounded_log_text(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return Some(String::new());
+    }
+    for len in 0..LOG_MAX_ENTRY_BYTES {
+        if *ptr.add(len) == 0 {
+            let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len);
+            return Some(String::from_utf8_lossy(bytes).into_owned());
+        }
+    }
+    None
+}
+
 unsafe extern "C" fn api_log(host: *mut c_void, level: XgcLogLevel, message: *const c_char) {
     let s = slot(host);
     let level = match level {
@@ -571,7 +972,13 @@ unsafe extern "C" fn api_log(host: *mut c_void, level: XgcLogLevel, message: *co
         _ => "error",
     };
     let name = &s.rt.modules[s.module].name;
-    s.rt.health.event(serde_json::json!({ "event": "log", "plugin": name, "level": level, "message": c_text(message) }));
+    let Some(message) = bounded_log_text(message) else {
+        s.rt.health.output.sender.state.oversize_drop();
+        return;
+    };
+    s.rt.health.event(
+        serde_json::json!({ "event": "log", "plugin": name, "level": level, "message": message }),
+    );
 }
 
 unsafe extern "C" fn api_request_degrade(host: *mut c_void, reason: *const c_char) {
@@ -586,7 +993,12 @@ unsafe extern "C" fn api_request_recover(host: *mut c_void) {
     s.degrade_request = None;
 }
 
-unsafe extern "C" fn api_port_origins(host: *mut c_void, port: u32, out: *mut u16, cap: u32) -> u32 {
+unsafe extern "C" fn api_port_origins(
+    host: *mut c_void,
+    port: u32,
+    out: *mut u16,
+    cap: u32,
+) -> u32 {
     let s = slot(host);
     let Some(Some(spec)) = s.rt.modules[s.module].inputs.get(port as usize) else {
         return 0;
@@ -609,8 +1021,17 @@ struct SendPtr(*mut Slot);
 // SAFETY: the slot is created for, and only used by, one module thread.
 unsafe impl Send for SendPtr {}
 
-fn spawn_module(rt: &Arc<Runtime>, m: usize, instance: Arc<Instance>, ready: Option<mpsc::Sender<usize>>) -> Result<(), HostError> {
+fn spawn_module(
+    rt: &Arc<Runtime>,
+    m: usize,
+    instance: Arc<Instance>,
+    ready: Option<mpsc::Sender<usize>>,
+) -> Result<(), HostError> {
     let module = &rt.modules[m];
+    let rpc_export = rt
+        .rpc
+        .export(module.lib.clone())
+        .map_err(|e| HostError(format!("plugin {} RPC binding: {e}", module.name)))?;
     let slot = Box::new(Slot {
         rt: rt.clone(),
         module: m,
@@ -627,7 +1048,10 @@ fn spawn_module(rt: &Arc<Runtime>, m: usize, instance: Arc<Instance>, ready: Opt
             request_recover: api_request_recover,
             port_origins: api_port_origins,
             node_id: api_node_id,
+            rpc_runtime: Some(api_rpc_runtime),
         },
+        rpc_export,
+        rpc_getter_allowed: false,
         current: None,
         staged: vec![VecDeque::new(); module.inputs.len()],
         local_seq: vec![0; module.outputs.len()],
@@ -639,20 +1063,37 @@ fn spawn_module(rt: &Arc<Runtime>, m: usize, instance: Arc<Instance>, ready: Opt
     });
     let ptr = Box::into_raw(slot);
     unsafe { (*ptr).api.host = ptr.cast() };
-    let ptr = SendPtr(ptr);
+    #[cfg(test)]
+    if rt.spawn_failure_at.load(Ordering::Relaxed) == m {
+        // The same allocation rollback as an OS thread-creation failure.
+        drop(unsafe { Box::from_raw(ptr) });
+        return herr("spawn module thread: injected creation failure");
+    }
+    let send_ptr = SendPtr(ptr);
     let handle = std::thread::Builder::new()
         .name(format!("xgc-{}", module.name))
         .spawn(move || {
-            let ptr = ptr;
-            let abandoned = ModuleThread { slot: ptr.0, instance: std::ptr::null_mut() }.run(ready);
+            let ptr = send_ptr;
+            let abandoned = ModuleThread {
+                slot: ptr.0,
+                instance: std::ptr::null_mut(),
+            }
+            .run(ready);
             if !abandoned {
                 // SAFETY: allocated above; no plugin instance refers to it any more.
                 drop(unsafe { Box::from_raw(ptr.0) });
             }
             // An abandoned slot is left alone: the stuck instance may still
             // call back through it.
-        })
-        .map_err(|e| HostError(format!("spawn module thread: {e}")))?;
+        });
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            // spawn rejected the closure: no native code has observed Slot.
+            drop(unsafe { Box::from_raw(ptr) });
+            return herr(format!("spawn module thread: {error}"));
+        }
+    };
     *module.thread.lock().unwrap() = Some(handle);
     Ok(())
 }
@@ -712,8 +1153,15 @@ impl ModuleThread {
                 g.schedule
             };
             if !rt.clock_runnable() {
-                if rt.clock_guard.as_ref().and_then(|g| g.failure()).is_some() { break; }
-                drop(inst.wait(inst.inner.lock().unwrap(), Duration::from_millis(1), false, schedule));
+                if rt.clock_guard.as_ref().and_then(|g| g.failure()).is_some() {
+                    break;
+                }
+                drop(inst.wait(
+                    inst.inner.lock().unwrap(),
+                    Duration::from_millis(1),
+                    false,
+                    schedule,
+                ));
                 continue;
             }
             let source = rt.clock.dispatch_stamp();
@@ -723,10 +1171,15 @@ impl ModuleThread {
                 let mut g = inst.inner.lock().unwrap();
                 if source.is_some_and(|s| !s.runnable) {
                     // Frozen input queues are not an output replay backlog.
-                    for input in g.inputs.iter_mut().flatten() { input.queue.clear(); }
+                    for input in g.inputs.iter_mut().flatten() {
+                        input.queue.clear();
+                    }
                     g.dirty = 0;
                 }
-                let _ = inst.wake.wait_timeout_while(g, Duration::from_millis(1), |g| !g.stop).unwrap();
+                let _ = inst
+                    .wake
+                    .wait_timeout_while(g, Duration::from_millis(1), |g| !g.stop)
+                    .unwrap();
                 continue;
             }
             let now = source.map_or_else(|| rt.clock.now(), |s| s.time);
@@ -740,16 +1193,21 @@ impl ModuleThread {
                 }
                 let restart_due = {
                     let st = module.status.lock().unwrap();
-                    st.fsm.state() == State::Error && st.restart_at.is_some_and(|t| Instant::now() >= t)
+                    st.fsm.state() == State::Error
+                        && st.restart_at.is_some_and(|t| Instant::now() >= t)
                 };
                 if restart_due && !self.restart_in_place() {
                     return true;
                 }
-                if rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable || source.is_some_and(|old| old.generation != s.generation)) {
+                if rt.clock.dispatch_stamp().is_some_and(|s| {
+                    !s.runnable || source.is_some_and(|old| old.generation != s.generation)
+                }) {
                     continue; // activation/restart may have outlived this accepted source stamp
                 }
                 let advanced = last_round != Some(k);
-                if let Some(p) = last_round.filter(|p| k > p + 1 && module.trigger != Trigger::OnDirty) {
+                if let Some(p) =
+                    last_round.filter(|p| k > p + 1 && module.trigger != Trigger::OnDirty)
+                {
                     // Woke late (load or a long step): one step for the
                     // current round; the skipped rounds are recorded.
                     rt.health.event(serde_json::json!({ "event": "rounds_skipped", "plugin": module.name, "from": p + 1, "to": k - 1 }));
@@ -769,7 +1227,9 @@ impl ModuleThread {
             let mut timeout = MAX_WAIT;
             if let Some(s) = schedule {
                 if s.round_at(now).is_none() || module.trigger != Trigger::OnDirty {
-                    timeout = timeout.min(Duration::from_nanos((s.next_boundary_after(now) - now).max(0) as u64));
+                    timeout = timeout.min(Duration::from_nanos(
+                        (s.next_boundary_after(now) - now).max(0) as u64,
+                    ));
                 }
             }
             if let Some(at) = module.status.lock().unwrap().restart_at {
@@ -779,7 +1239,12 @@ impl ModuleThread {
                 timeout = timeout.min(w.saturating_sub(last_step.elapsed()));
             }
             let wakes_on_input = module.trigger != Trigger::OnRound;
-            drop(inst.wait(inst.inner.lock().unwrap(), timeout, wakes_on_input, schedule));
+            drop(inst.wait(
+                inst.inner.lock().unwrap(),
+                timeout,
+                wakes_on_input,
+                schedule,
+            ));
         }
         self.finish()
     }
@@ -791,15 +1256,26 @@ impl ModuleThread {
         let (lib, api, config) = {
             let s = self.s();
             let module = &s.rt.modules[m];
-            (module.lib.clone(), &s.api as *const XgcHostApi, module.config.as_ptr())
+            (
+                module.lib.clone(),
+                &s.api as *const XgcHostApi,
+                module.config.as_ptr(),
+            )
         };
-        let Some(instance) = self.call(|| unsafe { (lib.vtbl.create)(api) }) else { return false };
+        self.s().rpc_getter_allowed = true;
+        let created = self.call(|| unsafe { (lib.vtbl.create)(api) });
+        self.s().rpc_getter_allowed = false;
+        let Some(instance) = created else {
+            return false;
+        };
         if instance.is_null() {
             rt.fault(m, "create returned NULL");
             return true;
         }
         self.instance = instance;
-        let Some(status) = self.call(|| unsafe { (lib.vtbl.configure)(instance, config) }) else { return false };
+        let Some(status) = self.call(|| unsafe { (lib.vtbl.configure)(instance, config) }) else {
+            return false;
+        };
         if status == XGC_OK {
             rt.transition(m, Event::Configure, None);
         } else {
@@ -815,7 +1291,12 @@ impl ModuleThread {
             return true;
         }
         let (f, instance) = (rt.modules[m].lib.vtbl.activate, self.instance);
-        let Some(status) = self.call(|| unsafe { f(instance) }) else { return false };
+        self.s().rpc_getter_allowed = true;
+        let activated = self.call(|| unsafe { f(instance) });
+        self.s().rpc_getter_allowed = false;
+        let Some(status) = activated else {
+            return false;
+        };
         if status == XGC_OK {
             rt.transition(m, Event::Activate, None);
         } else {
@@ -853,7 +1334,14 @@ impl ModuleThread {
         self.bring_up() && self.activate()
     }
 
-    fn step(&mut self, schedule: &RoundSchedule, k: u64, advanced: bool, wake_due: bool, source_time: Option<i64>) -> bool {
+    fn step(
+        &mut self,
+        schedule: &RoundSchedule,
+        k: u64,
+        advanced: bool,
+        wake_due: bool,
+        source_time: Option<i64>,
+    ) -> bool {
         let rt = self.rt();
         let m = self.s().module;
         let module = &rt.modules[m];
@@ -912,10 +1400,11 @@ impl ModuleThread {
             }
         }
         // At 100 robots a line per step is ~40k lines/s; a sampled log keeps
-        // whole rounds, and never drops a failed or slow step.
+        // whole rounds, including failed/slow steps, subject to the explicit
+        // queue and disk quota. Any lost evidence invalidates the audit.
         if k % rt.steps_every == 0 || status != XGC_OK || took > module.budget {
             let line = step_record(&module.name_json, k, t0, t1, &self.s().reads);
-            let _ = self.s().steps_tx.send(Some(line));
+            self.s().steps_tx.push(line);
         }
         if status != XGC_OK {
             rt.fault(m, &format!("step returned {status} in round {k}"));
@@ -923,7 +1412,10 @@ impl ModuleThread {
         }
         let (degrade, recover) = {
             let s = self.s();
-            (s.degrade_request.take(), std::mem::take(&mut s.recover_request))
+            (
+                s.degrade_request.take(),
+                std::mem::take(&mut s.recover_request),
+            )
         };
         let mut st = module.status.lock().unwrap();
         let state = st.fsm.state();
@@ -953,16 +1445,34 @@ impl ModuleThread {
         let module = &rt.modules[m];
         if module.status.lock().unwrap().fsm.state().runs() {
             let (f, instance) = (module.lib.vtbl.deactivate, self.instance);
-            let Some(status) = self.call(|| unsafe { f(instance) }) else { return true };
+            let Some(status) = self.call(|| unsafe { f(instance) }) else {
+                return true;
+            };
             if status == XGC_OK {
                 rt.transition(m, Event::Deactivate, None);
             } else {
-                rt.fault(m, &format!("deactivate returned {status}"));
+                let reason = format!(
+                    "deactivate returned {status}; quiescence unproven, instance abandoned"
+                );
+                module.status.lock().unwrap().abandons += 1;
+                rt.fault(m, &reason);
+                rt.health.event(serde_json::json!({
+                    "event": "abandoned", "plugin": module.name,
+                    "phase": "deactivate", "status": status, "reason": reason,
+                }));
+                // Publish abandonment only after the summary/health facts. The
+                // stop supervisor may return as soon as it sees this flag.
+                // Non-OK does not prove native callbacks have quiesced: leave
+                // the Slot, Runtime and library alive, with no further calls.
+                self.inst().abandoned.store(true, Ordering::Release);
+                return true;
             }
         }
         if !self.instance.is_null() {
             let (f, instance) = (module.lib.vtbl.domain_state, self.instance);
-            let Some(text) = self.call(|| unsafe { c_text(f(instance)) }) else { return true };
+            let Some(text) = self.call(|| unsafe { c_text(f(instance)) }) else {
+                return true;
+            };
             module.status.lock().unwrap().domain_state = text;
         }
         if !self.destroy() {
@@ -976,7 +1486,13 @@ impl ModuleThread {
 /// One `steps.jsonl` line, byte for byte what serializing
 /// `{"m", "k", "t0", "t1", "in": [[port, origin, seq], ...]}` with serde_json
 /// writes (keys sorted), without building a JSON tree per step.
-fn step_record(name_json: &str, k: u64, t0: i64, t1: i64, reads: &[(u32, OriginId, u64)]) -> String {
+fn step_record(
+    name_json: &str,
+    k: u64,
+    t0: i64,
+    t1: i64,
+    reads: &[(u32, OriginId, u64)],
+) -> String {
     use std::fmt::Write as _;
     let mut line = String::with_capacity(56 + name_json.len() + 24 * reads.len());
     line.push_str("{\"in\":[");
@@ -986,7 +1502,10 @@ fn step_record(name_json: &str, k: u64, t0: i64, t1: i64, reads: &[(u32, OriginI
         }
         let _ = write!(line, "[{port},{origin},{seq}]");
     }
-    let _ = write!(line, "],\"k\":{k},\"m\":{name_json},\"t0\":{t0},\"t1\":{t1}}}");
+    let _ = write!(
+        line,
+        "],\"k\":{k},\"m\":{name_json},\"t0\":{t0},\"t1\":{t1}}}"
+    );
     line
 }
 
@@ -1040,6 +1559,8 @@ pub struct RunSummary {
     /// were abandoned.
     pub aborted: Option<String>,
     pub audit_dir: PathBuf,
+    /// Evidence capacity and loss, including all log writers.
+    pub audit: StorageSnapshot,
 }
 
 pub struct Host {
@@ -1053,21 +1574,34 @@ pub struct Host {
     run_dir: PathBuf,
     clock_service: Option<crate::clock_service::ClockService>,
     clock_source: Option<crate::clock_source::ClockSource>,
+    #[cfg(test)]
+    panic_after_step: bool,
 }
 
 pub struct HostOptions {
     /// Echo health events to stderr.
     pub echo_health: bool,
     pub rx_queue: usize,
+    /// Shared process-owned XRPC runtime. Library callers may omit it to get
+    /// one aggregate-owned default runtime, never one runtime per module.
+    pub rpc: Option<RpcBinding>,
 }
 
 impl Default for HostOptions {
     fn default() -> Self {
-        Self { echo_health: false, rx_queue: DEFAULT_RX_QUEUE }
+        Self {
+            echo_health: false,
+            rx_queue: DEFAULT_RX_QUEUE,
+            rpc: None,
+        }
     }
 }
 
 impl Host {
+    /// Read-only observation uses the same supervisor observation as audit.
+    pub fn health_observer(&self) -> Arc<HealthLog> {
+        self.rt.health.clone()
+    }
     /// Load, validate and wire everything. No plugin instance exists yet:
     /// `run` creates each on its own thread. Relative plugin and audit paths
     /// resolve against `base_dir`, the manifest's directory.
@@ -1086,19 +1620,43 @@ impl Host {
 
     /// Production entry point. The manifest selects one source for both
     /// colocated and distributed placement; absence preserves wall behavior.
-    pub fn with_manifest_clock(manifest: Manifest, base_dir: &Path, transport: Box<dyn Transport>, opts: HostOptions) -> Result<Self, HostError> {
+    pub fn with_manifest_clock(
+        manifest: Manifest,
+        base_dir: &Path,
+        transport: Box<dyn Transport>,
+        opts: HostOptions,
+    ) -> Result<Self, HostError> {
         manifest.resolve().map_err(|e| HostError(e.0))?;
-        let source = manifest.clock_source.as_ref().map(|c| Arc::new(xgc_rt_core::clock::SourceClock::new(Duration::from_millis(c.stale_after_wall_ms), c.max_advance_ns)));
+        let source = manifest.clock_source.as_ref().map(|c| {
+            Arc::new(xgc_rt_core::clock::SourceClock::new(
+                Duration::from_millis(c.stale_after_wall_ms),
+                c.max_advance_ns,
+            ))
+        });
         let clock: Arc<dyn Clock> = match &source {
             Some(c) => c.clone(),
             None => Arc::new(xgc_rt_core::clock::WallClock::new(
-                if manifest.session.roster.len() == 1 && manifest.transport.kind == "loopback" && manifest.clock.is_none() { 0 } else { u32::MAX }
+                if manifest.session.roster.len() == 1
+                    && manifest.transport.kind == "loopback"
+                    && manifest.clock.is_none()
+                {
+                    0
+                } else {
+                    u32::MAX
+                },
             )),
         };
         Self::build(manifest, base_dir, transport, clock, source, opts)
     }
 
-    fn build(manifest: Manifest, base_dir: &Path, transport: Box<dyn Transport>, clock: Arc<dyn Clock>, source: Option<Arc<xgc_rt_core::clock::SourceClock>>, opts: HostOptions) -> Result<Self, HostError> {
+    fn build(
+        manifest: Manifest,
+        base_dir: &Path,
+        transport: Box<dyn Transport>,
+        clock: Arc<dyn Clock>,
+        source: Option<Arc<xgc_rt_core::clock::SourceClock>>,
+        opts: HostOptions,
+    ) -> Result<Self, HostError> {
         let started = Instant::now();
         let mut timings = StartupTimings::default();
         let resolved = manifest.resolve().map_err(|e| HostError(e.0))?;
@@ -1122,20 +1680,50 @@ impl Host {
             records_written: 0,
             complete: false,
         };
-        let audit = Arc::new(FileAudit::create(&run_dir, meta, clock.clone()).map_err(|e| HostError(format!("audit: {e}")))?);
+        let budget = AuditBudget::new(manifest.audit.max_bytes)
+            .map_err(|e| HostError(format!("audit quota: {e}")))?;
+        let audit = Arc::new(
+            FileAudit::create_with_budget(
+                &run_dir,
+                meta,
+                clock.clone(),
+                QUEUE_RECORDS,
+                budget.clone(),
+            )
+            .map_err(|e| HostError(format!("audit: {e}")))?,
+        );
         if let Some(source) = &manifest.clock_source {
             let identity = serde_json::json!({"schema":"xgc-clock-source/1", "kind":"ros1_sim", "world_instance_id":source.world_instance_id,
                 "topic":source.topic, "expected_publisher":source.expected_publisher, "epoch_ns":s.epoch_ns});
-            std::fs::write(audit.dir().join("clock_source.json"), serde_json::to_vec_pretty(&identity).unwrap())
+            let identity_bytes = serde_json::to_vec_pretty(&identity).unwrap();
+            if identity_bytes.len() > 16 * 1024 {
+                return herr("clock source audit identity exceeds 16 KiB reservation");
+            }
+            let mut identity_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(audit.dir().join("clock_source.json"))
+                .map_err(|e| HostError(format!("clock source audit identity: {e}")))?;
+            identity_file
+                .write_all(&identity_bytes)
                 .map_err(|e| HostError(format!("clock source audit identity: {e}")))?;
         }
         let health = Arc::new(
-            HealthLog::open(&audit.dir().join("health.jsonl"), clock.clone(), opts.echo_health)
-                .map_err(|e| HostError(format!("health log: {e}")))?,
+            HealthLog::open(
+                &audit.dir().join("health.jsonl"),
+                clock.clone(),
+                opts.echo_health,
+                budget.clone(),
+            )
+            .map_err(|e| HostError(format!("health log: {e}")))?,
         );
-        let steps = File::create(audit.dir().join("steps.jsonl"))
-            .and_then(|file| LineLog::spawn(BufWriter::new(file), false, "xgc-steps"))
-            .map_err(|e| HostError(format!("step log: {e}")))?;
+        let steps = LineLog::open(
+            &audit.dir().join("steps.jsonl"),
+            false,
+            "steps",
+            budget.clone(),
+        )
+        .map_err(|e| HostError(format!("step log: {e}")))?;
 
         // A Host loads each actual library once; instance declarations still
         // validate their own pins, descriptor expectations and port bindings.
@@ -1144,17 +1732,27 @@ impl Host {
         for (decl, bindings) in manifest.plugins.iter().zip(&resolved.bindings) {
             let declared_path = base_dir.join(&decl.path);
             // Normalize the identity only; preserve the loader's $ORIGIN path.
-            let path = declared_path.canonicalize().map_err(|e| HostError(format!("{}: {e}", declared_path.display())))?;
+            let path = declared_path
+                .canonicalize()
+                .map_err(|e| HostError(format!("{}: {e}", declared_path.display())))?;
             let lib = if let Some(lib) = libraries.get(&path) {
-                lib.check_pin(&declared_path, decl.sha256.as_deref()).map_err(|e| HostError(e.0))?;
+                lib.check_pin(&declared_path, decl.sha256.as_deref())
+                    .map_err(|e| HostError(e.0))?;
                 lib.clone()
             } else {
-                let lib = Arc::new(plugin::load(&declared_path, decl.sha256.as_deref()).map_err(|e| HostError(e.0))?);
+                let lib = Arc::new(
+                    plugin::load(&declared_path, decl.sha256.as_deref())
+                        .map_err(|e| HostError(e.0))?,
+                );
                 libraries.insert(path, lib.clone());
                 lib
             };
             if decl.expected_name.as_ref().is_some_and(|v| v != &lib.name)
-                || decl.expected_version.as_ref().is_some_and(|v| v != &lib.version) {
+                || decl
+                    .expected_version
+                    .as_ref()
+                    .is_some_and(|v| v != &lib.version)
+            {
                 return herr(format!("plugin {}: loaded descriptor {}/{} differs from expected_name {:?}, expected_version {:?}; install the frozen bundle", decl.name, lib.name, lib.version, decl.expected_name, decl.expected_version));
             }
             for port in &lib.ports {
@@ -1163,7 +1761,10 @@ impl Host {
                         health.event(serde_json::json!({ "event": "unbound_optional_port", "plugin": decl.name, "port": port.name }));
                         continue;
                     }
-                    return herr(format!("plugin {}: port {} is not bound in the manifest", decl.name, port.name));
+                    return herr(format!(
+                        "plugin {}: port {} is not bound in the manifest",
+                        decl.name, port.name
+                    ));
                 };
                 let chan = &resolved.channels[*channel as usize];
                 if chan.qos != port.qos {
@@ -1173,11 +1774,20 @@ impl Host {
                     ));
                 }
                 if !port.is_out && origins.is_empty() {
-                    return herr(format!("plugin {}: in-port {} has no origins", decl.name, port.name));
+                    return herr(format!(
+                        "plugin {}: in-port {} has no origins",
+                        decl.name, port.name
+                    ));
                 }
             }
-            if let Some(extra) = bindings.keys().find(|k| !lib.ports.iter().any(|p| &p.name == *k)) {
-                return herr(format!("plugin {}: manifest binds unknown port {extra}", decl.name));
+            if let Some(extra) = bindings
+                .keys()
+                .find(|k| !lib.ports.iter().any(|p| &p.name == *k))
+            {
+                return herr(format!(
+                    "plugin {}: manifest binds unknown port {extra}",
+                    decl.name
+                ));
             }
             health.event(serde_json::json!({
                 "event": "loaded", "plugin": decl.name, "library": lib.name, "version": lib.version, "sha256": lib.sha256,
@@ -1192,14 +1802,22 @@ impl Host {
                 let channel = bindings[&port.name].0;
                 if port.is_out {
                     if let Some(other) = writers.insert(channel, &decl.name) {
-                        return herr(format!("channel {} has two writers on this node: {other} and {}", resolved.channels[channel as usize].name, decl.name));
+                        return herr(format!(
+                            "channel {} has two writers on this node: {other} and {}",
+                            resolved.channels[channel as usize].name, decl.name
+                        ));
                     }
                 }
-                if let Some((schema, owner)) = schemas.insert(channel, (&port.schema_id, &decl.name)) {
+                if let Some((schema, owner)) =
+                    schemas.insert(channel, (&port.schema_id, &decl.name))
+                {
                     if schema != port.schema_id {
                         return herr(format!(
                             "channel {}: {} uses schema {schema} but {} uses {}",
-                            resolved.channels[channel as usize].name, owner, decl.name, port.schema_id
+                            resolved.channels[channel as usize].name,
+                            owner,
+                            decl.name,
+                            port.schema_id
                         ));
                     }
                 }
@@ -1218,7 +1836,11 @@ impl Host {
                     .map(|p| {
                         (!p.is_out && bindings.contains_key(&p.name)).then(|| {
                             let (channel, origins) = bindings[&p.name].clone();
-                            InputSpec { channel, origins, latest: decl.bind[&p.name].latest }
+                            InputSpec {
+                                channel,
+                                origins,
+                                latest: decl.bind[&p.name].latest,
+                            }
                         })
                     })
                     .collect()
@@ -1257,7 +1879,11 @@ impl Host {
         let mut out_channels = BTreeMap::new();
         let mut in_streams: BTreeMap<ChannelId, Vec<OriginId>> = BTreeMap::new();
         for ((decl, bindings, lib), inputs) in loaded.into_iter().zip(inputs.iter().cloned()) {
-            let unbound = lib.ports.iter().map(|p| !bindings.contains_key(&p.name)).collect();
+            let unbound = lib
+                .ports
+                .iter()
+                .map(|p| !bindings.contains_key(&p.name))
+                .collect();
             let outputs = lib
                 .ports
                 .iter()
@@ -1265,7 +1891,10 @@ impl Host {
                     (p.is_out && bindings.contains_key(&p.name)).then(|| {
                         let channel = bindings[&p.name].0;
                         out_channels.insert(channel, ());
-                        OutRoute { channel, readers: local_readers(channel) }
+                        OutRoute {
+                            channel,
+                            readers: local_readers(channel),
+                        }
                     })
                 })
                 .collect();
@@ -1277,16 +1906,23 @@ impl Host {
                     }
                 }
             }
-            let config = toml::to_string(&decl.config).map_err(|e| HostError(format!("plugin {} config: {e}", decl.name)))?;
-            let budget = decl.step_budget_ms.map_or(Duration::from_nanos(resolved.period_ns as u64), |ms| Duration::from_secs_f64(ms / 1e3));
+            let config = toml::to_string(&decl.config)
+                .map_err(|e| HostError(format!("plugin {} config: {e}", decl.name)))?;
+            let budget = decl
+                .step_budget_ms
+                .map_or(Duration::from_nanos(resolved.period_ns as u64), |ms| {
+                    Duration::from_secs_f64(ms / 1e3)
+                });
             modules.push(Module {
                 name: decl.name.clone(),
-                name_json: serde_json::to_string(&decl.name).map_err(|e| HostError(format!("plugin {} name: {e}", decl.name)))?,
+                name_json: serde_json::to_string(&decl.name)
+                    .map_err(|e| HostError(format!("plugin {} name: {e}", decl.name)))?,
                 lib,
                 trigger: decl.trigger,
                 wake: decl.wake_ms.map(|ms| Duration::from_secs_f64(ms / 1e3)),
                 restart: decl.restart,
-                config: CString::new(config).map_err(|_| HostError(format!("plugin {} config has NUL", decl.name)))?,
+                config: CString::new(config)
+                    .map_err(|_| HostError(format!("plugin {} config has NUL", decl.name)))?,
                 budget,
                 current: RwLock::new(Instance::new(&inputs, None)),
                 inputs,
@@ -1304,18 +1940,21 @@ impl Host {
                 endpoint.declare_out(*channel).map_err(|e| HostError(e.0))?;
             }
             for (channel, origins) in in_streams.iter().filter(|(_, o)| !o.is_empty()) {
-                endpoint.declare_in(*channel, origins).map_err(|e| HostError(e.0))?;
+                endpoint
+                    .declare_in(*channel, origins)
+                    .map_err(|e| HostError(e.0))?;
             }
         }
         let clock_service = match resolved.clock.clone() {
             None => None,
             Some(spec) => Some(
-                crate::clock_service::ClockService::new(
+                crate::clock_service::ClockService::with_budget(
                     spec,
                     node_id,
                     manifest.session.roster.len(),
                     endpoint.clone(),
                     &audit.dir().join("clock.jsonl"),
+                    budget.clone(),
                 )
                 .map_err(|e| HostError(format!("clock probe: {e}")))?,
             ),
@@ -1325,24 +1964,73 @@ impl Host {
         let clock_source = match (manifest.clock_source.clone(), source) {
             (Some(spec), Some(source)) => {
                 let module = modules.iter().find(|m| m.name == spec.plugin).unwrap();
-                let decl = manifest.plugins.iter().find(|p| p.name == spec.plugin).unwrap();
+                let decl = manifest
+                    .plugins
+                    .iter()
+                    .find(|p| p.name == spec.plugin)
+                    .unwrap();
                 let node_name = decl.config["node_name"].as_str().unwrap();
-                Some(crate::clock_source::ClockSource::new(spec, module.lib.clone(), source, node_name).map_err(HostError)?)
+                Some(
+                    crate::clock_source::ClockSource::new(
+                        spec,
+                        module.lib.clone(),
+                        source,
+                        node_name,
+                    )
+                    .map_err(HostError)?,
+                )
             }
             _ => None,
         };
         let steps_every = manifest.audit.steps_every.max(1);
         let clock_guard = clock_service.as_ref().map(|service| service.guard());
-        let rt = Arc::new(Runtime { node_id, link, clock, clock_guard, endpoint, health, steps, steps_every, modules, started });
-        Ok(Self { manifest, resolved, rt, audit, transport_kind, timings, started, run_dir, clock_service, clock_source })
+        let rpc = match opts.rpc {
+            Some(binding) => binding,
+            None => {
+                RpcBinding::owned_default().map_err(|e| HostError(format!("RPC runtime: {e}")))?
+            }
+        };
+        let rt = Arc::new(Runtime {
+            rpc,
+            node_id,
+            link,
+            clock,
+            clock_guard,
+            endpoint,
+            health,
+            steps,
+            steps_every,
+            modules,
+            started,
+            #[cfg(test)]
+            spawn_failure_at: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        });
+        Ok(Self {
+            manifest,
+            resolved,
+            rt,
+            audit,
+            transport_kind,
+            timings,
+            started,
+            run_dir,
+            clock_service,
+            clock_source,
+            #[cfg(test)]
+            panic_after_step: false,
+        })
     }
 
     /// Deliver link frames to every input that listens for their channel
     /// and origin.
     fn route(&mut self, frames: Vec<RxFrame>) {
-        if frames.is_empty() { return; }
+        if frames.is_empty() {
+            return;
+        }
         let rt = &self.rt;
-        if rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable) { return; }
+        if rt.clock.dispatch_stamp().is_some_and(|s| !s.runnable) {
+            return;
+        }
         let mut batches: Vec<Vec<(u32, Arc<Sample>)>> = vec![Vec::new(); rt.modules.len()];
         for frame in frames {
             if let Some(cs) = self.clock_service.as_mut() {
@@ -1354,21 +2042,36 @@ impl Host {
             let sample = Arc::new(Sample::from_frame(frame));
             for (m, module) in rt.modules.iter().enumerate() {
                 for (q, spec) in module.inputs.iter().enumerate() {
-                    if spec.as_ref().is_some_and(|s| s.channel == channel && s.origins.contains(&origin)) {
+                    if spec
+                        .as_ref()
+                        .is_some_and(|s| s.channel == channel && s.origins.contains(&origin))
+                    {
                         batches[m].push((q as u32, sample.clone()));
                     }
                 }
             }
         }
         let now = rt.clock.now();
-        for (module, batch) in rt.modules.iter().zip(batches).filter(|(_, b)| !b.is_empty()) {
-            module.instance().deliver_all(batch, rt.endpoint.audit().as_ref(), now);
+        for (module, batch) in rt
+            .modules
+            .iter()
+            .zip(batches)
+            .filter(|(_, b)| !b.is_empty())
+        {
+            module
+                .instance()
+                .deliver_all(batch, rt.endpoint.audit().as_ref(), now);
         }
     }
 
     /// Abandon hung instances, start replacements whose backoff passed, and
     /// return when to look again. Sets `aborted` past the abandon limit.
-    fn watchdog(&self, schedule: Option<RoundSchedule>, abandoned: &mut u32, aborted: &mut Option<String>) -> Option<Instant> {
+    fn watchdog(
+        &self,
+        schedule: Option<RoundSchedule>,
+        abandoned: &mut u32,
+        aborted: &mut Option<String>,
+    ) -> Option<Instant> {
         let rt = &self.rt;
         let now_mono = rt.mono_ns();
         let mut next: Option<Instant> = None;
@@ -1390,7 +2093,13 @@ impl Host {
                     st.abandons += 1;
                 }
                 rt.health.event(serde_json::json!({ "event": "abandoned", "plugin": module.name, "busy_ms": busy as f64 / 1e6, "hang_ms": hang as f64 / 1e6 }));
-                rt.fault(m, &format!("hung for more than {} ms; instance abandoned", hang / 1_000_000));
+                rt.fault(
+                    m,
+                    &format!(
+                        "hung for more than {} ms; instance abandoned",
+                        hang / 1_000_000
+                    ),
+                );
                 if *abandoned >= self.manifest.session.max_abandoned && aborted.is_none() {
                     *aborted = Some(format!("{abandoned} hung module instance(s) abandoned"));
                 }
@@ -1420,18 +2129,108 @@ impl Host {
         next
     }
 
+    /// Finalize every writer even if one fails, so storage.json and meta.json
+    /// expose the failure instead of returning a successful audit.
+    fn finish_evidence(&self) -> Result<(), HostError> {
+        let mut errors = Vec::new();
+        if let Err(e) = self.rt.steps.finish() {
+            errors.push(format!("steps: {e}"));
+        }
+        if let Err(e) = self.rt.health.output.finish() {
+            errors.push(format!("health: {e}"));
+        }
+        if let Some(clock) = &self.clock_service {
+            if let Err(e) = clock.finish() {
+                errors.push(format!("clock: {e}"));
+            }
+        }
+        if let Err(e) = self.audit.finish() {
+            errors.push(format!("audit: {e}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            herr(errors.join("; "))
+        }
+    }
+
     /// Run until `stop` is set, `session.run_for_ms` after E0 elapses, or
     /// too many hung modules were abandoned.
     pub fn run(mut self, stop: &AtomicBool) -> Result<RunSummary, HostError> {
+        let mut cleanup = ModuleStopGuard::new(self.rt.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_inner(stop, &mut cleanup)
+        }));
+        let error = match result {
+            Ok(Ok(summary)) => return Ok(summary),
+            Ok(Err(error)) => error,
+            Err(_) => HostError("host scheduler panicked".into()),
+        };
+        if !cleanup.armed {
+            return Err(error);
+        }
+        let mut errors = vec![error.0];
+        // Keep Host alive while cleaning up: its clock source and every audit
+        // writer are still owned here, even after a partial thread startup.
+        if let Some(gate) = &self.rt.clock_guard {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate.close())).is_err() {
+                errors.push("clock output gate cleanup panicked".into());
+            }
+        }
+        let clock = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.clock_source.as_mut().map(|source| source.shutdown())
+        }));
+        match clock {
+            Ok(Some(Err(reason))) => errors.push(reason),
+            Err(_) => errors.push("clock source cleanup panicked".into()),
+            _ => {}
+        }
+        cleanup.stop();
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rt.health.event(serde_json::json!({
+                "event": "aborted", "phase": "exception_cleanup", "reason": errors[0],
+            }));
+        }));
+        if report.is_err() {
+            errors.push("native cleanup error reporting panicked".into());
+        }
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rt.endpoint.close();
+        }))
+        .is_err()
+        {
+            errors.push("native endpoint close panicked".into());
+        }
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rt.health.event(serde_json::json!({
+                "event": "stopped", "phase": "exception_cleanup",
+                "abandons": self.rt.modules.iter().map(|m|m.status.lock().unwrap_or_else(|e|e.into_inner()).abandons as u64).sum::<u64>(),
+            }));
+        }));
+        if report.is_err() {
+            errors.push("native cleanup completion reporting panicked".into());
+        }
+        if let Err(error) = self.finish_evidence() {
+            errors.push(error.0);
+        }
+        Err(HostError(errors.join("; ")))
+    }
+
+    fn run_inner(
+        &mut self,
+        stop: &AtomicBool,
+        cleanup: &mut ModuleStopGuard,
+    ) -> Result<RunSummary, HostError> {
         let rt = self.rt.clone();
         let mut abandoned = 0u32;
         let mut aborted = None;
         if let Some(source) = self.clock_source.as_mut() {
             source.start(rt.health.clone()).map_err(HostError)?;
             if let Err(reason) = source.wait_first(stop) {
-                rt.health.event(serde_json::json!({"event":"clock_source_startup_failed", "reason":reason}));
+                rt.health.event(
+                    serde_json::json!({"event":"clock_source_startup_failed", "reason":reason}),
+                );
                 let _ = source.shutdown();
-                self.audit.finish().map_err(|e| HostError(e.to_string()))?;
                 return Err(HostError(reason));
             }
         }
@@ -1459,10 +2258,22 @@ impl Host {
             }
         }
         self.timings.configured_ms = ms_since(self.started);
+        let configured: Vec<_> = rt.modules.iter().map(|module| {
+            let status=module.status.lock().unwrap();
+            serde_json::json!({"name":module.name,"state":status.fsm.state().name(),"last_error":status.last_error})
+        }).collect();
+        rt.health.event(serde_json::json!({"event":"configuration_applied",
+            "applied":pending==0 && configured.iter().all(|m|m["state"]=="inactive" && m["last_error"].is_null()),
+            "modules":configured,"configured_ms":self.timings.configured_ms}));
 
         // Required wall-clock admission also checks the reference's external
         // clock. No schedule is handed to modules until the gate succeeds.
-        if let Some(timeout) = self.clock_service.as_ref().filter(|c| c.is_client() || c.required()).map(|c| c.gate_timeout()) {
+        if let Some(timeout) = self
+            .clock_service
+            .as_ref()
+            .filter(|c| c.is_client() || c.required())
+            .map(|c| c.gate_timeout())
+        {
             let deadline = Instant::now() + timeout;
             loop {
                 let frames = rt.endpoint.drain();
@@ -1473,7 +2284,9 @@ impl Host {
                 }
                 cs.tick(true);
                 let poll = Duration::from_millis(20);
-                let wait = cs.next_due().map_or(poll, |at| at.saturating_duration_since(Instant::now()).min(poll));
+                let wait = cs.next_due().map_or(poll, |at| {
+                    at.saturating_duration_since(Instant::now()).min(poll)
+                });
                 rt.endpoint.wait(wait);
             }
             let cs = self.clock_service.as_ref().unwrap();
@@ -1491,24 +2304,34 @@ impl Host {
             }
         }
         self.timings.clock_ok_ms = ms_since(self.started);
-        rt.health.event(serde_json::json!({ "event": "startup", "timings": self.timings }));
+        rt.health
+            .event(serde_json::json!({ "event": "startup", "timings": self.timings }));
 
         let s = &self.manifest.session;
-        let e0 = s.epoch_ns.unwrap_or_else(|| rt.clock.now() + (s.start_delay_ms as i64) * 1_000_000);
+        let e0 = s
+            .epoch_ns
+            .unwrap_or_else(|| rt.clock.now() + (s.start_delay_ms as i64) * 1_000_000);
         if s.epoch_ns.is_none() && rt.link {
             // Rounds are only agreed absolute times across nodes when every
             // node has the same E0 (the Session's epoch_ns). A local E0 still
             // runs, but its boundaries are this process's own.
             rt.health.event(serde_json::json!({ "event": "epoch_local_only", "e0": e0, "roster": s.roster.len() }));
         }
-        let schedule = RoundSchedule::new(e0, self.resolved.period_ns, self.resolved.publish_deadline_ns);
+        let schedule = RoundSchedule::new(
+            e0,
+            self.resolved.period_ns,
+            self.resolved.publish_deadline_ns,
+        );
         let stop_at = s.run_for_ms.map(|ms| e0 + (ms as i64) * 1_000_000);
-        rt.health.event(serde_json::json!({ "event": "epoch", "e0": e0, "period_ns": schedule.period }));
+        rt.health
+            .event(serde_json::json!({ "event": "epoch", "e0": e0, "period_ns": schedule.period }));
         if let Some(source) = self.clock_source.as_ref() {
             if source.clock.snapshot().fault.is_some() {
                 aborted = source.clock.snapshot().fault;
             } else if !stop.load(Ordering::Relaxed) && rt.clock.now() >= e0 {
-                source.clock.fail("shared simulator epoch passed before startup completed; new Session required");
+                source.clock.fail(
+                    "shared simulator epoch passed before startup completed; new Session required",
+                );
                 aborted = source.clock.snapshot().fault;
             } else {
                 source.clock.arm(!stop.load(Ordering::Relaxed));
@@ -1518,7 +2341,9 @@ impl Host {
             if aborted.is_none() && !stop.load(Ordering::Relaxed) {
                 let result = if rt.clock.now() >= e0 {
                     Err("shared wall epoch passed before startup completed; freeze a future epoch and start a new Session".into())
-                } else { gate.admit() };
+                } else {
+                    gate.admit()
+                };
                 if let Err(reason) = result {
                     gate.fail(reason.clone());
                     aborted = Some(reason);
@@ -1526,7 +2351,9 @@ impl Host {
             }
         }
         if aborted.is_none() && !stop.load(Ordering::Relaxed) {
-            for module in &rt.modules { module.instance().set_schedule(schedule); }
+            for module in &rt.modules {
+                module.instance().set_schedule(schedule);
+            }
         }
 
         let mut last_round: Option<u64> = None;
@@ -1534,31 +2361,48 @@ impl Host {
         let mut wakeups = 0u64;
         let mut last_liveness = Instant::now() - Duration::from_secs(1);
         loop {
+            #[cfg(test)]
+            if self.panic_after_step
+                && rt
+                    .modules
+                    .iter()
+                    .any(|m| m.steps.load(Ordering::Relaxed) > 0)
+            {
+                panic!("injected scheduler panic after native step");
+            }
             if let Some(reason) = rt.clock_guard.as_ref().and_then(|gate| gate.failure()) {
                 aborted = Some(reason);
             }
             if let Some(source) = self.clock_source.as_ref() {
                 source.check_health();
                 source.clock.commit_host_time();
-                if let Some(reason) = source.clock.snapshot().fault { aborted = Some(reason); }
+                if let Some(reason) = source.clock.snapshot().fault {
+                    aborted = Some(reason);
+                }
             }
             // A generic observation of the actual lifecycle, not a product
             // readiness decision. Product probes also check generation/PID
             // identity and their workspace's data readiness requirements.
             if last_liveness.elapsed() >= Duration::from_secs(1) {
                 let source = rt.clock.dispatch_stamp();
-                let modules: Vec<_> = rt.modules.iter().map(|module| {
-                    let status = module.status.lock().unwrap();
-                    serde_json::json!({
-                        "name": module.name, "state": status.fsm.state().name(),
-                        "last_error": status.last_error, "abandons": status.abandons,
-                        "steps": module.steps.load(Ordering::Relaxed),
-                        "published": module.published.load(Ordering::Relaxed),
-                        "consumed": module.consumed.load(Ordering::Relaxed),
+                let modules: Vec<_> = rt
+                    .modules
+                    .iter()
+                    .map(|module| {
+                        let status = module.status.lock().unwrap();
+                        serde_json::json!({
+                            "name": module.name, "state": status.fsm.state().name(),
+                            "last_error": status.last_error, "abandons": status.abandons,
+                            "steps": module.steps.load(Ordering::Relaxed),
+                            "published": module.published.load(Ordering::Relaxed),
+                            "consumed": module.consumed.load(Ordering::Relaxed),
+                        })
                     })
-                }).collect();
-                let wall_unix_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos().min(i64::MAX as u128) as i64).unwrap_or(0);
+                    .collect();
+                let wall_unix_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0);
                 rt.health.event(serde_json::json!({
                     "event": "host_liveness", "pid": std::process::id(),
                     "session": self.manifest.session.id, "node": self.manifest.session.node,
@@ -1569,14 +2413,20 @@ impl Host {
                 last_liveness = Instant::now();
             }
             let now = rt.clock.now();
-            if stop.load(Ordering::Relaxed) || stop_at.is_some_and(|t| now >= t) || aborted.is_some() {
+            if stop.load(Ordering::Relaxed)
+                || stop_at.is_some_and(|t| now >= t)
+                || aborted.is_some()
+            {
                 break;
             }
             let frames = rt.endpoint.drain();
             self.route(frames);
             if let Some(cs) = self.clock_service.as_mut() {
                 cs.tick(false);
-                if let Some(reason) = cs.guard().failure() { aborted = Some(reason); continue; }
+                if let Some(reason) = cs.guard().failure() {
+                    aborted = Some(reason);
+                    continue;
+                }
             }
             if let Some(k) = schedule.round_at(now) {
                 if last_round.is_none() {
@@ -1597,7 +2447,10 @@ impl Host {
                 wake = wake.min(t);
             }
             let mut timeout = Duration::from_nanos((wake - now).max(0) as u64);
-            for at in watch.into_iter().chain(self.clock_service.as_ref().and_then(|c| c.next_due())) {
+            for at in watch
+                .into_iter()
+                .chain(self.clock_service.as_ref().and_then(|c| c.next_due()))
+            {
                 timeout = timeout.min(at.saturating_duration_since(Instant::now()));
             }
             // Before the shared epoch there are no module/frame wakeups. Poll
@@ -1612,49 +2465,22 @@ impl Host {
             wakeups += 1;
         }
         // Close the clock output gates before ordinary module deactivation.
-        if let Some(gate) = rt.clock_guard.as_ref() { gate.close(); }
+        if let Some(gate) = rt.clock_guard.as_ref() {
+            gate.close();
+        }
         if let Some(source) = self.clock_source.as_mut() {
-            if let Err(reason) = source.shutdown() { aborted = Some(reason); }
+            if let Err(reason) = source.shutdown() {
+                aborted = Some(reason);
+            }
         }
         if let Some(reason) = &aborted {
-            rt.health.event(serde_json::json!({ "event": "aborted", "reason": reason }));
+            rt.health
+                .event(serde_json::json!({ "event": "aborted", "reason": reason }));
         }
 
-        // Orderly stop: every module thread deactivates, reads its domain
-        // state and destroys its instance. A module still inside plugin code
-        // after its hang time is abandoned.
-        for module in &rt.modules {
-            module.instance().stop();
-        }
-        loop {
-            let mut waiting = false;
-            let now_mono = rt.mono_ns();
-            for (m, module) in rt.modules.iter().enumerate() {
-                let inst = module.instance();
-                if inst.done.load(Ordering::Acquire) || inst.abandoned.load(Ordering::Acquire) {
-                    continue;
-                }
-                let started = inst.call_started.load(Ordering::Acquire);
-                if started != 0 && now_mono.saturating_sub(started) > module.limit(&inst).as_nanos() as u64 {
-                    inst.abandoned.store(true, Ordering::Release);
-                    module.status.lock().unwrap().abandons += 1;
-                    rt.fault(m, "hung at stop; instance abandoned");
-                    continue;
-                }
-                let finished = module.thread.lock().unwrap().as_ref().map_or(true, |h| h.is_finished());
-                waiting |= !finished;
-            }
-            if !waiting {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        for module in &rt.modules {
-            let handle = module.thread.lock().unwrap().take();
-            if let Some(h) = handle.filter(|h| h.is_finished()) {
-                let _ = h.join();
-            }
-        }
+        // The same stop/grace/join path handles normal scheduler completion,
+        // partial startup and Rust scheduler unwind.
+        cleanup.stop();
 
         let plugins = rt
             .modules
@@ -1678,14 +2504,21 @@ impl Host {
                 }
             })
             .collect();
-        for module in rt.modules.iter().filter(|m| m.instance().done.load(Ordering::Acquire)) {
+        for module in rt
+            .modules
+            .iter()
+            .filter(|m| m.instance().done.load(Ordering::Acquire))
+        {
             let _ = module.status.lock().unwrap().fsm.apply(Event::Shutdown);
         }
         rt.endpoint.close();
+        rt.health
+            .event(serde_json::json!({ "event": "stopped", "rounds": rounds, "wakeups": wakeups }));
+        self.finish_evidence()?;
         let summary = RunSummary {
             session: self.manifest.session.id.clone(),
             node: self.manifest.session.node.clone(),
-            transport: self.transport_kind.into(),
+            transport: self.transport_kind.clone(),
             e0_ns: e0,
             period_ns: schedule.period,
             rounds,
@@ -1694,14 +2527,15 @@ impl Host {
             plugins,
             aborted,
             audit_dir: self.run_dir.clone(),
+            audit: self.audit.storage_snapshot(),
         };
-        rt.health.event(serde_json::json!({ "event": "stopped", "rounds": rounds, "wakeups": wakeups }));
-        rt.steps.finish();
-        rt.health.output.finish();
-        self.audit.finish().map_err(|e| HostError(format!("audit: {e}")))?;
         Ok(summary)
     }
 }
+
+#[cfg(test)]
+#[path = "host_run_cleanup.rs"]
+mod host_run_cleanup;
 
 fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
@@ -1716,12 +2550,28 @@ mod loader_tests {
     fn shared_libraries_keep_instance_configuration_and_declaration_checks() {
         // Use the same Rust perception fixture as the existing Host tests,
         // with its own target directory so nested Cargo cannot take our lock.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-        let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
-            .unwrap_or_else(|| root.join("target")).join("plugin-tests");
-        let status = std::process::Command::new(env!("CARGO")).current_dir(&root)
-            .args(["build", "--offline", "--locked", "-q", "-p", "stub-perception", "--target-dir"])
-            .arg(&target).status().expect("build the existing perception fixture");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target"))
+            .join("plugin-tests");
+        let status = std::process::Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args([
+                "build",
+                "--offline",
+                "--locked",
+                "-q",
+                "-p",
+                "stub-perception",
+                "--target-dir",
+            ])
+            .arg(&target)
+            .status()
+            .expect("build the existing perception fixture");
         assert!(status.success(), "building the perception fixture failed");
         let library = target.join("debug/libstub_perception.so");
         let dir = target.join(format!("shared-library-{}", std::process::id()));
@@ -1729,7 +2579,8 @@ mod loader_tests {
         std::fs::copy(&library, dir.join("plugin.so")).unwrap();
         std::os::unix::fs::symlink("plugin.so", dir.join("alias.so")).unwrap();
         let pin = plugin::sha256_hex(&std::fs::read(&library).unwrap());
-        let text = format!(r#"
+        let text = format!(
+            r#"
 [session]
 id = "shared-library"
 node = "node"
@@ -1741,12 +2592,16 @@ run_for_ms = 120
 kind = "loopback"
 [audit]
 dir = "audit"
-"#);
+"#
+        );
         let mut manifest = Manifest::from_toml_str(&text).unwrap();
-        for (name, path, config) in [("left", "plugin.so", "payload_bytes = 32"),
-                                     ("right", "nested/../alias.so", "payload_bytes = 128"),
-                                     ("broken", "./plugin.so", "payload_bytes = 'invalid'")] {
-            let part = format!(r#"
+        for (name, path, config) in [
+            ("left", "plugin.so", "payload_bytes = 32"),
+            ("right", "nested/../alias.so", "payload_bytes = 128"),
+            ("broken", "./plugin.so", "payload_bytes = 'invalid'"),
+        ] {
+            let part = format!(
+                r#"
 [[channel]]
 name = "{name}"
 qos = "state"
@@ -1759,50 +2614,83 @@ expected_version = "0.1.0"
 trigger = "on_round"
 config = {{ {config} }}
 bind = {{ detections = {{ channel = "{name}" }} }}
-"#);
+"#
+            );
             let part = Manifest::from_toml_str(&(text.clone() + &part)).unwrap();
             manifest.channels.extend(part.channels);
             manifest.plugins.extend(part.plugins);
         }
-        let build = |manifest| Host::new(manifest, &dir,
-            Box::new(LoopbackTransport::new(LoopbackBus::new())),
-            Arc::new(xgc_rt_core::clock::WallClock::new(0)), HostOptions::default());
+        let attempt = AtomicU64::new(0);
+        let build = |mut manifest: Manifest| {
+            manifest.audit.dir =
+                PathBuf::from(format!("audit-{}", attempt.fetch_add(1, Ordering::Relaxed)));
+            Host::new(
+                manifest,
+                &dir,
+                Box::new(LoopbackTransport::new(LoopbackBus::new())),
+                Arc::new(xgc_rt_core::clock::WallClock::new(0)),
+                HostOptions::default(),
+            )
+        };
         let host = build(manifest.clone()).unwrap();
         let modules = &host.rt.modules;
         assert!(Arc::ptr_eq(&modules[0].lib, &modules[1].lib));
         assert!(Arc::ptr_eq(&modules[0].lib, &modules[2].lib));
         assert_ne!(modules[0].config, modules[1].config);
-        assert!(!Arc::ptr_eq(&modules[0].current.read().unwrap(), &modules[1].current.read().unwrap()));
+        assert!(!Arc::ptr_eq(
+            &modules[0].current.read().unwrap(),
+            &modules[1].current.read().unwrap()
+        ));
         let summary = host.run(&AtomicBool::new(false)).unwrap();
         for name in ["left", "right"] {
             let instance = summary.plugins.iter().find(|p| p.name == name).unwrap();
-            assert!(instance.steps > 0 && instance.last_error.is_none(), "{instance:?}");
+            assert!(
+                instance.steps > 0 && instance.last_error.is_none(),
+                "{instance:?}"
+            );
         }
         let broken = summary.plugins.iter().find(|p| p.name == "broken").unwrap();
         assert_eq!(broken.state, "error");
-        assert!(broken.last_error.as_ref().unwrap().contains("configure returned"));
+        assert!(broken
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("configure returned"));
 
-        for (field, message) in [("sha256", "does not match the manifest pin"),
-                                  ("name", "differs from expected_name"),
-                                  ("version", "differs from expected_name"),
-                                  ("port", "manifest binds unknown port")] {
+        for (field, message) in [
+            ("sha256", "does not match the manifest pin"),
+            ("name", "differs from expected_name"),
+            ("version", "differs from expected_name"),
+            ("port", "manifest binds unknown port"),
+        ] {
             let mut changed = manifest.clone();
             let second = &mut changed.plugins[1];
             match field {
                 "sha256" => second.sha256 = Some("0".repeat(64)),
                 "name" => second.expected_name = Some("other-library".into()),
                 "version" => second.expected_version = Some("9.9.9".into()),
-                _ => { let binding = second.bind["detections"].clone(); second.bind.insert("unknown".into(), binding); }
+                _ => {
+                    let binding = second.bind["detections"].clone();
+                    second.bind.insert("unknown".into(), binding);
+                }
             }
-            let error = build(changed).err().expect("each reused declaration must be checked");
+            let error = build(changed)
+                .err()
+                .expect("each reused declaration must be checked");
             assert!(error.0.contains(message), "{field}: {error}");
         }
         // Identical bytes at a different actual path are separate libraries.
         std::fs::copy(&library, dir.join("other.so")).unwrap();
         manifest.plugins[1].path = PathBuf::from("other.so");
         let other = build(manifest).unwrap();
-        assert!(!Arc::ptr_eq(&other.rt.modules[0].lib, &other.rt.modules[1].lib));
-        assert!(Arc::ptr_eq(&other.rt.modules[0].lib, &other.rt.modules[2].lib));
+        assert!(!Arc::ptr_eq(
+            &other.rt.modules[0].lib,
+            &other.rt.modules[1].lib
+        ));
+        assert!(Arc::ptr_eq(
+            &other.rt.modules[0].lib,
+            &other.rt.modules[2].lib
+        ));
     }
 }
 
@@ -1814,12 +2702,32 @@ mod log_tests {
     fn a_step_record_is_what_serde_json_writes() {
         for (name, k, t0, t1, reads) in [
             ("estimation", 0u64, 0i64, 1i64, vec![]),
-            ("plant_3", 17, -5, 1_234_567_890_123, vec![(0u32, 0 as OriginId, 1u64)]),
-            ("edge/\"quoted\"\\\u{1}", u64::MAX, i64::MIN, i64::MAX, vec![(63, OriginId::MAX, u64::MAX), (2, 1, 9)]),
+            (
+                "plant_3",
+                17,
+                -5,
+                1_234_567_890_123,
+                vec![(0u32, 0 as OriginId, 1u64)],
+            ),
+            (
+                "edge/\"quoted\"\\\u{1}",
+                u64::MAX,
+                i64::MIN,
+                i64::MAX,
+                vec![(63, OriginId::MAX, u64::MAX), (2, 1, 9)],
+            ),
         ] {
-            let reads_json: Vec<_> = reads.iter().map(|&(p, o, q)| [p as u64, o as u64, q]).collect();
-            let expected = serde_json::json!({ "m": name, "k": k, "t0": t0, "t1": t1, "in": reads_json }).to_string();
-            assert_eq!(step_record(&serde_json::to_string(name).unwrap(), k, t0, t1, &reads), expected);
+            let reads_json: Vec<_> = reads
+                .iter()
+                .map(|&(p, o, q)| [p as u64, o as u64, q])
+                .collect();
+            let expected =
+                serde_json::json!({ "m": name, "k": k, "t0": t0, "t1": t1, "in": reads_json })
+                    .to_string();
+            assert_eq!(
+                step_record(&serde_json::to_string(name).unwrap(), k, t0, t1, &reads),
+                expected
+            );
         }
     }
 
@@ -1850,11 +2758,23 @@ mod log_tests {
         let (resume_tx, resume_rx) = mpsc::channel();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::new(HealthLog {
-            output: LineLog::spawn(PausedWriter {
-                entered: Some(entered_tx), resume: resume_rx, bytes: bytes.clone(),
-            }, false, "test-health").unwrap(),
+            output: LineLog::spawn(
+                PausedWriter {
+                    entered: Some(entered_tx),
+                    resume: resume_rx,
+                    bytes: bytes.clone(),
+                },
+                false,
+                "health",
+                AuditBudget::new(xgc_rt_core::manifest::DEFAULT_AUDIT_MAX_BYTES).unwrap(),
+                LOG_QUEUE_LINES,
+            )
+            .unwrap(),
             clock: Arc::new(xgc_rt_core::clock::WallClock::new(0)),
             started: Instant::now(),
+            latest: Mutex::new(None),
+            configuration: Mutex::new(None),
+            notifications: Mutex::new(None),
         });
         log.event(serde_json::json!({"event":"first"}));
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1867,15 +2787,295 @@ mod log_tests {
         let sent_while_writer_paused = sent_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         resume_tx.send(()).unwrap();
         producer.join().unwrap();
-        log.output.finish();
-        assert!(sent_while_writer_paused, "plugin logging waited for output I/O");
+        log.output.finish().unwrap();
+        assert!(
+            sent_while_writer_paused,
+            "plugin logging waited for output I/O"
+        );
         let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        let events: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["event"], "first");
         assert_eq!(events[1]["event"], "second");
         assert!(events[0]["steady_elapsed_ns"].is_u64());
         assert!(events[1]["t"].is_i64());
+    }
+
+    #[test]
+    fn a_stalled_writer_has_a_fixed_queue_and_finish_drains_with_sender_clones_alive() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let budget = AuditBudget::new(xgc_rt_core::manifest::DEFAULT_AUDIT_MAX_BYTES).unwrap();
+        let log = Arc::new(
+            LineLog::spawn(
+                PausedWriter {
+                    entered: Some(entered_tx),
+                    resume: resume_rx,
+                    bytes: bytes.clone(),
+                },
+                false,
+                "steps",
+                budget.clone(),
+                2,
+            )
+            .unwrap(),
+        );
+        let abandoned_sender = log.sender();
+        log.push("first".into());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        log.push("second".into());
+        log.push("third".into());
+        let (done_tx, done_rx) = mpsc::channel();
+        let producer_log = log.clone();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                producer_log.push("overload".into());
+            }
+            done_tx.send(()).unwrap();
+        });
+        let did_not_wait = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        resume_tx.send(()).unwrap();
+        producer.join().unwrap();
+        assert!(did_not_wait, "a full logging queue waited for disk I/O");
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let finishing_log = log.clone();
+        let finishing = std::thread::spawn(move || {
+            finished_tx.send(finishing_log.finish()).unwrap();
+        });
+        let result = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("finish waited for a clone owned by an abandoned module")
+            .unwrap();
+        finishing.join().unwrap();
+        assert_eq!(result.queue_capacity, 2);
+        assert_eq!(result.accepted, 3);
+        assert_eq!(result.queue_drops, 10_000);
+        assert_eq!(result.entries_written, 3);
+        assert_eq!(&*bytes.lock().unwrap(), b"first\nsecond\nthird\n");
+        abandoned_sender.push("after-finish".into());
+        assert_eq!(budget.snapshot().writers["steps"].closed_drops, 1);
+        assert_eq!(log.finish().unwrap().entries_written, 3);
+    }
+
+    #[test]
+    fn concurrent_producers_share_admission_without_dropping_for_each_other() {
+        let budget = AuditBudget::new(xgc_rt_core::manifest::DEFAULT_AUDIT_MAX_BYTES).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let log = Arc::new(
+            LineLog::spawn(
+                PausedWriter {
+                    entered: Some(entered_tx),
+                    resume: resume_rx,
+                    bytes: Arc::new(Mutex::new(Vec::new())),
+                },
+                false,
+                "health",
+                budget,
+                LOG_QUEUE_LINES,
+            )
+            .unwrap(),
+        );
+        log.push("first".into());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let producers: Vec<_> = (0..8)
+            .map(|producer| {
+                let sender = log.sender();
+                std::thread::spawn(move || {
+                    for item in 0..128 {
+                        sender.push(format!("{producer}-{item}"));
+                    }
+                })
+            })
+            .collect();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        resume_tx.send(()).unwrap();
+        let snapshot = log.finish().unwrap();
+        assert_eq!(snapshot.accepted, 1025);
+        assert_eq!(snapshot.entries_written, 1025);
+        assert_eq!(snapshot.dropped_entries(), 0);
+    }
+
+    #[test]
+    fn serialization_and_native_log_strings_stop_at_the_entry_bound() {
+        let budget = AuditBudget::new(xgc_rt_core::manifest::DEFAULT_AUDIT_MAX_BYTES).unwrap();
+        let log = LineLog::spawn(std::io::sink(), false, "health", budget, 2).unwrap();
+        // Escaping expands this 20 KiB input past the output limit. The JSON
+        // serializer stops at 64 KiB instead of materializing the full text.
+        log.push_json(&serde_json::json!({"message": "\u{1}".repeat(20 * 1024)}));
+        let snapshot = log.finish().unwrap();
+        assert_eq!(snapshot.oversize_drops, 1);
+        assert_eq!(snapshot.accepted, 0);
+        assert_eq!(snapshot.bytes_written, 0);
+        let large = CString::new("x".repeat(LOG_MAX_ENTRY_BYTES)).unwrap();
+        assert!(unsafe { bounded_log_text(large.as_ptr()) }.is_none());
+        let small = CString::new("native").unwrap();
+        assert_eq!(
+            unsafe { bounded_log_text(small.as_ptr()) }.as_deref(),
+            Some("native")
+        );
+        assert_eq!(
+            unsafe { bounded_log_text(std::ptr::null()) }.as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn an_oversize_line_is_rejected_and_short_strings_cannot_hide_spare_capacity() {
+        let budget = AuditBudget::new(xgc_rt_core::manifest::DEFAULT_AUDIT_MAX_BYTES).unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (_resume_tx, resume_rx) = mpsc::channel();
+        let log = LineLog::spawn(
+            PausedWriter {
+                entered: None,
+                resume: resume_rx,
+                bytes: bytes.clone(),
+            },
+            false,
+            "health",
+            budget,
+            2,
+        )
+        .unwrap();
+        log.push("x".repeat(LOG_MAX_ENTRY_BYTES));
+        let mut spare = String::with_capacity(4 * LOG_MAX_ENTRY_BYTES);
+        spare.push_str("small");
+        log.push(spare);
+        let result = log.finish().unwrap();
+        assert_eq!(result.oversize_drops, 1);
+        assert_eq!(result.entries_written, 1);
+        assert_eq!(result.bytes_written, 6);
+        assert_eq!(&*bytes.lock().unwrap(), b"small\n");
+    }
+
+    struct FlushFailure;
+    impl Write for FlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush did not complete"))
+        }
+    }
+
+    #[test]
+    fn finish_reports_a_real_flush_failure_on_every_call() {
+        let budget = AuditBudget::new(xgc_rt_core::manifest::DEFAULT_AUDIT_MAX_BYTES).unwrap();
+        let log = LineLog::spawn(FlushFailure, false, "health", budget.clone(), 1).unwrap();
+        log.push("accepted".into());
+        assert_eq!(
+            log.finish().unwrap_err().to_string(),
+            "flush did not complete"
+        );
+        assert_eq!(
+            log.finish().unwrap_err().to_string(),
+            "flush did not complete"
+        );
+        let state = &budget.snapshot().writers["health"];
+        assert_eq!(state.entries_written, 1);
+        assert!(state.finished && state.write_error.is_some());
+        assert!(!budget.snapshot().complete());
+    }
+
+    #[test]
+    fn host_quota_loss_is_public_in_health_summary_and_incomplete_metadata() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/bounded-audit-tests")
+            .join(format!(
+                "host-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let maximum = xgc_rt_core::manifest::AUDIT_METADATA_RESERVED_BYTES;
+        let manifest = Manifest::from_toml_str(&format!(
+            r#"
+[session]
+id = "bounded-host"
+node = "node"
+roster = ["node"]
+period_ms = 1
+start_delay_ms = 10
+run_for_ms = 20
+[transport]
+kind = "loopback"
+[audit]
+dir = "audit"
+max_bytes = {maximum}
+"#
+        ))
+        .unwrap();
+        let host = Host::new(
+            manifest,
+            &dir,
+            Box::new(xgc_rt_transport_loopback::LoopbackTransport::new(
+                xgc_rt_transport_loopback::LoopbackBus::new(),
+            )),
+            Arc::new(xgc_rt_core::clock::WallClock::new(0)),
+            HostOptions::default(),
+        )
+        .unwrap();
+        let observer = host.health_observer();
+        let summary = host.run(&AtomicBool::new(false)).unwrap();
+        assert_eq!(summary.audit.max_bytes, maximum);
+        assert_eq!(summary.audit.data_bytes_reserved, 0);
+        assert!(summary.audit.writers["health"].quota_drops > 0);
+        assert!(!summary.audit.complete());
+        assert!(
+            observer.audit_snapshot()["writers"]["health"]["quota_drops"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let node = summary.audit_dir.join("node");
+        let meta: NodeMeta =
+            serde_json::from_slice(&std::fs::read(node.join("meta.json")).unwrap()).unwrap();
+        assert!(!meta.complete);
+        let total: u64 = std::fs::read_dir(node)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(total <= maximum);
+    }
+
+    #[test]
+    fn domain_health_notifies_after_snapshot_changes_and_plugin_logs_do_not() {
+        let budget = AuditBudget::new(xgc_rt_core::manifest::DEFAULT_AUDIT_MAX_BYTES).unwrap();
+        let health = HealthLog {
+            output: LineLog::spawn(std::io::sink(), false, "health", budget, LOG_QUEUE_LINES)
+                .unwrap(),
+            clock: Arc::new(xgc_rt_core::clock::WallClock::new(0)),
+            started: Instant::now(),
+            latest: Mutex::new(None),
+            configuration: Mutex::new(None),
+            notifications: Mutex::new(None),
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(0);
+        health.set_event_notifications(sender);
+        health.event(serde_json::json!({"event":"log", "message":"quiet"}));
+        assert_eq!(*receiver.borrow(), 0);
+        health.event(serde_json::json!({"event":"host_liveness", "modules":[]}));
+        assert_eq!(*receiver.borrow(), 1);
+        assert!(health.snapshot().unwrap()["audit"].is_object());
+        health.event(serde_json::json!({"event":"configuration_applied", "revision":7}));
+        assert_eq!(*receiver.borrow(), 2);
+        assert_eq!(health.configuration_snapshot().unwrap()["revision"], 7);
+        health.event(serde_json::json!({"event":"transition", "to":"inactive"}));
+        assert_eq!(*receiver.borrow(), 3);
+        assert!(health.snapshot().is_none());
+        assert_eq!(health.configuration_snapshot().unwrap()["revision"], 7);
+        health.event(serde_json::json!({"event":"stopped"}));
+        assert_eq!(*receiver.borrow(), 4);
+        health.output.finish().unwrap();
     }
 }
 
@@ -1885,11 +3085,24 @@ mod wake_tests {
     use xgc_rt_core::audit::NullAudit;
 
     fn sample(seq: u64) -> Arc<Sample> {
-        Arc::new(Sample { origin: 0, seq, round: 0, t_produce: 0, t_tx: 0, t_rx: 0, payload: vec![0; 8], link_header: None })
+        Arc::new(Sample {
+            origin: 0,
+            seq,
+            round: 0,
+            t_produce: 0,
+            t_tx: 0,
+            t_rx: 0,
+            payload: vec![0; 8],
+            link_header: None,
+        })
     }
 
     fn instance(ports: u32) -> Arc<Instance> {
-        let spec = InputSpec { channel: 0, origins: vec![0], latest: false };
+        let spec = InputSpec {
+            channel: 0,
+            origins: vec![0],
+            latest: false,
+        };
         Instance::new(&vec![Some(spec); ports as usize], None)
     }
 
@@ -1897,7 +3110,10 @@ mod wake_tests {
     fn until_waiting(inst: &Instance) {
         let started = Instant::now();
         while !inst.inner.lock().unwrap().input_waiter {
-            assert!(started.elapsed() < Duration::from_secs(10), "reader never slept");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "reader never slept"
+            );
             std::thread::yield_now();
         }
     }
@@ -1912,7 +3128,14 @@ mod wake_tests {
             std::thread::spawn(move || {
                 for _ in 0..20 {
                     let started = Instant::now();
-                    let dirty = inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), true, None).dirty;
+                    let dirty = inst
+                        .wait(
+                            inst.inner.lock().unwrap(),
+                            Duration::from_secs(30),
+                            true,
+                            None,
+                        )
+                        .dirty;
                     woke_tx.send((started.elapsed(), dirty)).unwrap();
                     // "Stepping": the rest of the burst lands meanwhile, then
                     // the step's snapshot takes it.
@@ -1927,13 +3150,30 @@ mod wake_tests {
             for port in 0..4 {
                 inst.deliver(port, sample(burst), &NullAudit, 0);
             }
-            let (after, dirty) = woke_rx.recv_timeout(Duration::from_secs(10)).expect("the reader did not wake");
-            assert!(after < Duration::from_secs(10) && dirty != 0, "burst {burst}: {after:?} {dirty:#b}");
-            assert_eq!(inst.notified.load(Ordering::Relaxed), burst + 1, "one notify per burst");
+            let (after, dirty) = woke_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the reader did not wake");
+            assert!(
+                after < Duration::from_secs(10) && dirty != 0,
+                "burst {burst}: {after:?} {dirty:#b}"
+            );
+            assert_eq!(
+                inst.notified.load(Ordering::Relaxed),
+                burst + 1,
+                "one notify per burst"
+            );
             go_tx.send(()).unwrap();
         }
         reader.join().unwrap();
-        let queued: usize = inst.inner.lock().unwrap().inputs.iter().flatten().map(|i| i.queue.len()).sum();
+        let queued: usize = inst
+            .inner
+            .lock()
+            .unwrap()
+            .inputs
+            .iter()
+            .flatten()
+            .map(|i| i.queue.len())
+            .sum();
         assert_eq!(queued, 80, "every sample stays queued for the step");
     }
 
@@ -1942,7 +3182,12 @@ mod wake_tests {
         let inst = instance(1);
         inst.deliver(0, sample(1), &NullAudit, 0);
         let started = Instant::now();
-        let g = inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), true, None);
+        let g = inst.wait(
+            inst.inner.lock().unwrap(),
+            Duration::from_secs(30),
+            true,
+            None,
+        );
         assert!(started.elapsed() < Duration::from_secs(10) && g.dirty == 1);
         assert!(!g.input_waiter);
         drop(g);
@@ -1956,10 +3201,20 @@ mod wake_tests {
             let inst = inst.clone();
             std::thread::spawn(move || {
                 let started = Instant::now();
-                drop(inst.wait(inst.inner.lock().unwrap(), Duration::from_millis(300), false, None));
+                drop(inst.wait(
+                    inst.inner.lock().unwrap(),
+                    Duration::from_millis(300),
+                    false,
+                    None,
+                ));
                 let by_timeout = started.elapsed();
                 let started = Instant::now();
-                drop(inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), false, None));
+                drop(inst.wait(
+                    inst.inner.lock().unwrap(),
+                    Duration::from_secs(30),
+                    false,
+                    None,
+                ));
                 (by_timeout, started.elapsed())
             })
         };
@@ -1971,8 +3226,14 @@ mod wake_tests {
         std::thread::sleep(Duration::from_millis(400));
         inst.set_schedule(RoundSchedule::new(0, 10_000_000, 10_000_000));
         let (by_timeout, by_schedule) = waits.join().unwrap();
-        assert!(by_timeout >= Duration::from_millis(300), "input woke an on_round reader after {by_timeout:?}");
-        assert!(by_schedule < Duration::from_secs(10), "a new schedule did not wake it");
+        assert!(
+            by_timeout >= Duration::from_millis(300),
+            "input woke an on_round reader after {by_timeout:?}"
+        );
+        assert!(
+            by_schedule < Duration::from_secs(10),
+            "a new schedule did not wake it"
+        );
         assert_eq!(inst.notified.load(Ordering::Relaxed), 0);
 
         let schedule = inst.inner.lock().unwrap().schedule;
@@ -1980,12 +3241,20 @@ mod wake_tests {
             let inst = inst.clone();
             std::thread::spawn(move || {
                 let started = Instant::now();
-                drop(inst.wait(inst.inner.lock().unwrap(), Duration::from_secs(30), false, schedule));
+                drop(inst.wait(
+                    inst.inner.lock().unwrap(),
+                    Duration::from_secs(30),
+                    false,
+                    schedule,
+                ));
                 started.elapsed()
             })
         };
         std::thread::sleep(Duration::from_millis(50));
         inst.stop();
-        assert!(stopper.join().unwrap() < Duration::from_secs(10), "stop did not wake it");
+        assert!(
+            stopper.join().unwrap() < Duration::from_secs(10),
+            "stop did not wake it"
+        );
     }
 }

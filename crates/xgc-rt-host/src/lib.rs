@@ -7,6 +7,8 @@ pub mod clock_source_abi;
 pub mod endpoint;
 pub mod host;
 pub mod plugin;
+pub mod rpc;
 pub mod transport_so;
 
 pub use host::{Host, HostError, HostOptions, RunSummary};
+pub use rpc::RpcBinding;
