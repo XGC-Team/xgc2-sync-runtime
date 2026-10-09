@@ -16,7 +16,7 @@ name = "station-io-cmd"
 path = "src/main.rs"
 
 [dependencies]
-xgc2-xrpc = { path = "../../../xrpc/rust" }
+xgc2-xrpc.workspace = true
 tokio = { version = "1", features = ["sync", "time"] }
 libc = "0.2"
 xgc-rt-abi.workspace = true

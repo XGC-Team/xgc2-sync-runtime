@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-xgc2-xrpc = { path = "../../../xrpc/rust" }
+xgc2-xrpc.workspace = true
 tokio = { version = "1", features = ["sync"] }
 xgc-rt-abi.workspace = true
 xgc-rt-core.workspace = true

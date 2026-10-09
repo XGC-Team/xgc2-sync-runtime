@@ -27,6 +27,7 @@ license = "Apache-2.0"
 repository = "https://github.com/XGC-Team/xgc2-sync-runtime"
 
 [workspace.dependencies]
+xgc2-xrpc = { git = "https://github.com/XGC-Team/xgc2-xrpc", rev = "35c2262358a39843c347249efd80c1788cb79849" }
 xgc-rt-abi = { path = "crates/xgc-rt-abi" }
 xgc-rt-core = { path = "crates/xgc-rt-core" }
 xgc-rt-audit = { path = "crates/xgc-rt-audit" }
