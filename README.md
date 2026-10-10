@@ -72,7 +72,16 @@ python3 sdk/tests/test_sdk.py --work-dir /tmp/sdk-check    # the SDK as a module
 
 Measurements and the commands behind them are recorded in [docs/validation/](docs/validation/).
 
-The control plane uses the XRPC Rust SDK, pinned by git revision in the workspace `Cargo.toml`.
+The control plane uses the XRPC Rust SDK, pinned by git revision in the workspace `Cargo.toml`. To build against a
+local checkout of the SDK (for example an unreleased branch) without touching the manifest or the lock file, patch it
+for one invocation:
+
+```bash
+cargo test --config 'patch."https://github.com/XGC-Team/xgc2-xrpc".xgc2-xrpc.path="/path/to/xrpc/rust"'
+```
+
+The host uses only `Runtime`, `Host::bind`, `handler`, `Fault`, `Limits::default()`, `new_instance_id` (and
+`BlockingClient` in its tests), so bumping the pin needs no code change.
 
 ## Packages
 
