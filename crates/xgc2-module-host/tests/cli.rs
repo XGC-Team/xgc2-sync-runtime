@@ -114,6 +114,49 @@ fn it_serves_the_control_plane_until_sigterm() {
     let _ = runtime;
 }
 
+/// Run the host on `manifest` with the given `--log-level` until it has logged that instance `src`
+/// started, then stop it with SIGTERM; returns everything it wrote to stderr.
+fn stderr_until_started(manifest: &std::path::Path, level: &str) -> String {
+    let mut child =
+        host().arg("--manifest").arg(manifest).args(["--log-level", level]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (lines, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut log = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !log.contains("instance src (p) started") {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match received.recv_timeout(wait) {
+            Ok(line) => log.push_str(&format!("{line}\n")),
+            Err(e) => panic!("no start-up line ({e}); stderr so far:\n{log}"),
+        }
+    }
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(wait_exit(&mut child, Duration::from_secs(10)).code(), Some(0));
+    while let Ok(line) = received.recv_timeout(Duration::from_secs(5)) {
+        log.push_str(&format!("{line}\n"));
+    }
+    log
+}
+
+#[test]
+fn log_lines_of_modules_follow_the_log_level() {
+    let dir = private_dir();
+    let path = manifest(dir.path(), None);
+    // The producer logs "producer started" at level 0 (debug) from its start function.
+    let debug = stderr_until_started(&path, "debug");
+    assert!(debug.lines().any(|line| line.contains(" DEBUG src: producer started")), "{debug}");
+    let info = stderr_until_started(&path, "info");
+    assert!(info.contains("instance src (p) started") && !info.contains("producer started"), "{info}");
+}
+
 #[test]
 fn a_failing_start_exits_without_serving() {
     let dir = private_dir();

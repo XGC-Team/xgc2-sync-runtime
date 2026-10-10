@@ -33,6 +33,32 @@ fn period_timer_steps_an_instance_at_its_rate() {
 }
 
 #[test]
+fn a_module_can_choose_its_own_period_in_start() {
+    let f = Fixture::new("module-period");
+    f.load_module("producer_state");
+    // The manifest gives no period; the module asks for 4 ms from start().
+    f.add(spec("chosen", "producer_state", 0.0, r#"{"period_us":4000}"#, &[]));
+    // The module's request replaces the period of the manifest, too.
+    f.add(spec("overridden", "producer_state", 500.0, r#"{"period_us":4000}"#, &[]));
+    f.add(spec("untouched", "producer_state", 0.0, "{}", &[]));
+    sleep_ms(400);
+    for name in ["chosen", "overridden"] {
+        let health = f.instance(name);
+        assert_eq!(health["period_ns"], 4_000_000, "{name}");
+        let steps = count(&health["steps"]);
+        assert!((30..=101).contains(&steps), "{name}: {steps} steps in 400 ms at 4 ms");
+    }
+    let health = f.instance("untouched");
+    assert_eq!((health["period_ns"].as_i64(), count(&health["steps"])), (Some(0), 0), "no timer, nothing to run it: {health}");
+    // A period of 0 disarms the timer.
+    f.host.set_timing("chosen", Some(0), None, None).unwrap();
+    sleep_ms(30);
+    let before = count(&f.instance("chosen")["steps"]);
+    sleep_ms(100);
+    assert_eq!(count(&f.instance("chosen")["steps"]), before, "no step after the timer was disarmed");
+}
+
+#[test]
 fn a_module_thread_wakes_its_instance_and_writes_asynchronously() {
     let f = Fixture::new("wake");
     f.load_module("wake_thread");

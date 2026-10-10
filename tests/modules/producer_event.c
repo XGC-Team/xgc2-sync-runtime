@@ -7,9 +7,11 @@ typedef struct instance {
   void* ctx;
   uint64_t producer;
   uint64_t burst;
+  uint64_t abort_every;
   uint64_t seq;
   uint64_t sent;
   uint64_t dropped;
+  uint64_t aborted;
 } instance;
 
 static const xgc2_port_desc PORTS[] = {
@@ -19,6 +21,7 @@ static const xgc2_port_desc PORTS[] = {
 static void apply(instance* self, const xgc2_config* config) {
   self->producer = (uint64_t)cfg_number(config, "id", 1);
   self->burst = (uint64_t)cfg_number(config, "burst", 1);
+  self->abort_every = (uint64_t)cfg_number(config, "abort_every", 0);
 }
 
 static xgc2_status create(const xgc2_host_api* host, void* ctx, const xgc2_config* config, xgc2_instance** out) {
@@ -52,14 +55,21 @@ static xgc2_status step(xgc2_instance* handle, const xgc2_step_ctx* step_ctx) {
       self->dropped++;
       continue;
     }
+    if (self->abort_every && seq % self->abort_every == 0) {
+      /* Changed our mind after write_begin: the claimed slot must not reach the readers. */
+      self->host->write_abort(self->ctx, 0);
+      self->aborted++;
+      continue;
+    }
     event->producer = self->producer;
     event->seq = seq;
     self->host->write_commit(self->ctx, 0, self->host->now_ns(self->ctx));
     self->sent++;
   }
-  char detail[128];
-  snprintf(detail, sizeof detail, "{\"sent\":%llu,\"dropped\":%llu,\"last_seq\":%llu}", (unsigned long long)self->sent,
-           (unsigned long long)self->dropped, (unsigned long long)self->seq);
+  char detail[160];
+  snprintf(detail, sizeof detail, "{\"sent\":%llu,\"dropped\":%llu,\"aborted\":%llu,\"last_seq\":%llu}",
+           (unsigned long long)self->sent, (unsigned long long)self->dropped, (unsigned long long)self->aborted,
+           (unsigned long long)self->seq);
   self->host->report(self->ctx, XGC2_OK, detail);
   return XGC2_OK;
 }

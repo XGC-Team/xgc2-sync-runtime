@@ -11,6 +11,7 @@ typedef struct instance {
   uint64_t steps;
   uint64_t fail_at;
   uint64_t report_every;
+  long period_us;
 } instance;
 
 static const xgc2_port_desc PORTS[] = {
@@ -22,6 +23,7 @@ static void apply(instance* self, const xgc2_config* config) {
   self->burst = (uint64_t)cfg_number(config, "burst", 1);
   self->fail_at = (uint64_t)cfg_number(config, "fail_at", 0);
   self->report_every = (uint64_t)cfg_number(config, "report_every", 1);
+  self->period_us = (long)cfg_number(config, "period_us", 0);
 }
 
 static xgc2_status create(const xgc2_host_api* host, void* ctx, const xgc2_config* config, xgc2_instance** out) {
@@ -40,7 +42,10 @@ static xgc2_status configure(xgc2_instance* handle, const xgc2_config* config) {
 }
 
 static xgc2_status start(xgc2_instance* handle) {
-  (void)handle;
+  instance* self = (instance*)handle;
+  self->host->log(self->ctx, 0, "producer started");
+  /* A module may ask for its own period; the manifest need not give one. */
+  if (self->period_us > 0) self->host->set_period_ns(self->ctx, self->period_us * 1000L);
   return XGC2_OK;
 }
 

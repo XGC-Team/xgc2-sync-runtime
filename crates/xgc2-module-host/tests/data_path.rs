@@ -109,6 +109,31 @@ fn several_writers_share_an_event_channel_and_keep_their_own_order() {
 }
 
 #[test]
+fn an_aborted_event_claim_never_reaches_a_reader() {
+    let f = Fixture::new("abort");
+    f.load_module("producer_event");
+    f.load_module("consumer");
+    f.add(spec("consumer", "consumer", 0.0, "{}", &[("event_in", "bus")]));
+    // Every third claimed event is given back with write_abort instead of being committed.
+    f.add(spec("producer", "producer_event", 2.0, r#"{"burst":7,"abort_every":3}"#, &[("out", "bus")]));
+    wait_until("events flow", Duration::from_secs(10), || count(&f.detail("producer")["sent"]) >= 70);
+    f.host.stop_instance("producer").unwrap();
+    let producer = f.detail("producer");
+    let (sent, aborted) = (count(&producer["sent"]), count(&producer["aborted"]));
+    assert!(aborted >= 30, "{producer}");
+    assert_eq!(count(&producer["dropped"]), 0, "the queue never fills: {producer}");
+    wait_until("the consumer drained the queue", Duration::from_secs(10), || count(&f.detail("consumer")["events"]) == sent);
+    let channel = f.channel("bus");
+    assert_eq!(count(&channel["commits"]), sent, "an aborted claim is not a commit: {channel}");
+    let consumer = f.detail("consumer");
+    assert_eq!(count(&consumer["event_disorder"]), 0, "{consumer}");
+    // The consumer sees the producer's own sequence numbers: one hole per aborted claim, except
+    // for a claim aborted last, which leaves no later event to show the hole.
+    let gaps = count(&consumer["event_gaps"]);
+    assert!(gaps == aborted || gaps + 1 == aborted, "{gaps} gaps for {aborted} aborted claims");
+}
+
+#[test]
 fn every_event_reader_gets_every_event() {
     let f = Fixture::new("broadcast");
     f.load_module("producer_event");
