@@ -186,10 +186,12 @@ fn autostart_false_creates_but_does_not_run() {
 #[test]
 fn the_external_clock_channel_comes_from_the_manifest() {
     let text = format!(
-        "entity = \"sim\"\n[clock]\nmode = \"external\"\nchannel = \"clock\"\n[[module]]\nname = \"clock\"\npath = \"{}\"\n[[module]]\nname = \"p\"\npath = \"{}\"\n[[instance]]\nname = \"sim\"\nmodule = \"clock\"\n[instance.config]\nstep_ms = 20\ninterval_us = 500\ncount = 25\n[instance.bind]\ntime = \"clock\"\n[[instance]]\nname = \"tick\"\nmodule = \"p\"\nperiod_ms = 100\n",
+        "entity = \"sim\"\n[clock]\nmode = \"external\"\nchannel = \"clock\"\n[[module]]\nname = \"clock\"\npath = \"{}\"\n[[module]]\nname = \"p\"\npath = \"{}\"\n[[instance]]\nname = \"tick\"\nmodule = \"p\"\nperiod_ms = 100\n[[instance]]\nname = \"sim\"\nmodule = \"clock\"\n[instance.config]\nstep_ms = 20\ninterval_us = 500\ncount = 25\n[instance.bind]\ntime = \"clock\"\n",
         lib("sim_clock"),
         lib("producer_state")
     );
+    // The time source is listed last: instances start in document order, and the timer of
+    // `tick` has to be armed before the first sample arrives for the count below to be exact.
     let host = Running(start(&text).unwrap());
     wait_until("simulation done", Duration::from_secs(5), || host.0.describe().1["clock"]["now_ns"] == 500_000_000);
     sleep_ms(30);
