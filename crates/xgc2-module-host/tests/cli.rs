@@ -11,6 +11,20 @@ use xgc2_xrpc::{BlockingClient, Method, Runtime, RuntimeOptions};
 
 const BIN: &str = env!("CARGO_BIN_EXE_xgc2-module-host");
 
+/// The host binary, behind `XGC2_HOST_RUNNER` when set (scripts/bionic-test.sh runs it on the
+/// glibc 2.27 loader, like the test processes).
+fn host() -> Command {
+    match std::env::var("XGC2_HOST_RUNNER") {
+        Ok(runner) if !runner.is_empty() => {
+            let mut words = runner.split_whitespace();
+            let mut command = Command::new(words.next().unwrap());
+            command.args(words).arg(BIN);
+            command
+        }
+        _ => Command::new(BIN),
+    }
+}
+
 fn manifest(dir: &std::path::Path, socket: Option<&std::path::Path>) -> std::path::PathBuf {
     let control = socket.map_or(String::new(), |s| format!("[control]\nsocket = \"{}\"\n", s.display()));
     let text = format!(
@@ -43,7 +57,7 @@ fn wait_exit(child: &mut Child, within: Duration) -> std::process::ExitStatus {
 fn check_validates_without_starting() {
     let dir = private_dir();
     let path = manifest(dir.path(), None);
-    let output = Command::new(BIN).arg("--manifest").arg(&path).arg("--check").output().unwrap();
+    let output = host().arg("--manifest").arg(&path).arg("--check").output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["entity"], "cli-test");
@@ -52,7 +66,7 @@ fn check_validates_without_starting() {
 
     let bad = dir.path().join("bad.toml");
     std::fs::write(&bad, "entity = \"x\"\n[[instance]]\nname = \"i\"\nmodule = \"nope\"\nperiod_ms = 0\n").unwrap();
-    let output = Command::new(BIN).arg("--manifest").arg(&bad).arg("--check").output().unwrap();
+    let output = host().arg("--manifest").arg(&bad).arg("--check").output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("module \"nope\" is not declared") && stderr.contains("period_ms"), "{stderr}");
@@ -63,7 +77,7 @@ fn usage_errors_exit_with_two() {
     for args in
         [vec![], vec!["--bogus"], vec!["--manifest"], vec!["--manifest", "/nonexistent/m.toml"], vec!["--workers", "x", "--manifest", "m"]]
     {
-        let output = Command::new(BIN).args(&args).output().unwrap();
+        let output = host().args(&args).output().unwrap();
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(!output.stderr.is_empty(), "{args:?}");
     }
@@ -74,7 +88,7 @@ fn it_serves_the_control_plane_until_sigterm() {
     let dir = private_dir();
     let socket = dir.path().join("module.sock");
     let path = manifest(dir.path(), Some(&socket));
-    let mut child = Command::new(BIN).arg("--manifest").arg(&path).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = host().arg("--manifest").arg(&path).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut first = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
     let announced: Value = serde_json::from_str(&first).unwrap_or_else(|e| panic!("first line {first:?}: {e}"));
@@ -110,7 +124,7 @@ fn a_failing_start_exits_without_serving() {
     );
     let path = dir.path().join("bad.toml");
     std::fs::write(&path, text).unwrap();
-    let output = Command::new(BIN).arg("--manifest").arg(&path).output().unwrap();
+    let output = host().arg("--manifest").arg(&path).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("libm.so"));
     assert!(!socket.exists());

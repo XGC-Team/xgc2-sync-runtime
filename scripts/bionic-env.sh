@@ -17,6 +17,8 @@ export CC="$toolchains/bin/bionic-gcc" CXX="$toolchains/bin/bionic-g++"
 # Test processes run on the glibc 2.27 dynamic loader with the sysroot's libraries.
 libs="$sysroot/lib/x86_64-linux-gnu:$sysroot/usr/lib/x86_64-linux-gnu"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$sysroot/lib/x86_64-linux-gnu/ld-2.27.so --library-path $libs"
+# The command line tests start the host binary the same way.
+export XGC2_HOST_RUNNER="$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"
 
 # glibc_floor BINARY: the highest glibc symbol version the binary needs.
 glibc_floor() {
