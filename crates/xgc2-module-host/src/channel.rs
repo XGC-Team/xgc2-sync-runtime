@@ -16,7 +16,7 @@
 //!   which they read it, so borrowed events stay valid. The queue is lossless until the slowest
 //!   reader is `depth` events behind; then `begin_write` fails and the drop is counted.
 
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -27,6 +27,8 @@ const FLAG_VOID: u32 = 1;
 /// Upper bound on spin rounds before a state writer reports a stall. Reached only if the
 /// pin accounting is broken; it keeps a bug from becoming a livelock.
 const SPIN_LIMIT: u32 = 200_000;
+/// The largest arena one channel may allocate.
+pub const MAX_ARENA_BYTES: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -88,6 +90,17 @@ pub enum WriterError {
     StateHasWriter,
 }
 
+/// Bytes of memory a channel allocates: `slots` slots of one header and a payload rounded up to
+/// whole cache lines. State channels have `max_readers + 2` slots, event channels `depth`.
+pub fn arena_bytes(kind: Kind, payload_size: u32, depth: u32, max_readers: u32) -> u64 {
+    let stride = (CACHE_LINE + (payload_size as usize).max(1).next_multiple_of(CACHE_LINE)) as u64;
+    let slots = match kind {
+        Kind::State => u64::from(max_readers) + 2,
+        Kind::Event => u64::from(depth),
+    };
+    stride * slots
+}
+
 #[repr(C, align(64))]
 struct SlotHeader {
     /// State: commit sequence of the content. Event: position + 1 once published.
@@ -112,12 +125,13 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
-    fn new(slots: usize, payload: usize) -> Arena {
+    fn new(slots: usize, payload: usize) -> Result<Arena, String> {
         let stride = CACHE_LINE + payload.max(1).next_multiple_of(CACHE_LINE);
-        let layout = Layout::from_size_align(stride * slots, CACHE_LINE).expect("arena layout");
+        let layout = Layout::from_size_align(stride * slots, CACHE_LINE).map_err(|e| format!("arena layout: {e}"))?;
         // SAFETY: the layout has a nonzero size (at least one slot of 128 bytes).
-        let base = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap_or_else(|| handle_alloc_error(layout));
-        Arena { base, layout, stride, slots }
+        let base = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .ok_or_else(|| format!("cannot allocate {} bytes for a channel", layout.size()))?;
+        Ok(Arena { base, layout, stride, slots })
     }
 
     fn header(&self, slot: u32) -> &SlotHeader {
@@ -153,8 +167,8 @@ struct StateRing {
 }
 
 impl StateRing {
-    fn new(max_readers: u32, payload: usize) -> StateRing {
-        StateRing { arena: Arena::new(max_readers as usize + 2, payload), latest: AtomicU32::new(NO_SLOT), seq: AtomicU64::new(0) }
+    fn new(max_readers: u32, payload: usize) -> Result<StateRing, String> {
+        Ok(StateRing { arena: Arena::new(max_readers as usize + 2, payload)?, latest: AtomicU32::new(NO_SLOT), seq: AtomicU64::new(0) })
     }
 
     /// Single writer: pick a slot that is neither the latest nor pinned.
@@ -236,13 +250,13 @@ struct EventRing {
 }
 
 impl EventRing {
-    fn new(depth: u32, payload: usize) -> EventRing {
-        EventRing {
-            arena: Arena::new(depth as usize, payload),
+    fn new(depth: u32, payload: usize) -> Result<EventRing, String> {
+        Ok(EventRing {
+            arena: Arena::new(depth as usize, payload)?,
             depth: u64::from(depth),
             claim: Mutex::new(Claim { head: 0, cursors: Vec::new() }),
             head: AtomicU64::new(0),
-        }
+        })
     }
 
     fn slot(&self, position: u64) -> u32 {
@@ -398,14 +412,26 @@ pub struct ChannelInfo {
 
 impl Channel {
     /// `depth` is the event queue length (ignored for state channels); `max_readers` bounds
-    /// the readers that can attach at the same time.
-    pub fn new(name: &str, kind: Kind, spec: PayloadSpec, depth: u32, max_readers: u32, hook: Option<CommitHook>) -> Arc<Channel> {
+    /// the readers that can attach at the same time. Fails when the arena would exceed
+    /// [`MAX_ARENA_BYTES`] or cannot be allocated.
+    pub fn new(
+        name: &str,
+        kind: Kind,
+        spec: PayloadSpec,
+        depth: u32,
+        max_readers: u32,
+        hook: Option<CommitHook>,
+    ) -> Result<Arc<Channel>, String> {
+        let bytes = arena_bytes(kind, spec.size, depth, max_readers);
+        if bytes > MAX_ARENA_BYTES {
+            return Err(format!("channel {name} needs {} MiB of slots; the limit is {} MiB", bytes >> 20, MAX_ARENA_BYTES >> 20));
+        }
         let payload = spec.size as usize;
         let ring = match kind {
-            Kind::State => Ring::State(StateRing::new(max_readers, payload)),
-            Kind::Event => Ring::Event(EventRing::new(depth, payload)),
+            Kind::State => Ring::State(StateRing::new(max_readers, payload)?),
+            Kind::Event => Ring::Event(EventRing::new(depth, payload)?),
         };
-        Arc::new(Channel {
+        Ok(Arc::new(Channel {
             name: name.to_owned(),
             spec,
             kind,
@@ -422,7 +448,7 @@ impl Channel {
             stale_reads: AtomicU64::new(0),
             stale: AtomicBool::new(false),
             hook,
-        })
+        }))
     }
 
     pub fn name(&self) -> &str {
@@ -694,7 +720,7 @@ mod tests {
 
     #[test]
     fn slots_are_cache_line_aligned_and_headers_are_contiguous() {
-        let channel = Channel::new("a", Kind::State, spec(100), 0, 3, None);
+        let channel = Channel::new("a", Kind::State, spec(100), 0, 3, None).unwrap();
         let Ring::State(ring) = &channel.ring else { unreachable!() };
         assert_eq!(ring.arena.slots, 5);
         assert_eq!(ring.arena.stride, 64 + 128);
@@ -707,7 +733,7 @@ mod tests {
 
     #[test]
     fn state_reader_gets_latest_and_borrowed_view_is_stable() {
-        let channel = Channel::new("s", Kind::State, spec(8), 0, 2, None);
+        let channel = Channel::new("s", Kind::State, spec(8), 0, 2, None).unwrap();
         let target = Arc::new(Counter::default());
         let mut reader = channel.attach_reader(target.clone(), 1 << 3).unwrap();
         let mut writer = Writer::default();
@@ -738,7 +764,7 @@ mod tests {
 
     #[test]
     fn state_reader_capacity_and_single_writer_are_enforced() {
-        let channel = Channel::new("s", Kind::State, spec(8), 0, 2, None);
+        let channel = Channel::new("s", Kind::State, spec(8), 0, 2, None).unwrap();
         let target = Arc::new(Counter::default());
         let a = channel.attach_reader(target.clone(), 1).unwrap();
         let _b = channel.attach_reader(target.clone(), 2).unwrap();
@@ -754,7 +780,7 @@ mod tests {
     #[test]
     fn state_writer_never_waits_with_every_reader_pinned() {
         let readers = 4;
-        let channel = Channel::new("s", Kind::State, spec(8), 0, readers, None);
+        let channel = Channel::new("s", Kind::State, spec(8), 0, readers, None).unwrap();
         let target = Arc::new(Counter::default());
         let mut writer = Writer::default();
         write_u64(&channel, &mut writer, 0);
@@ -773,7 +799,7 @@ mod tests {
     fn state_stress_readers_never_see_torn_samples() {
         const WORDS: usize = 32;
         let readers = 3;
-        let channel = Channel::new("s", Kind::State, spec(8 * WORDS as u32), 0, readers, None);
+        let channel = Channel::new("s", Kind::State, spec(8 * WORDS as u32), 0, readers, None).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let target = Arc::new(Counter::default());
         let mut handles = Vec::new();
@@ -818,7 +844,7 @@ mod tests {
 
     #[test]
     fn event_queue_is_fifo_lossless_until_full_and_counts_drops() {
-        let channel = Channel::new("e", Kind::Event, spec(8), 4, 4, None);
+        let channel = Channel::new("e", Kind::Event, spec(8), 4, 4, None).unwrap();
         let target = Arc::new(Counter::default());
         let mut reader = channel.attach_reader(target, 1).unwrap();
         let mut writer = Writer::default();
@@ -845,7 +871,7 @@ mod tests {
 
     #[test]
     fn every_event_reader_has_its_own_cursor() {
-        let channel = Channel::new("e", Kind::Event, spec(8), 8, 4, None);
+        let channel = Channel::new("e", Kind::Event, spec(8), 8, 4, None).unwrap();
         let target = Arc::new(Counter::default());
         let mut fast = channel.attach_reader(target.clone(), 1).unwrap();
         let mut slow = channel.attach_reader(target, 2).unwrap();
@@ -874,7 +900,7 @@ mod tests {
 
     #[test]
     fn late_event_reader_starts_at_the_head() {
-        let channel = Channel::new("e", Kind::Event, spec(8), 4, 2, None);
+        let channel = Channel::new("e", Kind::Event, spec(8), 4, 2, None).unwrap();
         let mut writer = Writer::default();
         for value in 0..3 {
             write_u64(&channel, &mut writer, value);
@@ -887,7 +913,7 @@ mod tests {
 
     #[test]
     fn uncommitted_claim_blocks_later_events_and_abort_releases_them() {
-        let channel = Channel::new("e", Kind::Event, spec(8), 8, 2, None);
+        let channel = Channel::new("e", Kind::Event, spec(8), 8, 2, None).unwrap();
         let mut reader = channel.attach_reader(Arc::new(Counter::default()), 1).unwrap();
         let mut slow = Writer::default();
         let mut fast = Writer::default();
@@ -907,7 +933,7 @@ mod tests {
     fn several_writers_keep_per_writer_order() {
         const WRITERS: u64 = 4;
         const PER_WRITER: u64 = 2000;
-        let channel = Channel::new("e", Kind::Event, spec(16), 64, 2, None);
+        let channel = Channel::new("e", Kind::Event, spec(16), 64, 2, None).unwrap();
         let mut reader = channel.attach_reader(Arc::new(Counter::default()), 1).unwrap();
         let handles: Vec<_> = (0..WRITERS)
             .map(|id| {
@@ -963,7 +989,7 @@ mod tests {
         let hook: CommitHook = Box::new(move |bytes| {
             observed.store(u64::from_ne_bytes(bytes.try_into().unwrap()), Ordering::SeqCst);
         });
-        let channel = Channel::new("clock", Kind::State, spec(8), 0, 1, Some(hook));
+        let channel = Channel::new("clock", Kind::State, spec(8), 0, 1, Some(hook)).unwrap();
         let mut writer = Writer::default();
         channel.set_stale(true);
         write_u64(&channel, &mut writer, 42);

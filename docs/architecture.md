@@ -214,6 +214,7 @@ channel: `commits`, `drops`, `stale`, `stale_reads`, `lag`, readers and writers;
 | payload size | 1 MiB, alignment at most 64 |
 | event queue depth | at most 65536 |
 | readers per channel | `max_readers`, default 8, at most 64 |
+| memory of one channel | 64 MiB of slots (`queue_depth` times the rounded slot size, or `max_readers + 2` slots) |
 | workers | 1 to 64 |
 | shortest period | 100 microseconds |
 | shortest hang limit | 20 ms |

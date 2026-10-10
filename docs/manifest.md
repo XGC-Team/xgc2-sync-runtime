@@ -55,7 +55,7 @@ this table only sets capacities for channels with these names.
 |---|---|
 | `name` | Channel name. |
 | `depth` | Event channels: queue length, 1 to 65536; at least what every port bound to the channel asks for (without this key the largest `queue_depth` among the manifest's ports is used). |
-| `max_readers` | Readers that can be attached at the same time, 1 to 64 (default 8). A state channel has `max_readers + 2` slots. |
+| `max_readers` | Readers that can be attached at the same time, 1 to 64 (default 8). A state channel has `max_readers + 2` slots. The slots of one channel may take at most 64 MiB. |
 
 ## `[[instance]]`
 

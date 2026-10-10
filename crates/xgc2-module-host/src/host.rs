@@ -229,9 +229,9 @@ impl ModuleHost {
             let mut planner = Planner::new(BTreeMap::new(), options.hints.clone());
             planner.add_clock_channel(&name);
             let spec = &planner.specs()[&name];
-            topology
-                .channels
-                .insert(name.clone(), Channel::new(&name, spec.kind, spec.payload.clone(), spec.depth, spec.max_readers, Some(hook)));
+            let channel = Channel::new(&name, spec.kind, spec.payload.clone(), spec.depth, spec.max_readers, Some(hook))
+                .map_err(HostError::Unavailable)?;
+            topology.channels.insert(name.clone(), channel);
         }
         let core = Arc::new(Core {
             hints: RwLock::new(options.hints.clone()),
@@ -461,22 +461,27 @@ impl ModuleHost {
         topo.channels.retain(|name, _| counts.contains_key(name) || clock.as_deref() == Some(name.as_str()));
     }
 
-    fn channel_for(topo: &mut Topology, name: &str, spec: &ChannelSpec) -> Arc<Channel> {
-        topo.channels
-            .entry(name.to_owned())
-            .or_insert_with(|| Channel::new(name, spec.kind, spec.payload.clone(), spec.depth, spec.max_readers, None))
-            .clone()
+    fn channel_for(topo: &mut Topology, name: &str, spec: &ChannelSpec) -> Result<Arc<Channel>, HostError> {
+        if let Some(channel) = topo.channels.get(name) {
+            return Ok(channel.clone());
+        }
+        let channel =
+            Channel::new(name, spec.kind, spec.payload.clone(), spec.depth, spec.max_readers, None).map_err(HostError::Unavailable)?;
+        topo.channels.insert(name.to_owned(), channel.clone());
+        Ok(channel)
     }
 
     /// Connect `instance` to the channels of `bindings`, creating channels as planned.
     fn connect(&self, instance: &Instance, bindings: &[(usize, String)], specs: &BTreeMap<String, ChannelSpec>) -> Result<(), HostError> {
         let mut topo = self.topo_mut();
-        let resolved: Vec<(usize, Arc<Channel>)> =
-            bindings.iter().map(|(port, name)| (*port, Self::channel_for(&mut topo, name, &specs[name]))).collect();
-        instance.bind_all(&resolved).map_err(|e| {
+        let resolved: Result<Vec<(usize, Arc<Channel>)>, HostError> =
+            bindings.iter().map(|(port, name)| Self::channel_for(&mut topo, name, &specs[name]).map(|channel| (*port, channel))).collect();
+        let result = resolved.and_then(|resolved| instance.bind_all(&resolved).map_err(HostError::Conflict));
+        if result.is_err() {
+            // Channels created for this attempt must not outlive it.
             self.collect_channels(&mut topo);
-            HostError::Conflict(e)
-        })
+        }
+        result
     }
 
     // ---- instances --------------------------------------------------------------------
@@ -783,6 +788,15 @@ impl ModuleHost {
             instance.unbind(index);
             if let Some(target) = &target {
                 let new = Self::channel_for(&mut self.topo_mut(), target, &specs[target]);
+                let new = match new {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        if let Some(current) = &current {
+                            let _ = instance.bind(index, current.clone());
+                        }
+                        return Err(error);
+                    }
+                };
                 if let Err(message) = instance.bind(index, new) {
                     // Put the old connection back before reporting.
                     if let Some(current) = &current {

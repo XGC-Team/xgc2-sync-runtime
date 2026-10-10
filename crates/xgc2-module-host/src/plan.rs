@@ -6,7 +6,7 @@
 //! port must match kind, schema id, size and align exactly. A state channel has one writer, an
 //! event channel any number. Reader and queue capacity are fixed when the channel is created.
 
-use crate::channel::{Kind, PayloadSpec};
+use crate::channel::{arena_bytes, Kind, PayloadSpec, MAX_ARENA_BYTES};
 use crate::loader::{Dir, PortSpec};
 use std::collections::{BTreeMap, HashMap};
 
@@ -140,17 +140,18 @@ impl Planner {
             if hint.depth.is_some() && port.kind == Kind::State {
                 return Err(format!("{who}: depth applies to event channels only"));
             }
+            let max_readers = hint.max_readers.unwrap_or(DEFAULT_MAX_READERS);
+            let bytes = arena_bytes(port.kind, port.payload.size, depth, max_readers);
+            if bytes > MAX_ARENA_BYTES {
+                return Err(format!(
+                    "{who}: the channel would need {} MiB of slots; the limit is {} MiB",
+                    bytes >> 20,
+                    MAX_ARENA_BYTES >> 20
+                ));
+            }
             self.specs.insert(
                 channel.to_owned(),
-                ChannelSpec {
-                    kind: port.kind,
-                    payload: port.payload.clone(),
-                    depth,
-                    max_readers: hint.max_readers.unwrap_or(DEFAULT_MAX_READERS),
-                    writers: 0,
-                    readers: 0,
-                    keep: false,
-                },
+                ChannelSpec { kind: port.kind, payload: port.payload.clone(), depth, max_readers, writers: 0, readers: 0, keep: false },
             );
         }
         let spec = self.specs.get_mut(channel).expect("channel exists");
@@ -289,6 +290,20 @@ mod tests {
         assert!(plan.bind("c", &port("ev", Dir::In, Kind::Event, "e.v1", 8, 4), "e").unwrap_err().contains("readers"));
         assert!(plan.bind("a", &out, "low").unwrap_err().contains("below the 4"));
         assert!(plan.bind("a", &port("o", Dir::Out, Kind::State, "s.v1", 8, 0), "s").unwrap_err().contains("event channels only"));
+    }
+
+    #[test]
+    fn a_channel_cannot_ask_for_an_unbounded_arena() {
+        let hints = HashMap::new();
+        let mut plan = planner(&hints);
+        // 65536 events of 1 MiB would be 64 GiB.
+        let huge = PortSpec { queue_depth: 65_536, ..port("ev", Dir::Out, Kind::Event, "e.v1", 1 << 20, 65_536) };
+        let error = plan.bind("a", &huge, "e").unwrap_err();
+        assert!(error.contains("MiB of slots") && error.contains("limit is 64 MiB"), "{error}");
+        assert!(plan.specs().is_empty());
+        // 256 events of 64 KiB are 16 MiB: fine.
+        let fine = port("ev", Dir::Out, Kind::Event, "e.v1", 64 << 10, 256);
+        plan.bind("a", &fine, "e").unwrap();
     }
 
     #[test]
