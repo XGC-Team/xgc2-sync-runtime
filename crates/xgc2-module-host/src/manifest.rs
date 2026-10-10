@@ -158,13 +158,14 @@ impl Manifest {
     pub fn parse(text: &str, base: &Path) -> Result<Manifest, ManifestError> {
         let mut manifest: Manifest =
             toml::from_str(text).map_err(|e| ManifestError { problems: vec![e.to_string().trim_end().to_owned()] })?;
+        // An empty path stays empty so that validation can name it.
         for module in &mut manifest.modules {
-            if module.path.is_relative() {
+            if module.path.is_relative() && !module.path.as_os_str().is_empty() {
                 module.path = base.join(&module.path);
             }
         }
         if let Some(socket) = manifest.control.socket.as_mut() {
-            if socket.is_relative() {
+            if socket.is_relative() && !socket.as_os_str().is_empty() {
                 *socket = base.join(&*socket);
             }
         }
@@ -191,6 +192,9 @@ impl Manifest {
             if value == Some(0) {
                 note(format!("host.{key} must be positive"));
             }
+        }
+        if self.control.socket.as_ref().is_some_and(|socket| socket.as_os_str().is_empty()) {
+            note("control.socket is empty".into());
         }
         match (self.clock.mode.as_deref().unwrap_or("steady"), &self.clock.channel) {
             ("steady", None) => {}

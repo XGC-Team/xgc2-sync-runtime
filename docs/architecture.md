@@ -5,19 +5,20 @@ hot-plug, the clock and the control plane. The module ABI itself is `include/xgc
 [manifest.md](manifest.md) and the control endpoints in [control-api.md](control-api.md).
 
 ```text
-                     one process = one entity
- ┌──────────────────────────────────────────────────────────────────────────┐
- │  worker pool (min(4, cores) threads)          timer thread (deadline heap, │
- │   runs one task per instance, serially         watchdog tick every 10 ms)  │
- │                                                                            │
- │   ┌───────────┐  state / event channels  ┌────────────┐   ┌─────────────┐ │
- │   │ reference ├─────────────────────────▶│ controller ├──▶│  ROS edge   │─┼─▶ ROS
- │   └───────────┘   slots written in place │ (module)   │   │  (module)   │◀┼── ROS
- │        ▲          and read in place      └────────────┘   └─────────────┘ │
- │        └───────────────── events ───────────────────────────────┘         │
- │                                                                            │
- │  control plane: XRPC http.v1 on a Unix socket   describe / health / hot-plug │
- └──────────────────────────────────────────────────────────────────────────┘
+                    one process = one entity
++---------------------------------------------------------------------------+
+| worker pool: min(4, cores) threads, one serial task per instance          |
+| timer thread: period timers (deadline heap) and the 10 ms watchdog tick   |
+|                                                                           |
+|  +-----------+ state  +------------+ state  +----------+  ROS             |
+|  | reference |------->| controller |------->| ROS edge |<-----> robot     |
+|  +-----------+        +------------+        +----------+                  |
+|        ^  events: requests                       |                        |
+|        +-----------------------------------------+                        |
+|                                                                           |
+| channel slots are written in place and read in place: nothing is copied   |
+| control plane: XRPC http.v1 on a Unix socket (describe, health, hot-plug) |
++---------------------------------------------------------------------------+
 ```
 
 ## Source map
