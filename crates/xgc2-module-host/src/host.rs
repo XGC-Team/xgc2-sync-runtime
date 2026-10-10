@@ -8,7 +8,7 @@
 
 use crate::channel::{Channel, CommitHook};
 use crate::clock::{Clock, Mode};
-use crate::instance::{lock, Completion, Env, Health, Instance, OpKind, Params, PortRt, State};
+use crate::instance::{lock, Completion, Env, Instance, OpKind, Params, State};
 use crate::loader::{self, Dir, Module};
 use crate::log::Level;
 use crate::log_at;
@@ -16,7 +16,7 @@ use crate::names;
 use crate::plan::{port_channels, ChannelSpec, Hint, Planner};
 use crate::scheduler::{Runner, Scheduler, Taken, Worker, MAX_INSTANCES};
 use crate::timers::Timers;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
@@ -150,20 +150,20 @@ pub fn check_limits(budget_ns: i64, hang_ns: i64) -> Result<(), String> {
 /// Port to channel bindings of a replacement, and the channel specs once they are applied.
 type ReplacementPlan = (Vec<(usize, String)>, BTreeMap<String, ChannelSpec>);
 
-struct Topology {
-    modules: BTreeMap<String, Arc<Module>>,
-    slots: Vec<Option<Arc<Instance>>>,
+pub(crate) struct Topology {
+    pub(crate) modules: BTreeMap<String, Arc<Module>>,
+    pub(crate) slots: Vec<Option<Arc<Instance>>>,
     names: HashMap<String, u32>,
     /// Instance slots in the order they were added.
-    order: Vec<u32>,
-    channels: BTreeMap<String, Arc<Channel>>,
+    pub(crate) order: Vec<u32>,
+    pub(crate) channels: BTreeMap<String, Arc<Channel>>,
 }
 
-struct Core {
-    options: HostOptions,
-    started: Instant,
-    clock: Arc<Clock>,
-    sched: Arc<Scheduler>,
+pub(crate) struct Core {
+    pub(crate) options: HostOptions,
+    pub(crate) started: Instant,
+    pub(crate) clock: Arc<Clock>,
+    pub(crate) sched: Arc<Scheduler>,
     timers: Arc<Timers>,
     timer_thread: Mutex<Option<JoinHandle<()>>>,
     topo: RwLock<Topology>,
@@ -197,14 +197,7 @@ impl Runner for Core {
 /// Handle to a running host. Cloning is cheap; `shutdown` stops it for every clone.
 #[derive(Clone)]
 pub struct ModuleHost {
-    core: Arc<Core>,
-}
-
-fn bound_channel(port: &PortRt) -> Option<Arc<Channel>> {
-    match &*lock(&port.io) {
-        crate::instance::PortIo::Unbound => None,
-        crate::instance::PortIo::Out { channel, .. } | crate::instance::PortIo::In { channel, .. } => Some(channel.clone()),
-    }
+    pub(crate) core: Arc<Core>,
 }
 
 impl ModuleHost {
@@ -271,7 +264,7 @@ impl ModuleHost {
         self.core.clock.mode()
     }
 
-    fn topo(&self) -> RwLockReadGuard<'_, Topology> {
+    pub(crate) fn topo(&self) -> RwLockReadGuard<'_, Topology> {
         self.core.topo.read().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -379,7 +372,7 @@ impl ModuleHost {
             return Err(HostError::Conflict(format!("a module named {handle} is already loaded; pass another name")));
         }
         let module = Arc::new(module);
-        let info = module_json(&handle, &module, &[], false);
+        let info = crate::observe::module_json(&handle, &module, &[], false);
         log_at!(Level::Info, "host", "loaded module {handle} ({} {}) from {}", module.name, module.version, module.canonical.display());
         topo.modules.insert(handle, module);
         Ok(info)
@@ -429,7 +422,7 @@ impl ModuleHost {
         let mut counts: HashMap<String, (u32, u32)> = HashMap::new();
         for instance in topo.slots.iter().flatten() {
             for port in &instance.ports {
-                if let Some(channel) = bound_channel(port) {
+                if let Some(channel) = port.bound_channel() {
                     let entry = counts.entry(channel.name().to_owned()).or_default();
                     match port.spec.dir {
                         Dir::Out => entry.0 += 1,
@@ -645,7 +638,7 @@ impl ModuleHost {
         let topo = self.topo();
         let mut planner = self.planner(self.topology_specs(&topo));
         for port in &old.ports {
-            if let Some(channel) = bound_channel(port) {
+            if let Some(channel) = port.bound_channel() {
                 planner.unbind(&port.spec, channel.name());
             }
         }
@@ -668,7 +661,7 @@ impl ModuleHost {
                 .iter()
                 .flatten()
                 .filter(|other| other.idx != old.idx)
-                .any(|other| other.ports.iter().any(|p| bound_channel(p).is_some_and(|c| Arc::ptr_eq(&c, &channel))));
+                .any(|other| other.ports.iter().any(|p| p.bound_channel().is_some_and(|c| Arc::ptr_eq(&c, &channel))));
             if shared {
                 return Err(HostError::Invalid(format!(
                     "cannot replace {name}: module {} has no port {} but channel {} connects it to other instances",
@@ -813,185 +806,6 @@ impl ModuleHost {
         result
     }
 
-    // ---- observation ------------------------------------------------------------------
-
-    fn readiness(&self, topo: &Topology) -> (bool, Vec<String>, Vec<Value>) {
-        let mut reasons = Vec::new();
-        let mut summaries = Vec::new();
-        let mut producers: HashMap<String, usize> = HashMap::new();
-        for instance in topo.slots.iter().flatten() {
-            if instance.state() == State::Running && instance.health() != Health::Failed {
-                for port in instance.ports.iter().filter(|p| p.spec.dir == Dir::Out) {
-                    if let Some(channel) = bound_channel(port) {
-                        *producers.entry(channel.name().to_owned()).or_default() += 1;
-                    }
-                }
-            }
-        }
-        for idx in &topo.order {
-            let Some(instance) = &topo.slots[*idx as usize] else { continue };
-            let mut missing = Vec::new();
-            for port in instance.ports.iter().filter(|p| p.spec.dir == Dir::In && p.spec.required) {
-                match bound_channel(port) {
-                    None => missing.push(format!("required input {} is not bound", port.spec.name)),
-                    Some(channel) if !producers.contains_key(channel.name()) => {
-                        missing.push(format!("required input {} (channel {}) has no running producer", port.spec.name, channel.name()))
-                    }
-                    Some(_) => {}
-                }
-            }
-            let running = instance.state() == State::Running && instance.health() != Health::Failed;
-            if instance.required {
-                if !running {
-                    reasons.push(format!("instance {} is {}", instance.name, instance.state().as_str()));
-                }
-                for message in &missing {
-                    reasons.push(format!("instance {}: {message}", instance.name));
-                }
-            }
-            summaries.push(json!({
-                "name": instance.name,
-                "module": instance.module_handle,
-                "state": instance.state().as_str(),
-                "health": instance.health().as_str(),
-                "required": instance.required,
-                "ready": running && missing.is_empty(),
-                "missing": missing,
-            }));
-        }
-        if !self.core.clock.valid() {
-            reasons.push("the external clock has not published a time yet".to_owned());
-        }
-        (reasons.is_empty(), reasons, summaries)
-    }
-
-    fn clock_json(&self) -> Value {
-        json!({
-            "mode": self.core.clock.mode().as_str(),
-            "valid": self.core.clock.valid(),
-            "now_ns": self.core.clock.now_ns(),
-            "channel": self.core.options.clock.channel,
-        })
-    }
-
-    /// Identity and readiness facts for `GET /v1/describe` (the control plane adds the
-    /// service envelope): ready means every required instance is running and every required
-    /// input of those has a running producer.
-    pub fn describe(&self) -> (bool, Value) {
-        let topo = self.topo();
-        let (ready, reasons, instances) = self.readiness(&topo);
-        let facts = json!({
-            "entity": self.core.options.entity,
-            "host_version": env!("CARGO_PKG_VERSION"),
-            "abi": {"major": crate::abi::ABI_MAJOR, "minor": crate::abi::ABI_MINOR},
-            "clock": self.clock_json(),
-            "instances": instances,
-            "modules": topo.modules.keys().collect::<Vec<_>>(),
-            "not_ready": reasons,
-        });
-        (ready, facts)
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.describe().0
-    }
-
-    pub fn health(&self) -> Value {
-        let topo = self.topo();
-        let (configured, live, abandoned) = self.core.sched.worker_counts();
-        let instances: Vec<Value> =
-            topo.order.iter().filter_map(|idx| topo.slots[*idx as usize].as_ref()).map(|i| self.instance_health(i)).collect();
-        let channels: Vec<Value> = topo.channels.values().map(|channel| channel_json(channel)).collect();
-        json!({
-            "entity": self.core.options.entity,
-            "uptime_ms": self.core.started.elapsed().as_millis() as u64,
-            "clock": self.clock_json(),
-            "workers": {"configured": configured, "live": live, "abandoned": abandoned},
-            "instances": instances,
-            "channels": channels,
-        })
-    }
-
-    pub fn modules(&self) -> Value {
-        let topo = self.topo();
-        let list: Vec<Value> = topo
-            .modules
-            .iter()
-            .map(|(handle, module)| {
-                let users: Vec<String> = topo
-                    .slots
-                    .iter()
-                    .flatten()
-                    .filter(|instance| Arc::ptr_eq(&instance.module, module))
-                    .map(|instance| instance.name.clone())
-                    .collect();
-                module_json(handle, module, &users, module.pinned.load(Ordering::Acquire))
-            })
-            .collect();
-        json!({"modules": list})
-    }
-
-    fn instance_json(&self, instance: &Instance) -> Value {
-        let params = instance.params();
-        json!({
-            "name": instance.name,
-            "module": instance.module_handle,
-            "state": instance.state().as_str(),
-            "health": instance.health().as_str(),
-            "required": instance.required,
-            "period_ns": params.period_ns,
-            "step_budget_ns": params.step_budget_ns,
-            "hang_limit_ns": params.hang_limit_ns,
-        })
-    }
-
-    fn instance_health(&self, instance: &Instance) -> Value {
-        let params = instance.params();
-        let cell = self.core.sched.cell(instance.idx);
-        let report = instance.report();
-        let ports: Vec<Value> = instance
-            .ports
-            .iter()
-            .map(|port| {
-                json!({
-                    "name": port.spec.name,
-                    "dir": if port.spec.dir == Dir::In { "in" } else { "out" },
-                    "kind": port.spec.kind.as_str(),
-                    "schema": port.spec.payload.schema,
-                    "required": port.spec.required,
-                    "channel": bound_channel(port).map(|c| c.name().to_owned()),
-                })
-            })
-            .collect();
-        let stats = &instance.stats;
-        json!({
-            "name": instance.name,
-            "module": instance.module_handle,
-            "library": {"name": instance.module.name, "version": instance.module.version, "sha256": instance.module.sha256},
-            "state": instance.state().as_str(),
-            "health": instance.health().as_str(),
-            "required": instance.required,
-            "last_error": instance.last_error(),
-            "reported": {"health": report.health, "detail": report.detail},
-            "period_ns": params.period_ns,
-            "step_budget_ns": params.step_budget_ns,
-            "hang_limit_ns": params.hang_limit_ns,
-            "steps": stats.steps.load(Ordering::Relaxed),
-            "step_time": stats.step_time.summary(),
-            "handoff_latency": stats.handoff.summary(),
-            "wakeups": cell.wakes.load(Ordering::Relaxed),
-            "input_commits": cell.dirty_commits.load(Ordering::Relaxed),
-            "coalesced_dirties": cell.coalesced.load(Ordering::Relaxed),
-            "timer_fires": cell.timer_fires.load(Ordering::Relaxed),
-            "missed_periods": cell.missed_periods.load(Ordering::Relaxed),
-            "overruns": stats.overruns.load(Ordering::Relaxed),
-            "step_errors": stats.step_errors.load(Ordering::Relaxed),
-            "spurious_wakeups": stats.spurious.load(Ordering::Relaxed),
-            "misuse": stats.misuse.load(Ordering::Relaxed),
-            "ports": ports,
-        })
-    }
-
     // ---- shutdown ---------------------------------------------------------------------
 
     /// Stop every instance (newest first), destroy it and stop the threads. Idempotent.
@@ -1021,56 +835,4 @@ impl ModuleHost {
         }
         self.core.sched.shutdown(Duration::from_secs(2));
     }
-}
-
-fn channel_json(channel: &Channel) -> Value {
-    let info = channel.info();
-    json!({
-        "name": info.name,
-        "kind": info.kind.as_str(),
-        "schema": info.spec.schema,
-        "size": info.spec.size,
-        "align": info.spec.align,
-        "depth": info.depth,
-        "max_readers": info.max_readers,
-        "readers": info.readers,
-        "writers": info.writers,
-        "commits": info.commits,
-        "drops": info.drops,
-        "stale": info.stale,
-        "stale_reads": info.stale_reads,
-        "lag": info.lag,
-        "stalls": info.stalls,
-    })
-}
-
-fn module_json(handle: &str, module: &Module, instances: &[String], pinned: bool) -> Value {
-    let ports: Vec<Value> = module
-        .ports
-        .iter()
-        .map(|port| {
-            json!({
-                "name": port.name,
-                "dir": if port.dir == Dir::In { "in" } else { "out" },
-                "kind": port.kind.as_str(),
-                "schema": port.payload.schema,
-                "size": port.payload.size,
-                "align": port.payload.align,
-                "queue_depth": port.queue_depth,
-                "required": port.required,
-                "async_writer": port.async_writer,
-            })
-        })
-        .collect();
-    json!({
-        "module": handle,
-        "name": module.name,
-        "version": module.version,
-        "path": module.canonical,
-        "sha256": module.sha256,
-        "abi": format!("{}.{}", crate::abi::ABI_MAJOR, module.abi_minor),
-        "ports": ports,
-        "instances": instances,
-        "pinned": pinned,
-    })
 }

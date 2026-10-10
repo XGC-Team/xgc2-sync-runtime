@@ -20,6 +20,22 @@ hot-plug, the clock and the control plane. The module ABI itself is `include/xgc
  └──────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Source map
+
+| File (`crates/xgc2-module-host/src/`) | Responsibility |
+|---|---|
+| `abi.rs` | Rust mirror of `include/xgc2/module.h`; its layout is checked against the C compiler in `tests/abi_layout.rs` |
+| `loader.rs` | sha256 pin, `dlopen`, descriptor validation |
+| `channel.rs` | slot arenas, state and event channels, pins and cursors |
+| `scheduler.rs` | worker pool, per-instance cells, dirty bits, run-next, watchdog |
+| `timers.rs` | deadline heap, period timers, external clock hook |
+| `clock.rs`, `metrics.rs`, `log.rs`, `names.rs` | host clock, latency histogram, logger, identifier grammars |
+| `instance.rs`, `api.rs` | one module instance (lifecycle operations, steps, budgets, isolation) and the host function table it gives the module |
+| `plan.rs` | which ports may share a channel (used by the manifest, the control plane and `--check`) |
+| `host.rs`, `observe.rs` | topology and the hot-plug operations; `describe`, `health`, `modules` |
+| `manifest.rs`, `launch.rs` | the TOML manifest; start from it, or check it |
+| `control.rs`, `main.rs` | XRPC control plane; the binary |
+
 ## Data
 
 **Channels.** Every output port writes into a channel; every input port reads one. A channel carries one payload type,

@@ -186,6 +186,16 @@ pub struct PortRt {
     pub io: Mutex<PortIo>,
 }
 
+impl PortRt {
+    /// The channel this port is bound to.
+    pub fn bound_channel(&self) -> Option<Arc<Channel>> {
+        match &*lock(&self.io) {
+            PortIo::Unbound => None,
+            PortIo::Out { channel, .. } | PortIo::In { channel, .. } => Some(channel.clone()),
+        }
+    }
+}
+
 /// Delivers input commits of one instance to the scheduler.
 pub struct InputWake {
     sched: Arc<Scheduler>,
@@ -380,10 +390,7 @@ impl Instance {
 
     /// Channel a port is bound to.
     pub fn bound_channel(&self, port: usize) -> Option<Arc<Channel>> {
-        match &*lock(&self.ports[port].io) {
-            PortIo::Unbound => None,
-            PortIo::Out { channel, .. } | PortIo::In { channel, .. } => Some(channel.clone()),
-        }
+        self.ports[port].bound_channel()
     }
 
     // ---- binding (control plane; the instance is paused or not yet started) -----------

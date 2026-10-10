@@ -15,6 +15,7 @@ pub mod log;
 pub mod manifest;
 pub mod metrics;
 pub mod names;
+pub mod observe;
 pub mod plan;
 pub mod scheduler;
 pub mod timers;

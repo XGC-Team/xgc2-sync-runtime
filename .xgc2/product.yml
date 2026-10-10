@@ -30,7 +30,7 @@ usage:
     serves Ubuntu 18.04, 20.04 and 24.04. Products ship their own modules (shared libraries that
     export xgc2_module_v2) and their own entity manifests; this product contains no domain logic.
     One host process runs one entity; the control plane is XRPC http.v1 on a Unix socket named in
-    the manifest or by --control-socket. Formerly xgc2-sync-runtime.
+    the manifest or by --control-socket.
 ownership:
   paths:
   - /usr/include/xgc2/module.h
