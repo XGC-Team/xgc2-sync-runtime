@@ -4,7 +4,8 @@
  *  - events of each producer arrive in order;
  *  - the same step reads the same state sample twice.
  * `work_us` simulates a slow consumer. `latency_file` receives the nanoseconds between each
- * sample's commit and the start of the step that read it (state input only). */
+ * sample's commit stamp and the start of the step that read it; `origin_file` the nanoseconds
+ * since the payload's `committed_ns`, which a pass-through stage preserves (state input only). */
 #include "common.h"
 
 #define MAX_PRODUCERS 16
@@ -14,13 +15,14 @@ typedef struct instance {
   const xgc2_host_api* host;
   void* ctx;
   long work_us;
-  char latency_file[256];
+  uint64_t report_every;
+  char latency_file[256], origin_file[256];
   uint64_t steps, state_updates, bad_seq, zero_copy_bad, repeat_bad, wrong_size;
   uint64_t events, event_disorder, event_gaps, no_input_steps;
   uint64_t last_state_seq, last_producer;
   uint64_t last_event[MAX_PRODUCERS];
   uint64_t config_steps, wake_steps, timer_steps;
-  int64_t* latencies;
+  int64_t *latencies, *origins;
   uint64_t latency_count;
 } instance;
 
@@ -33,6 +35,7 @@ static const xgc2_port_desc PORTS[] = {
 
 static void apply(instance* self, const xgc2_config* config) {
   self->work_us = (long)cfg_number(config, "work_us", 0);
+  self->report_every = (uint64_t)cfg_number(config, "report_every", 1);
 }
 
 static xgc2_status create(const xgc2_host_api* host, void* ctx, const xgc2_config* config, xgc2_instance** out) {
@@ -42,7 +45,9 @@ static xgc2_status create(const xgc2_host_api* host, void* ctx, const xgc2_confi
   self->ctx = ctx;
   apply(self, config);
   cfg_string(config, "latency_file", self->latency_file, sizeof self->latency_file);
+  cfg_string(config, "origin_file", self->origin_file, sizeof self->origin_file);
   if (self->latency_file[0]) self->latencies = (int64_t*)malloc(MAX_LATENCIES * sizeof(int64_t));
+  if (self->origin_file[0]) self->origins = (int64_t*)malloc(MAX_LATENCIES * sizeof(int64_t));
   *out = (xgc2_instance*)self;
   return XGC2_OK;
 }
@@ -93,8 +98,10 @@ static xgc2_status step(xgc2_instance* handle, const xgc2_step_ctx* step_ctx) {
     if (view.seq > self->last_state_seq) {
       self->state_updates++;
       if ((uint64_t)(uintptr_t)view.data != sample->addr) self->zero_copy_bad++;
-      if (self->latencies && self->latency_count < MAX_LATENCIES) {
-        self->latencies[self->latency_count++] = step_ctx->now_ns - view.stamp_ns;
+      if (self->latency_count < MAX_LATENCIES) {
+        if (self->latencies) self->latencies[self->latency_count] = step_ctx->now_ns - view.stamp_ns;
+        if (self->origins) self->origins[self->latency_count] = step_ctx->now_ns - sample->committed_ns;
+        if (self->latencies || self->origins) self->latency_count++;
       }
     }
     self->last_state_seq = view.seq;
@@ -116,26 +123,30 @@ static xgc2_status step(xgc2_instance* handle, const xgc2_step_ctx* step_ctx) {
       self->last_event[event->producer] = event->seq;
     }
   }
-  publish(self);
+  if (self->report_every && self->steps % self->report_every == 0) publish(self);
   if (self->work_us > 0) pause_us(self->work_us);
   return XGC2_OK;
 }
 
+static void dump(const char* path, const int64_t* values, uint64_t count) {
+  FILE* file = path[0] && values ? fopen(path, "wb") : NULL;
+  if (!file) return;
+  fwrite(values, sizeof(int64_t), count, file);
+  fclose(file);
+}
+
 static xgc2_status stop(xgc2_instance* handle) {
   instance* self = (instance*)handle;
-  if (self->latencies && self->latency_file[0]) {
-    FILE* file = fopen(self->latency_file, "wb");
-    if (file) {
-      fwrite(self->latencies, sizeof(int64_t), self->latency_count, file);
-      fclose(file);
-    }
-  }
+  dump(self->latency_file, self->latencies, self->latency_count);
+  dump(self->origin_file, self->origins, self->latency_count);
+  self->latency_count = 0;
   return XGC2_OK;
 }
 
 static void destroy(xgc2_instance* handle) {
   instance* self = (instance*)handle;
   free(self->latencies);
+  free(self->origins);
   free(self);
 }
 

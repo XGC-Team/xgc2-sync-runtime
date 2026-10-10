@@ -17,7 +17,7 @@ use crate::scheduler::{Scheduler, Taken, Worker, REASON_INPUT, REASON_OPS, REASO
 use crate::timers::{Timers, MIN_PERIOD_NS};
 use std::collections::VecDeque;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,13 @@ pub struct Params {
     pub period_ns: i64,
     pub step_budget_ns: i64,
     pub hang_limit_ns: i64,
+}
+
+/// Period and budgets of an instance, readable without a lock.
+pub struct Timing {
+    period_ns: AtomicI64,
+    step_budget_ns: AtomicI64,
+    hang_limit_ns: AtomicI64,
 }
 
 pub enum OpKind {
@@ -231,7 +238,10 @@ pub struct Instance {
     pub ports: Vec<PortRt>,
     pub stats: Stats,
     env: Env,
-    params: Mutex<Params>,
+    /// JSON object text of the current configuration.
+    config: Mutex<String>,
+    /// Period and budgets are read on every step, so they are plain atomics.
+    timing: Timing,
     state: AtomicU8,
     last_error: Mutex<Option<String>>,
     handle: AtomicPtr<abi::Instance>,
@@ -239,6 +249,8 @@ pub struct Instance {
     /// Completion of the operation being executed, so isolation can fail it.
     inflight: Mutex<Option<Arc<Completion>>>,
     config_applied: AtomicBool,
+    /// The module's `start` returned OK and `stop` has not been called since.
+    started: AtomicBool,
     changed: AtomicU64,
     step_index: AtomicU64,
     wake: Arc<InputWake>,
@@ -276,13 +288,19 @@ impl Instance {
             stats: Stats::default(),
             wake: Arc::new(InputWake { sched: env.sched.clone(), idx, generation }),
             env,
-            params: Mutex::new(params),
+            config: Mutex::new(params.config_json),
+            timing: Timing {
+                period_ns: AtomicI64::new(params.period_ns),
+                step_budget_ns: AtomicI64::new(params.step_budget_ns),
+                hang_limit_ns: AtomicI64::new(params.hang_limit_ns),
+            },
             state: AtomicU8::new(State::New as u8),
             last_error: Mutex::new(None),
             handle: AtomicPtr::new(std::ptr::null_mut()),
             ops: Mutex::new(VecDeque::new()),
             inflight: Mutex::new(None),
             config_applied: AtomicBool::new(false),
+            started: AtomicBool::new(false),
             changed: AtomicU64::new(0),
             step_index: AtomicU64::new(0),
             report: Mutex::new(Report::default()),
@@ -301,12 +319,20 @@ impl Instance {
         self.state.store(state as u8, Ordering::Release);
     }
 
+    /// Snapshot of the configuration and timing (control plane only).
     pub fn params(&self) -> Params {
-        lock(&self.params).clone()
+        Params {
+            config_json: lock(&self.config).clone(),
+            period_ns: self.timing.period_ns.load(Ordering::Relaxed),
+            step_budget_ns: self.timing.step_budget_ns.load(Ordering::Relaxed),
+            hang_limit_ns: self.timing.hang_limit_ns.load(Ordering::Relaxed),
+        }
     }
 
-    pub fn set_params(&self, change: impl FnOnce(&mut Params)) {
-        change(&mut lock(&self.params));
+    /// New budgets, applied from the next step on.
+    pub fn set_limits(&self, step_budget_ns: i64, hang_limit_ns: i64) {
+        self.timing.step_budget_ns.store(step_budget_ns, Ordering::Relaxed);
+        self.timing.hang_limit_ns.store(hang_limit_ns, Ordering::Relaxed);
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -597,7 +623,7 @@ impl Instance {
 
     pub fn set_period_ns(&self, period_ns: i64) {
         let period_ns = if period_ns <= 0 { 0 } else { period_ns.max(MIN_PERIOD_NS) };
-        self.set_params(|params| params.period_ns = period_ns);
+        self.timing.period_ns.store(period_ns, Ordering::Relaxed);
         if self.state() == State::Running {
             if period_ns == 0 {
                 self.env.timers.disarm(self.idx);
@@ -633,7 +659,7 @@ impl Instance {
     }
 
     fn lifecycle_limit(&self) -> i64 {
-        self.params().hang_limit_ns.max(LIFECYCLE_MIN_LIMIT_NS)
+        self.timing.hang_limit_ns.load(Ordering::Relaxed).max(LIFECYCLE_MIN_LIMIT_NS)
     }
 
     /// Stop dispatching steps; outputs go stale; readers detach so they cannot hold writers
@@ -729,7 +755,7 @@ impl Instance {
                 if state != State::New {
                     return Err(format!("cannot create an instance in state {}", state.as_str()));
                 }
-                let json = CString::new(self.params().config_json).map_err(|_| "configuration contains a NUL byte".to_owned())?;
+                let json = CString::new(lock(&self.config).clone()).map_err(|_| "configuration contains a NUL byte".to_owned())?;
                 let config = abi::Config { json: json.as_ptr(), length: json.as_bytes().len() };
                 let mut created: *mut abi::Instance = std::ptr::null_mut();
                 let ctx = self.host_ctx();
@@ -760,7 +786,7 @@ impl Instance {
                 // SAFETY: handle was returned by create; calls are serial on this task.
                 let status = worker.guard(self.idx, limit, || unsafe { (vtable.configure)(handle, &config) });
                 call_status(status, "configure")?;
-                self.set_params(|params| params.config_json = json);
+                *lock(&self.config) = json;
                 self.config_applied.store(true, Ordering::Release);
                 Ok(())
             }
@@ -768,8 +794,12 @@ impl Instance {
                 match state {
                     State::Created | State::Stopped => {}
                     State::Running => return Ok(()),
+                    State::Failed => return Err("the instance failed; stop it before starting it again".into()),
                     other => return Err(format!("cannot start an instance in state {}", other.as_str())),
                 }
+                self.over_budget.store(false, Ordering::Release);
+                self.reported_health.store(abi::HEALTH_OK, Ordering::Release);
+                *lock(&self.last_error) = None;
                 self.set_state(State::Starting);
                 if let Err(message) = self.attach_inputs() {
                     self.set_state(State::Failed);
@@ -787,11 +817,13 @@ impl Instance {
                     self.fail_with(message.clone());
                     return Err(message);
                 }
-                self.over_budget.store(false, Ordering::Release);
-                self.reported_health.store(abi::HEALTH_OK, Ordering::Release);
-                *lock(&self.last_error) = None;
+                self.started.store(true, Ordering::Release);
+                if self.state() == State::Failed {
+                    // The module reported failure from inside start().
+                    return Err(self.last_error().unwrap_or_else(|| "the module reported failure while starting".into()));
+                }
                 self.set_state(State::Running);
-                let period = self.params().period_ns;
+                let period = self.timing.period_ns.load(Ordering::Relaxed);
                 if period > 0 {
                     self.env.timers.arm(self.idx, self.generation, period);
                 }
@@ -810,8 +842,13 @@ impl Instance {
                 self.set_state(State::Stopping);
                 self.env.sched.pause(self.idx);
                 self.env.timers.disarm(self.idx);
-                // SAFETY: as above.
-                let status = worker.guard(self.idx, limit, || unsafe { (vtable.stop)(handle) });
+                // A module whose start failed was never started, so it is not stopped either.
+                let status = if self.started.swap(false, Ordering::AcqRel) {
+                    // SAFETY: as above.
+                    worker.guard(self.idx, limit, || unsafe { (vtable.stop)(handle) })
+                } else {
+                    abi::OK
+                };
                 if worker.abandoned() {
                     return Err("stop did not return".into());
                 }
@@ -881,7 +918,7 @@ impl Instance {
             self.stats.spurious.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let params = self.params();
+        let (budget_ns, hang_ns) = (self.timing.step_budget_ns.load(Ordering::Relaxed), self.timing.hang_limit_ns.load(Ordering::Relaxed));
         let started = steady_ns();
         if changed != 0 && taken.first_dirty_ns != 0 {
             self.stats.handoff.record((started - taken.first_dirty_ns).max(0) as u64);
@@ -892,7 +929,7 @@ impl Instance {
         let handle = self.handle.load(Ordering::Acquire);
         let step = self.module.vtable.step;
         // SAFETY: handle was returned by create; steps are serial on this task.
-        let status = worker.guard(self.idx, params.hang_limit_ns, || unsafe { step(handle, &ctx) });
+        let status = worker.guard(self.idx, hang_ns, || unsafe { step(handle, &ctx) });
         if worker.abandoned() {
             return;
         }
@@ -900,16 +937,10 @@ impl Instance {
         self.end_step_io();
         self.stats.steps.fetch_add(1, Ordering::Relaxed);
         self.stats.step_time.record(elapsed as u64);
-        if elapsed > params.step_budget_ns {
+        if elapsed > budget_ns {
             self.stats.overruns.fetch_add(1, Ordering::Relaxed);
             if !self.over_budget.swap(true, Ordering::AcqRel) {
-                log_at!(
-                    Level::Warn,
-                    &self.name,
-                    "step {index} took {} us, budget {} us: degraded",
-                    elapsed / 1000,
-                    params.step_budget_ns / 1000
-                );
+                log_at!(Level::Warn, &self.name, "step {index} took {} us, budget {} us: degraded", elapsed / 1000, budget_ns / 1000);
             }
         } else if self.over_budget.swap(false, Ordering::AcqRel) {
             log_at!(Level::Info, &self.name, "step time back within budget");

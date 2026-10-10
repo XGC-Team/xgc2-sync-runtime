@@ -10,6 +10,7 @@ typedef struct instance {
   uint64_t counter;
   uint64_t steps;
   uint64_t fail_at;
+  uint64_t report_every;
 } instance;
 
 static const xgc2_port_desc PORTS[] = {
@@ -20,6 +21,7 @@ static void apply(instance* self, const xgc2_config* config) {
   self->producer = (uint64_t)cfg_number(config, "id", 1);
   self->burst = (uint64_t)cfg_number(config, "burst", 1);
   self->fail_at = (uint64_t)cfg_number(config, "fail_at", 0);
+  self->report_every = (uint64_t)cfg_number(config, "report_every", 1);
 }
 
 static xgc2_status create(const xgc2_host_api* host, void* ctx, const xgc2_config* config, xgc2_instance** out) {
@@ -56,10 +58,12 @@ static xgc2_status step(xgc2_instance* handle, const xgc2_step_ctx* step_ctx) {
     self->host->write_commit(self->ctx, 0, sample->committed_ns);
   }
   self->steps++;
-  char detail[96];
-  snprintf(detail, sizeof detail, "{\"steps\":%llu,\"commits\":%llu}", (unsigned long long)self->steps,
-           (unsigned long long)self->counter);
-  self->host->report(self->ctx, XGC2_OK, detail);
+  if (self->report_every && self->steps % self->report_every == 0) {
+    char detail[96];
+    snprintf(detail, sizeof detail, "{\"steps\":%llu,\"commits\":%llu}", (unsigned long long)self->steps,
+             (unsigned long long)self->counter);
+    self->host->report(self->ctx, XGC2_OK, detail);
+  }
   return self->fail_at && self->steps == self->fail_at ? XGC2_ERR_INTERNAL : XGC2_OK;
 }
 

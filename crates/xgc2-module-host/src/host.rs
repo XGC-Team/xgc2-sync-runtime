@@ -611,10 +611,7 @@ impl ModuleHost {
         let budget = budget_ns.unwrap_or(current.step_budget_ns);
         let hang = hang_ns.unwrap_or(current.hang_limit_ns);
         check_limits(budget, hang).map_err(|e| HostError::Invalid(format!("instance {name}: {e}")))?;
-        instance.set_params(|params| {
-            params.step_budget_ns = budget;
-            params.hang_limit_ns = hang;
-        });
+        instance.set_limits(budget, hang);
         if let Some(period) = period_ns {
             instance.set_period_ns(period);
         }
