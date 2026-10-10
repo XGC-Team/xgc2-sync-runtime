@@ -147,7 +147,7 @@ fn vendored_ros_messages_equal_their_originals() {
     .chain(["SceneSnapshot", "SceneObstacle", "ScenePart", "SceneGeometry", "SceneState", "SceneObstacleState"].map(|m| {
         (
             Box::leak(format!("xgc2_geometry_msgs/{m}.msg").into_boxed_str()) as &str,
-            products.join(format!("ros1/simulator/convex_geometry/xgc2_geometry_msgs/msg/{m}.msg")),
+            products.join(format!("ros1/common/ros1-msgs/xgc2_geometry_msgs/msg/{m}.msg")),
         )
     }))
     {
