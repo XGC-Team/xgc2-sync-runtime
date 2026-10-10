@@ -1,7 +1,0 @@
-[package]
-name = "xgc-rt-abi"
-description = "Rust mirror of xgc_rt.h and the safe plugin SDK"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
