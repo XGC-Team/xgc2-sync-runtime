@@ -1,0 +1,2 @@
+# Xgc2Module @PROJECT_VERSION@: header-only SDK of the xgc2-module ABI v2.
+include("${CMAKE_CURRENT_LIST_DIR}/Xgc2ModuleTargets.cmake")

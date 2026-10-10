@@ -405,6 +405,14 @@ pose = "pose"
     }
 
     #[test]
+    fn the_shipped_example_parses() {
+        let manifest = parse(include_str!("../../../docs/examples/entity.toml")).unwrap();
+        assert_eq!((manifest.entity.as_str(), manifest.modules.len(), manifest.instances.len()), ("scout1", 3, 3));
+        assert_eq!(manifest.instance_specs()[0].period_ns, 2_000_000);
+        assert_eq!(manifest.control.socket, Some(PathBuf::from("/run/xgc2/scout1/module.sock")));
+    }
+
+    #[test]
     fn toml_values_convert_to_json() {
         let table: toml::Table =
             toml::from_str("a = 1\nb = 2.5\nc = 'x'\nd = true\ne = 1979-05-27T07:32:00Z\nf = [1, 'a']\n[g]\nh = 1\n").unwrap();
