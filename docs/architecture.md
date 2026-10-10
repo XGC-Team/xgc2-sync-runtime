@@ -193,7 +193,7 @@ channel: `commits`, `drops`, `stale`, `stale_reads`, `lag`, readers and writers;
   (`read_latest`, `read_next`, `changed`) are valid only inside `step`; the views are borrowed until it returns.
 * **Commit as the last thing in a step** and keep steps short: the consumer runs right after the producer's step on the
   same thread. Do not block on another module and do not wait for input in a step; use `wake()` to hand work back.
-* A thread that a module owns may call `wake`, `now_ns` and `log` at any time and the write calls on ports flagged
+* A thread that a module owns may call `wake`, `now_ns`, `log`, `report` and `set_period_ns` at any time and the write calls on ports flagged
   `XGC2_PORT_ASYNC_WRITER` (one writer thread per port). Stop the threads in `stop`; nothing may call the host after
   `destroy` returns.
 * `changed_inputs` numbers the inputs on their own (bit i = i-th input port); every host call takes the index into the

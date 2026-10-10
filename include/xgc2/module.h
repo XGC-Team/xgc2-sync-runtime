@@ -15,7 +15,7 @@
  * - write_begin/write_commit/write_abort may be called from step, or from module-owned threads for
  *   output ports flagged XGC2_PORT_ASYNC_WRITER (one writer thread at a time per port).
  * - read_latest/read_next/changed are only valid inside step; views are borrowed until step returns.
- * - now_ns, wake and log may be called from any thread.
+ * - now_ns, wake, log, report and set_period_ns may be called from any thread.
  *
  * Port numbering: every host API call that takes `port` uses the index into the descriptor's port
  * table (inputs and outputs share one numbering). Only xgc2_step_ctx.changed_inputs numbers the
