@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Functional gates with real C++/ROS dependencies. Missing prerequisites or
+# Replay/equivalence gates with owning C++/ROS dependencies. Missing prerequisites or
 # an environment-skipped Rust test are failures, not successful validation.
 # Source ROS and the freshly built controller workspace first; see
 # docs/validation/native-20260926/README.md. Run tests serially: helpers share
@@ -23,7 +23,11 @@ out="${1:-$root/target/native-gates}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 mkdir -p "$out/bags" "$out/replays"
-export XGC_RECORD_BAG_DIR="$out/bags"
+# The caller supplies recorded flights here; Runtime no longer builds a ROS bridge
+# or launches a live ROS baseline to create these inputs.
+for backend in px4_local dfbc nmpc; do
+  test -r "$out/bags/px4_flight_$backend.bag"
+done
 
 gate() {
   local label="$1" count="$2"
@@ -42,8 +46,6 @@ PY
 
 gate native-equivalence 2 cargo test -p xgc-rt-host \
   --test est_rigid_state --test ctl_dfbc -- --nocapture --test-threads=1
-gate ros-baseline 6 cargo test -p xgc-rt-host \
-  --test ros_io --test ref_trajectory_ros_io --test px4_ros_io -- --nocapture --test-threads=1
 
 python3 "$REF_ROOT/test/replay/make_reference_stream.py" "$out/replays/reference.stream"
 "$ref_replay" "$out/replays/reference.stream" "$out/replays/reference.expected.txt"
@@ -59,6 +61,5 @@ for backend in px4_local dfbc nmpc; do
     PX4_REPLAY_STREAM="$out/replays/$backend.stream" PX4_REPLAY_REF="$out/replays/$backend.expected.txt" \
     cargo test -p xgc-rt-host --test ctl_px4_replay -- --nocapture --test-threads=1
 done
-gate native-composition 5 cargo test -p xgc-rt-host --test ctl_px4_ros_io -- --nocapture --test-threads=1
 sha256sum "$out"/*.log "$out"/replays/* > "$out/SHA256SUMS"
-echo "17 native/ROS functional tests executed; no environment skips. Software plant only."
+echo "6 native equivalence/replay tests executed; no environment skips. Recorded software inputs only."

@@ -1,7 +1,7 @@
 // Test tool: convert the reference trajectory replay stream (ROS-serialized
 // requests, from xgc2-multirotor-controller
 // multirotor_reference_trajectory/test/replay/make_reference_stream.py)
-// into ref-trajectory port payloads, the way ros_io does for live topics.
+// into ref-trajectory port payloads using the owning reference wire codec.
 //
 // Usage: ref_stream_to_xgc IN.stream OUT.xgcstream
 //
@@ -19,7 +19,7 @@
 #include <multirotor_reference_trajectory_msgs/SampledReference.h>
 #include <ros/serialization.h>
 
-#include "reference_wire.hpp"
+#include <multirotor_reference_trajectory/reference_wire.hpp>
 
 namespace msgs = multirotor_reference_trajectory_msgs;
 

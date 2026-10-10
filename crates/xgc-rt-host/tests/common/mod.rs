@@ -120,18 +120,6 @@ pub fn ros_prefix() -> Option<PathBuf> {
     std::env::var_os("ROS_PREFIX").map(PathBuf::from).filter(|p| p.join("include/ros/ros.h").is_file())
 }
 
-pub fn ros_io_lib(prefix: &std::path::Path) -> &'static PathBuf {
-    static LIB: OnceLock<PathBuf> = OnceLock::new();
-    LIB.get_or_init(|| {
-        let out = workspace_root().join("target/plugin-tests/ros");
-        std::fs::create_dir_all(&out).unwrap();
-        let lib = out.join("libros_io.so");
-        let status = std::process::Command::new(workspace_root().join("scripts/build-ros-io.sh")).arg(&lib).env("ROS_PREFIX", prefix).status().unwrap();
-        assert!(status.success(), "building ros_io failed");
-        lib
-    })
-}
-
 /// Consume the owning PX4 controller product's installed native adapter.
 /// The generic Runtime tests load the same artifact as external workspaces;
 /// they do not rebuild a second controller wrapper from Runtime sources.

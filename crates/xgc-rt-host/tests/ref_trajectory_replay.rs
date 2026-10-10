@@ -11,7 +11,9 @@
 //!   REF_CORE_LIB_DIR    dir with libmultirotor_reference_trajectory_core.so
 //!   REF_REPLAY_STREAM   the request stream (make_reference_stream.py output)
 //!   REF_REPLAY_REF      reference_replay_harness output on that stream
-//!   XGC2_PREFIX, REF_ROOT, EIGEN_INCLUDE (as for build-ref-trajectory.sh)
+//!   REFERENCE_TRAJECTORY_NATIVE_LIBRARY installed owning native adapter
+//!   XGC_REFERENCE_WIRE_PREFIX owning reference wire header install prefix
+//!   XGC_ROS_REPLAY_MSGS_INCLUDE owning generated ROS message include directory
 //! Without them the test prints why and passes.
 
 mod common;
@@ -49,18 +51,20 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn convert_stream(prefix: &std::path::Path, stream: &std::path::Path) -> Vec<(u64, u32, Vec<u8>)> {
-    // The converter reuses ros_io's generated message headers (verbatim .msg).
-    let ros_io = common::ros_io_lib(prefix);
-    let gen = ros_io.parent().unwrap().join("ros-io-gen");
+    // Consume the same owning installed wire and ROS headers as ctl_px4_replay.
+    let reference = PathBuf::from(std::env::var_os("XGC_REFERENCE_WIRE_PREFIX")
+        .expect("set XGC_REFERENCE_WIRE_PREFIX to the owning reference wire install prefix")).join("include");
+    let messages = PathBuf::from(std::env::var_os("XGC_ROS_REPLAY_MSGS_INCLUDE")
+        .expect("set XGC_ROS_REPLAY_MSGS_INCLUDE to the owning generated ROS message include directory"));
     let out = common::workspace_root().join("target/plugin-tests/ros");
+    std::fs::create_dir_all(&out).unwrap();
     let tool = out.join("ref_stream_to_xgc");
     let conda_cxx = prefix.join("bin/x86_64-conda-linux-gnu-c++");
     let cxx = if conda_cxx.is_file() { conda_cxx } else { PathBuf::from("c++") };
     let status = Command::new(cxx)
         .args(["-std=c++17", "-O2"])
-        .arg("-I").arg(common::workspace_root().join("abi/include"))
-        .arg("-I").arg(common::workspace_root().join("plugins/common"))
-        .arg("-I").arg(&gen)
+        .arg("-I").arg(&reference)
+        .arg("-I").arg(&messages)
         .arg("-isystem").arg(prefix.join("include"))
         .arg(common::workspace_root().join("crates/xgc-rt-host/tests/ros/ref_stream_to_xgc.cpp"))
         .arg("-o").arg(&tool)

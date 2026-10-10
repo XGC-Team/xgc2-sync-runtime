@@ -11,8 +11,8 @@ An aggregator is a plain process (`xgc-rt-host`) that loads the `.so` modules on
 ```text
             robot (container or onboard)                         other robots / station
  ┌─────────────────── aggregator (xgc-rt-host) ─────────┐
- │  ros_io ─▶ estimator ─▶ planner ─▶ controller ─▶ ros_io ─▶ MAVROS (ROS pub)
- │   (ROS sub)                    ▲  │                  │
+ │  inputs ─▶ estimator ─▶ planner ─▶ controller ─▶ outputs │
+ │                               ▲  │                  │
  │  same process: memory only    │  └── dmpc/plan ─────┼──▶ Zenoh over radio ◀──▶ peers
  │  (one thread per module)      └───── neighbor plans ◀┼───  stamped + audited
  └──────────────────────────────────────────────────────┘
@@ -41,7 +41,7 @@ An aggregator is a plain process (`xgc-rt-host`) that loads the `.so` modules on
 4b. **Watchdog.** A step over `step_budget_ms` (default one period) marks the module Degraded; the next step within budget recovers it. A step over 10× the budget is a hang: the instance is abandoned and, if the restart policy allows, replaced. After `session.max_abandoned` (default 2) abandons the aggregator stops and exits nonzero, so the Agent restarts it.
 5. Every module has the lifecycle state machine (`Unconfigured → Inactive → Active ⇄ Degraded`, plus `Error` and `Finalized`), tested exhaustively, and its own domain state is visible in health.
 6. A module's declared inputs and outputs are its entire I/O. Between processes, only the link (Zenoh) is used.
-6a. **Modules never touch ROS.** No ros::init/rospy, no publish/subscribe, no ROS libraries in a domain plugin. The aggregator's `ros_io` module does ordinary ROS subscribe and publish: topics are copied into module inputs, module outputs are published as topics. It is not the `ros1_bridge` package. VRPN, simulators and third-party ROS stacks stay ROS nodes, reached through `ros_io`.
+6a. **ROS integration is product-owned.** Runtime supplies the host, ABI and transport; it does not define robot message mappings or provide a platform `ros_io` plugin. Products compose their ROS nodes and owning native adapters through ordinary launch or workflow entry points.
 7. Every link (cross-process) channel is audited (`audit-def/1`, `docs/audit-definitions.md`).
 
 ## Build, test and demo
@@ -56,7 +56,9 @@ Rust ≥ 1.85 (workspace resolver 3 and the shared XRPC SDK require it).
 Some native integration tests return early when ROS/core dependencies are
 absent. A successful default `cargo test` run alone does not show they ran.
 With the real dependencies configured, `scripts/check-native-gates.sh` checks
-the executed test counts and rejects those skips. The [recorded validation](docs/validation/native-20260926/README.md)
+the executed test counts and rejects those skips. These replay gates consume
+owning installed artifacts and headers plus recorded flights supplied in the
+output directory's `bags/`; they do not build a ROS bridge. The [recorded validation](docs/validation/native-20260926/README.md)
 lists source identities, replay hashes, software-plant results and limitations.
 
 The runtime-owned [deployment renderer](docs/native-deployment.md) binds an actual Session, robot namespace, topics, calibration provenance and artifact hashes into a private manifest generation. Use its target-local `run` entry with the ordinary managed-process definition; `prepare` alone does not establish module readiness.
