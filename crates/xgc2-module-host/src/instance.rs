@@ -154,9 +154,15 @@ struct Op {
 /// What a port is connected to.
 pub enum PortIo {
     Unbound,
-    Out { channel: Arc<Channel>, writer: Writer },
+    Out {
+        channel: Arc<Channel>,
+        writer: Writer,
+    },
     /// `reader` is present while the instance is started.
-    In { channel: Arc<Channel>, reader: Option<Reader> },
+    In {
+        channel: Arc<Channel>,
+        reader: Option<Reader>,
+    },
 }
 
 /// A reader taken from a stopping instance, waiting to be adopted by its replacement.
@@ -257,11 +263,7 @@ impl Instance {
             .ports
             .iter()
             .enumerate()
-            .map(|(index, spec)| PortRt {
-                spec: spec.clone(),
-                input_bit: module.input_bit(index),
-                io: Mutex::new(PortIo::Unbound),
-            })
+            .map(|(index, spec)| PortRt { spec: spec.clone(), input_bit: module.input_bit(index), io: Mutex::new(PortIo::Unbound) })
             .collect();
         Arc::new(Instance {
             name: name.to_owned(),
@@ -440,6 +442,10 @@ impl Instance {
                 if let PortIo::In { channel, reader } = &mut *lock(&self.ports[index].io) {
                     if Arc::ptr_eq(channel, &released.channel) && reader.is_none() {
                         channel.retarget_reader(&mut released.reader, self.wake.clone(), 1u64 << bit);
+                        // What the previous instance left unread is this instance's first input.
+                        if channel.has_unread(&released.reader) {
+                            self.env.sched.mark_dirty(self.idx, self.generation, 1u64 << bit, steady_ns());
+                        }
                         *reader = Some(released.reader);
                         continue;
                     }
@@ -582,10 +588,7 @@ impl Instance {
     }
 
     pub fn changed(&self, port: u32) -> bool {
-        self.ports
-            .get(port as usize)
-            .and_then(|rt| rt.input_bit)
-            .is_some_and(|bit| self.changed.load(Ordering::Acquire) >> bit & 1 == 1)
+        self.ports.get(port as usize).and_then(|rt| rt.input_bit).is_some_and(|bit| (self.changed.load(Ordering::Acquire) >> bit) & 1 == 1)
     }
 
     pub fn wake(&self) {
@@ -852,7 +855,7 @@ impl Instance {
         if taken.dirty != 0 {
             for port in &self.ports {
                 let Some(bit) = port.input_bit else { continue };
-                if taken.dirty >> bit & 1 == 1 {
+                if (taken.dirty >> bit) & 1 == 1 {
                     if let PortIo::In { channel, reader: Some(reader) } = &*lock(&port.io) {
                         if channel.has_unread(reader) {
                             changed |= 1 << bit;

@@ -13,7 +13,7 @@ use crate::loader::{self, Dir, Module};
 use crate::log::Level;
 use crate::log_at;
 use crate::names;
-use crate::plan::{ChannelSpec, Hint, Planner};
+use crate::plan::{port_channels, ChannelSpec, Hint, Planner};
 use crate::scheduler::{Runner, Scheduler, Taken, Worker, MAX_INSTANCES};
 use crate::timers::Timers;
 use serde_json::{json, Value};
@@ -142,13 +142,13 @@ pub fn check_limits(budget_ns: i64, hang_ns: i64) -> Result<(), String> {
         return Err("the step budget must be positive".into());
     }
     if hang_ns < MIN_HANG_LIMIT_NS || hang_ns < budget_ns {
-        return Err(format!(
-            "the hang limit must be at least {} ms and not below the step budget",
-            MIN_HANG_LIMIT_NS / 1_000_000
-        ));
+        return Err(format!("the hang limit must be at least {} ms and not below the step budget", MIN_HANG_LIMIT_NS / 1_000_000));
     }
     Ok(())
 }
+
+/// Port to channel bindings of a replacement, and the channel specs once they are applied.
+type ReplacementPlan = (Vec<(usize, String)>, BTreeMap<String, ChannelSpec>);
 
 struct Topology {
     modules: BTreeMap<String, Arc<Module>>,
@@ -167,6 +167,9 @@ struct Core {
     timers: Arc<Timers>,
     timer_thread: Mutex<Option<JoinHandle<()>>>,
     topo: RwLock<Topology>,
+    hints: RwLock<HashMap<String, Hint>>,
+    /// Queue lengths the whole manifest asks for per event channel.
+    depths: RwLock<HashMap<String, u32>>,
     control: Mutex<()>,
     down: AtomicBool,
 }
@@ -230,7 +233,7 @@ impl ModuleHost {
                     hook_timers.on_clock(update, ns);
                 }
             });
-            let mut planner = Planner::new(BTreeMap::new(), &options.hints);
+            let mut planner = Planner::new(BTreeMap::new(), options.hints.clone());
             planner.add_clock_channel(&name);
             let spec = &planner.specs()[&name];
             topology
@@ -238,6 +241,8 @@ impl ModuleHost {
                 .insert(name.clone(), Channel::new(&name, spec.kind, spec.payload.clone(), spec.depth, spec.max_readers, Some(hook)));
         }
         let core = Arc::new(Core {
+            hints: RwLock::new(options.hints.clone()),
+            depths: RwLock::new(HashMap::new()),
             options,
             started: Instant::now(),
             clock,
@@ -302,6 +307,25 @@ impl ModuleHost {
         Env { clock: self.core.clock.clone(), sched: self.core.sched.clone(), timers: self.core.timers.clone() }
     }
 
+    fn planner(&self, specs: BTreeMap<String, ChannelSpec>) -> Planner {
+        let hints = self.core.hints.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let depths = self.core.depths.read().unwrap_or_else(|e| e.into_inner()).clone();
+        Planner::new(specs, hints).with_expected_depths(depths)
+    }
+
+    /// Channel overrides (queue depth, reader capacity) and the queue lengths the ports of a
+    /// whole manifest ask for; both apply to channels created from now on. The manifest
+    /// launcher declares them before the first instance.
+    pub fn declare_channels(&self, hints: HashMap<String, Hint>, depths: HashMap<String, u32>) {
+        *self.core.hints.write().unwrap_or_else(|e| e.into_inner()) = hints;
+        *self.core.depths.write().unwrap_or_else(|e| e.into_inner()) = depths;
+    }
+
+    /// The loaded module registered under `handle`.
+    pub fn loaded_module(&self, handle: &str) -> Result<Arc<Module>, HostError> {
+        self.module(handle)
+    }
+
     fn wait(&self, done: &Completion, what: &str) -> Result<(), HostError> {
         match done.wait(self.core.options.op_timeout) {
             Some(Ok(())) => Ok(()),
@@ -337,6 +361,9 @@ impl ModuleHost {
                 return Err(HostError::Invalid(format!("module name {handle:?} is not a valid name")));
             }
         }
+        if sha256.is_some_and(|pin| !names::valid_sha256(pin)) {
+            return Err(HostError::Invalid("sha256 must be 64 hex digits".into()));
+        }
         if let Ok(canonical) = path.canonicalize() {
             // dlopen answers a second open of the same path with the code that is already
             // mapped, whatever the file contains now, so a loaded path is never loaded again.
@@ -361,19 +388,36 @@ impl ModuleHost {
     /// Unload a library that no instance uses.
     pub fn unload_module(&self, handle: &str) -> Result<(), HostError> {
         let _control = self.exclusive()?;
-        let mut topo = self.topo_mut();
-        let module = topo.modules.get(handle).ok_or_else(|| HostError::NotFound(format!("no module named {handle}")))?;
-        let users: Vec<String> =
-            topo.slots.iter().flatten().filter(|instance| Arc::ptr_eq(&instance.module, module)).map(|instance| instance.name.clone()).collect();
-        if !users.is_empty() {
-            return Err(HostError::Conflict(format!("module {handle} is used by instance(s) {}", users.join(", "))));
-        }
-        if Arc::strong_count(module) > 1 {
+        let module = {
+            let topo = self.topo();
+            let module = topo.modules.get(handle).cloned().ok_or_else(|| HostError::NotFound(format!("no module named {handle}")))?;
+            let users: Vec<String> = topo
+                .slots
+                .iter()
+                .flatten()
+                .filter(|instance| Arc::ptr_eq(&instance.module, &module))
+                .map(|instance| instance.name.clone())
+                .collect();
+            if !users.is_empty() {
+                return Err(HostError::Conflict(format!("module {handle} is used by instance(s) {}", users.join(", "))));
+            }
+            module
+        };
+        if module.pinned.load(Ordering::Acquire) {
             return Err(HostError::Conflict(format!(
                 "module {handle} is pinned by an abandoned instance; the library stays mapped until the process exits"
             )));
         }
-        topo.modules.remove(handle);
+        // A worker may still hold the last instance for a moment after it was removed.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Arc::strong_count(&module) > 2 {
+            if Instant::now() >= deadline {
+                return Err(HostError::Conflict(format!("module {handle} is still referenced by a running task")));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.topo_mut().modules.remove(handle);
+        drop(module);
         log_at!(Level::Info, "host", "unloaded module {handle}");
         Ok(())
     }
@@ -431,29 +475,6 @@ impl ModuleHost {
             .clone()
     }
 
-    /// Channel name for every port of `module` that gets one: explicit bindings, and a private
-    /// `<instance>.<port>` channel for outputs without one.
-    fn port_channels(instance: &str, module: &Module, bind: &BTreeMap<String, String>) -> Result<Vec<(usize, String)>, HostError> {
-        for (port, channel) in bind {
-            if module.port_index(port).is_none() {
-                return Err(HostError::Invalid(format!("module {} has no port {port}", module.name)));
-            }
-            if !names::valid_name(channel) {
-                return Err(HostError::Invalid(format!("channel name {channel:?} is not a valid name")));
-            }
-        }
-        Ok(module
-            .ports
-            .iter()
-            .enumerate()
-            .filter_map(|(index, port)| match (bind.get(&port.name), port.dir) {
-                (Some(channel), _) => Some((index, channel.clone())),
-                (None, Dir::Out) => Some((index, format!("{instance}.{}", port.name))),
-                (None, Dir::In) => None,
-            })
-            .collect())
-    }
-
     /// Connect `instance` to the channels of `bindings`, creating channels as planned.
     fn connect(&self, instance: &Instance, bindings: &[(usize, String)], specs: &BTreeMap<String, ChannelSpec>) -> Result<(), HostError> {
         let mut topo = self.topo_mut();
@@ -483,8 +504,8 @@ impl ModuleHost {
             if topo.names.contains_key(&spec.name) {
                 return Err(HostError::Conflict(format!("an instance named {} exists", spec.name)));
             }
-            let bindings = Self::port_channels(&spec.name, &module, &spec.bind)?;
-            let mut planner = Planner::new(self.topology_specs(&topo), &self.core.options.hints);
+            let bindings = port_channels(&spec.name, &module.ports, &spec.bind, &module.name).map_err(HostError::Invalid)?;
+            let mut planner = self.planner(self.topology_specs(&topo));
             for (port, channel) in &bindings {
                 planner.bind(&spec.name, &module.ports[*port], channel).map_err(HostError::Invalid)?;
             }
@@ -492,7 +513,8 @@ impl ModuleHost {
         };
         let (budget, hang) = effective_limits(spec.period_ns, spec.step_budget_ns, spec.hang_limit_ns);
         check_limits(budget, hang).map_err(|e| HostError::Invalid(format!("instance {}: {e}", spec.name)))?;
-        let params = Params { config_json: spec.config_json.clone(), period_ns: spec.period_ns, step_budget_ns: budget, hang_limit_ns: hang };
+        let params =
+            Params { config_json: spec.config_json.clone(), period_ns: spec.period_ns, step_budget_ns: budget, hang_limit_ns: hang };
         let (idx, generation) = self.core.sched.alloc().ok_or_else(|| HostError::Conflict(format!("at most {MAX_INSTANCES} instances")))?;
         let instance = Instance::new(&spec.name, &spec.module, module, spec.required, params, idx, generation, self.env());
         if let Err(error) = self.connect(&instance, &bindings, &specs) {
@@ -541,6 +563,7 @@ impl ModuleHost {
             self.collect_channels(&mut topo);
         }
         if instance.state() == State::Isolated {
+            instance.module.pinned.store(true, Ordering::Release);
             std::mem::forget(instance.clone());
         }
         self.core.timers.disarm(instance.idx);
@@ -620,10 +643,10 @@ impl ModuleHost {
 
     /// Plan the channels of the replacement: every bound port of the old instance keeps its
     /// channel, new outputs get private channels, and the new module must fit.
-    fn plan_replacement(&self, old: &Instance, module: &Module) -> Result<(Vec<(usize, String)>, BTreeMap<String, ChannelSpec>), HostError> {
+    fn plan_replacement(&self, old: &Instance, module: &Module) -> Result<ReplacementPlan, HostError> {
         let name = &old.name;
         let topo = self.topo();
-        let mut planner = Planner::new(self.topology_specs(&topo), &self.core.options.hints);
+        let mut planner = self.planner(self.topology_specs(&topo));
         for port in &old.ports {
             if let Some(channel) = bound_channel(port) {
                 planner.unbind(&port.spec, channel.name());
@@ -734,7 +757,8 @@ impl ModuleHost {
     pub fn bind_port(&self, instance: &str, port: &str, channel: Option<&str>) -> Result<(), HostError> {
         let _control = self.exclusive()?;
         let instance = self.instance(instance)?;
-        let index = instance.port_index(port).ok_or_else(|| HostError::Invalid(format!("instance {} has no port {port}", instance.name)))?;
+        let index =
+            instance.port_index(port).ok_or_else(|| HostError::Invalid(format!("instance {} has no port {port}", instance.name)))?;
         let spec = instance.ports[index].spec.clone();
         let target = match (channel, spec.dir) {
             (Some(channel), _) => {
@@ -752,7 +776,7 @@ impl ModuleHost {
         }
         let specs = {
             let topo = self.topo();
-            let mut planner = Planner::new(self.topology_specs(&topo), &self.core.options.hints);
+            let mut planner = self.planner(self.topology_specs(&topo));
             if let Some(current) = &current {
                 planner.unbind(&spec, current.name());
             }
@@ -904,8 +928,7 @@ impl ModuleHost {
                     .filter(|instance| Arc::ptr_eq(&instance.module, module))
                     .map(|instance| instance.name.clone())
                     .collect();
-                let pinned = Arc::strong_count(module) > 1 + users.len();
-                module_json(handle, module, &users, pinned)
+                module_json(handle, module, &users, module.pinned.load(Ordering::Acquire))
             })
             .collect();
         json!({"modules": list})

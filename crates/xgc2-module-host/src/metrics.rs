@@ -49,11 +49,7 @@ fn upper(bucket: usize) -> u64 {
 
 impl Histogram {
     pub fn new() -> Self {
-        Self {
-            buckets: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(),
-            count: AtomicU64::new(0),
-            max: AtomicU64::new(0),
-        }
+        Self { buckets: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(), count: AtomicU64::new(0), max: AtomicU64::new(0) }
     }
 
     pub fn record(&self, value: u64) {

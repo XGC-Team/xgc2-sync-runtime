@@ -99,8 +99,7 @@ pub struct Instance {
     _private: [u8; 0],
 }
 
-pub type CreateFn =
-    unsafe extern "C" fn(*const HostApi, *mut c_void, *const Config, *mut *mut Instance) -> Status;
+pub type CreateFn = unsafe extern "C" fn(*const HostApi, *mut c_void, *const Config, *mut *mut Instance) -> Status;
 pub type ConfigureFn = unsafe extern "C" fn(*mut Instance, *const Config) -> Status;
 pub type LifecycleFn = unsafe extern "C" fn(*mut Instance) -> Status;
 pub type StepFn = unsafe extern "C" fn(*mut Instance, *const StepCtx) -> Status;

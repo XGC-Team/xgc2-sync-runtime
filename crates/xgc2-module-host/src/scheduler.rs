@@ -499,9 +499,7 @@ impl Scheduler {
         let worker = Worker::new(id);
         lock(&self.workers).push(worker.clone());
         let scheduler = self.clone();
-        let spawned = thread::Builder::new()
-            .name(format!("xgc2-worker-{id}"))
-            .spawn(move || scheduler.worker_main(runner, worker));
+        let spawned = thread::Builder::new().name(format!("xgc2-worker-{id}")).spawn(move || scheduler.worker_main(runner, worker));
         if let Err(error) = spawned {
             log_at!(Level::Error, "scheduler", "cannot spawn worker {id}: {error}");
             lock(&self.workers).retain(|worker| worker.id != id);

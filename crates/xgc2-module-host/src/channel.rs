@@ -154,11 +154,7 @@ struct StateRing {
 
 impl StateRing {
     fn new(max_readers: u32, payload: usize) -> StateRing {
-        StateRing {
-            arena: Arena::new(max_readers as usize + 2, payload),
-            latest: AtomicU32::new(NO_SLOT),
-            seq: AtomicU64::new(0),
-        }
+        StateRing { arena: Arena::new(max_readers as usize + 2, payload), latest: AtomicU32::new(NO_SLOT), seq: AtomicU64::new(0) }
     }
 
     /// Single writer: pick a slot that is neither the latest nor pinned.
@@ -256,12 +252,7 @@ impl EventRing {
     /// Claim the next position, or `None` when the slowest reader is `depth` events behind.
     fn begin(&self) -> Option<u64> {
         let mut claim = lock(&self.claim);
-        let gate = claim
-            .cursors
-            .iter()
-            .map(|cursor| cursor.next.load(Ordering::Acquire))
-            .min()
-            .unwrap_or(claim.head);
+        let gate = claim.cursors.iter().map(|cursor| cursor.next.load(Ordering::Acquire)).min().unwrap_or(claim.head);
         if claim.head - gate >= self.depth {
             return None;
         }
@@ -408,14 +399,7 @@ pub struct ChannelInfo {
 impl Channel {
     /// `depth` is the event queue length (ignored for state channels); `max_readers` bounds
     /// the readers that can attach at the same time.
-    pub fn new(
-        name: &str,
-        kind: Kind,
-        spec: PayloadSpec,
-        depth: u32,
-        max_readers: u32,
-        hook: Option<CommitHook>,
-    ) -> Arc<Channel> {
+    pub fn new(name: &str, kind: Kind, spec: PayloadSpec, depth: u32, max_readers: u32, hook: Option<CommitHook>) -> Arc<Channel> {
         let payload = spec.size as usize;
         let ring = match kind {
             Kind::State => Ring::State(StateRing::new(max_readers, payload)),
@@ -595,10 +579,7 @@ impl Channel {
                 ReaderSide::Event { cursor, local: start }
             }
         };
-        self.subscribers
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Subscription { token, bit, target });
+        self.subscribers.write().unwrap_or_else(PoisonError::into_inner).push(Subscription { token, bit, target });
         Ok(Reader { token, side })
     }
 
@@ -614,10 +595,7 @@ impl Channel {
     /// Detach a reader; its pins and cursor stop holding slots.
     pub fn detach_reader(&self, mut reader: Reader) {
         self.end_step(&mut reader);
-        self.subscribers
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|subscription| subscription.token != reader.token);
+        self.subscribers.write().unwrap_or_else(PoisonError::into_inner).retain(|subscription| subscription.token != reader.token);
         if let (Ring::Event(ring), ReaderSide::Event { cursor, .. }) = (&self.ring, &reader.side) {
             ring.detach(cursor);
         }

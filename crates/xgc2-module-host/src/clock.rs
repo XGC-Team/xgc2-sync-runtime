@@ -17,7 +17,10 @@ pub fn steady_ns() -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `ts` is a valid out pointer; CLOCK_MONOTONIC always exists on Linux.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+    // time_t and the nanosecond field are narrower than i64 on some 32-bit targets.
+    #[allow(clippy::unnecessary_cast)]
+    let ns = ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64;
+    ns
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

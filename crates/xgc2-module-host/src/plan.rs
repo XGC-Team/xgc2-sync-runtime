@@ -34,9 +34,37 @@ pub struct Hint {
     pub max_readers: Option<u32>,
 }
 
-pub struct Planner<'a> {
+/// Channel name for every port that gets one: explicit bindings, and a private
+/// `<instance>.<port>` channel for outputs without one. Inputs without a binding stay
+/// unconnected. Bindings naming a port the module does not have are an error.
+pub fn port_channels(
+    instance: &str,
+    ports: &[PortSpec],
+    bind: &BTreeMap<String, String>,
+    module: &str,
+) -> Result<Vec<(usize, String)>, String> {
+    for (port, channel) in bind {
+        if !ports.iter().any(|spec| &spec.name == port) {
+            return Err(format!("module {module} has no port {port}"));
+        }
+        if !crate::names::valid_name(channel) {
+            return Err(format!("channel name {channel:?} is not a valid name"));
+        }
+    }
+    Ok(ports
+        .iter()
+        .enumerate()
+        .filter_map(|(index, port)| match (bind.get(&port.name), port.dir) {
+            (Some(channel), _) => Some((index, channel.clone())),
+            (None, Dir::Out) => Some((index, format!("{instance}.{}", port.name))),
+            (None, Dir::In) => None,
+        })
+        .collect())
+}
+
+pub struct Planner {
     specs: BTreeMap<String, ChannelSpec>,
-    hints: &'a HashMap<String, Hint>,
+    hints: HashMap<String, Hint>,
     /// Queue length the ports of the whole manifest ask for, so the first port that creates
     /// an event channel does not fix a depth that a later port cannot use.
     expected_depth: HashMap<String, u32>,
@@ -46,9 +74,15 @@ fn describe(port: &PortSpec) -> String {
     format!("{} {} {} ({} bytes, align {})", port.kind.as_str(), port.payload.schema, port.name, port.payload.size, port.payload.align)
 }
 
-impl<'a> Planner<'a> {
-    pub fn new(existing: BTreeMap<String, ChannelSpec>, hints: &'a HashMap<String, Hint>) -> Self {
+impl Planner {
+    pub fn new(existing: BTreeMap<String, ChannelSpec>, hints: HashMap<String, Hint>) -> Self {
         Planner { specs: existing, hints, expected_depth: HashMap::new() }
+    }
+
+    /// Start with the queue lengths a pre-pass over the whole manifest found.
+    pub fn with_expected_depths(mut self, depths: HashMap<String, u32>) -> Self {
+        self.expected_depth = depths;
+        self
     }
 
     pub fn specs(&self) -> &BTreeMap<String, ChannelSpec> {
@@ -179,8 +213,8 @@ mod tests {
         }
     }
 
-    fn planner(hints: &HashMap<String, Hint>) -> Planner<'_> {
-        Planner::new(BTreeMap::new(), hints)
+    fn planner(hints: &HashMap<String, Hint>) -> Planner {
+        Planner::new(BTreeMap::new(), hints.clone())
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::ffi::{c_char, CStr};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 /// Largest payload a port may declare.
 pub const MAX_PAYLOAD_SIZE: u32 = 1 << 20;
@@ -89,6 +90,9 @@ pub struct Module {
     pub abi_minor: u32,
     pub ports: Vec<PortSpec>,
     pub vtable: Vtable,
+    /// Set when an abandoned instance may still run code of this library, which must then
+    /// stay mapped until the process exits.
+    pub pinned: AtomicBool,
     /// For every port: its bit in `changed_inputs` (inputs in port table order).
     input_bits: Vec<Option<u8>>,
     _library: libloading::os::unix::Library,
@@ -111,7 +115,13 @@ impl Module {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        text.push(HEX[usize::from(byte >> 4)] as char);
+        text.push(HEX[usize::from(byte & 15)] as char);
+    }
+    text
 }
 
 /// Read `path`, check the pin, dlopen it and validate its descriptor.
@@ -136,9 +146,8 @@ pub fn load(path: &Path, pin: Option<&str>) -> Result<Module, LoadError> {
     let library = unsafe { libloading::os::unix::Library::open(Some(&canonical), libc::RTLD_NOW | libc::RTLD_LOCAL) }
         .map_err(|e| LoadError::Open(format!("{}: {e}", path.display())))?;
     // SAFETY: the symbol has the declared signature by the ABI contract.
-    let entry: abi::EntryFn = *unsafe { library.get::<abi::EntryFn>(abi::ENTRY_SYMBOL) }.map_err(|e| {
-        LoadError::NoEntry(format!("{}: no {} entry point: {e}", path.display(), "xgc2_module_v2"))
-    })?;
+    let entry: abi::EntryFn = *unsafe { library.get::<abi::EntryFn>(abi::ENTRY_SYMBOL) }
+        .map_err(|e| LoadError::NoEntry(format!("{}: no {} entry point: {e}", path.display(), "xgc2_module_v2")))?;
     // SAFETY: the entry function takes no arguments and returns a pointer that stays valid
     // while the library is loaded.
     let descriptor = unsafe { entry() };
@@ -146,8 +155,7 @@ pub fn load(path: &Path, pin: Option<&str>) -> Result<Module, LoadError> {
         return Err(LoadError::Descriptor(format!("{}: descriptor is NULL", path.display())));
     }
     // SAFETY: non-null, and descriptors are immutable static data of the library.
-    let parsed = unsafe { parse_descriptor(&*descriptor) }
-        .map_err(|m| LoadError::Descriptor(format!("{}: {m}", path.display())))?;
+    let parsed = unsafe { parse_descriptor(&*descriptor) }.map_err(|m| LoadError::Descriptor(format!("{}: {m}", path.display())))?;
     let mut input_bits = Vec::with_capacity(parsed.ports.len());
     let mut next_bit = 0u8;
     for port in &parsed.ports {
@@ -167,6 +175,7 @@ pub fn load(path: &Path, pin: Option<&str>) -> Result<Module, LoadError> {
         abi_minor: parsed.abi_minor,
         ports: parsed.ports,
         vtable: parsed.vtable,
+        pinned: AtomicBool::new(false),
         input_bits,
         _library: library,
     })
@@ -177,10 +186,7 @@ fn text(pointer: *const c_char, what: &str) -> Result<String, String> {
         return Err(format!("{what} is NULL"));
     }
     // SAFETY: descriptor strings are NUL-terminated and stay valid while the library is loaded.
-    unsafe { CStr::from_ptr(pointer) }
-        .to_str()
-        .map(str::to_owned)
-        .map_err(|_| format!("{what} is not UTF-8"))
+    unsafe { CStr::from_ptr(pointer) }.to_str().map(str::to_owned).map_err(|_| format!("{what} is not UTF-8"))
 }
 
 /// Validate a descriptor and copy what the host needs.
@@ -193,12 +199,7 @@ pub unsafe fn parse_descriptor(desc: &ModuleDesc) -> Result<Descriptor, String> 
         return Err(format!("ABI major {} (this host speaks {})", desc.abi_major, abi::ABI_MAJOR));
     }
     if desc.abi_minor > abi::ABI_MINOR {
-        return Err(format!(
-            "ABI minor {} is newer than this host's {}.{}",
-            desc.abi_minor,
-            abi::ABI_MAJOR,
-            abi::ABI_MINOR
-        ));
+        return Err(format!("ABI minor {} is newer than this host's {}.{}", desc.abi_minor, abi::ABI_MAJOR, abi::ABI_MINOR));
     }
     let name = text(desc.name, "module name")?;
     if !names::valid_name(&name) {
@@ -309,12 +310,7 @@ mod tests {
     use super::*;
     use std::ffi::{c_void, CString};
 
-    unsafe extern "C" fn create(
-        _: *const abi::HostApi,
-        _: *mut c_void,
-        _: *const abi::Config,
-        _: *mut *mut abi::Instance,
-    ) -> abi::Status {
+    unsafe extern "C" fn create(_: *const abi::HostApi, _: *mut c_void, _: *const abi::Config, _: *mut *mut abi::Instance) -> abi::Status {
         abi::OK
     }
     unsafe extern "C" fn configure(_: *mut abi::Instance, _: *const abi::Config) -> abi::Status {
@@ -327,6 +323,20 @@ mod tests {
         abi::OK
     }
     unsafe extern "C" fn destroy(_: *mut abi::Instance) {}
+
+    /// A port table entry as plain numbers, so a test can break one field at a time.
+    #[derive(Clone, Copy)]
+    struct Raw {
+        name: &'static str,
+        direction: u32,
+        kind: u32,
+        size: u32,
+        align: u32,
+        depth: u32,
+        flags: u32,
+    }
+
+    const STATE_IN: Raw = Raw { name: "p", direction: abi::PORT_IN, kind: abi::PORT_STATE, size: 8, align: 8, depth: 0, flags: 0 };
 
     struct Fixture {
         strings: Vec<CString>,
@@ -341,9 +351,18 @@ mod tests {
             self.strings.push(CString::new(text).unwrap());
             self.strings.last().unwrap().as_ptr()
         }
-        fn port(&mut self, name: &str, direction: u32, kind: u32, size: u32, align: u32, depth: u32, flags: u32) {
-            let (name, schema) = (self.cstr(name), self.cstr("test.v1"));
-            self.ports.push(PortDesc { name, direction, kind, schema_id: schema, size, align, queue_depth: depth, flags });
+        fn port(&mut self, raw: Raw) {
+            let (name, schema) = (self.cstr(raw.name), self.cstr("test.v1"));
+            self.ports.push(PortDesc {
+                name,
+                direction: raw.direction,
+                kind: raw.kind,
+                schema_id: schema,
+                size: raw.size,
+                align: raw.align,
+                queue_depth: raw.depth,
+                flags: raw.flags,
+            });
         }
         fn descriptor(&mut self, major: u32, minor: u32) -> ModuleDesc {
             ModuleDesc {
@@ -372,8 +391,16 @@ mod tests {
     #[test]
     fn accepts_a_valid_descriptor() {
         let mut f = Fixture::new();
-        f.port("pose", abi::PORT_IN, abi::PORT_STATE, 24, 8, 0, abi::PORT_REQUIRED);
-        f.port("cmd", abi::PORT_OUT, abi::PORT_EVENT, 16, 8, 8, abi::PORT_ASYNC_WRITER);
+        f.port(Raw { name: "pose", size: 24, flags: abi::PORT_REQUIRED, ..STATE_IN });
+        f.port(Raw {
+            name: "cmd",
+            direction: abi::PORT_OUT,
+            kind: abi::PORT_EVENT,
+            size: 16,
+            depth: 8,
+            flags: abi::PORT_ASYNC_WRITER,
+            ..STATE_IN
+        });
         let parsed = parse(&mut f, 2, 0).unwrap();
         assert_eq!((parsed.name.as_str(), parsed.version.as_str()), ("demo", "1.0"));
         assert_eq!(parsed.ports.len(), 2);
@@ -388,45 +415,43 @@ mod tests {
         assert!(parse(&mut f, 1, 0).unwrap_err().contains("ABI major 1"));
         assert!(parse(&mut f, 2, 1).unwrap_err().contains("newer"));
         let mut f = Fixture::new();
-        f.port("a", abi::PORT_IN, abi::PORT_STATE, 8, 8, 0, 0);
-        f.port("a", abi::PORT_OUT, abi::PORT_STATE, 8, 8, 0, 0);
+        f.port(Raw { name: "a", ..STATE_IN });
+        f.port(Raw { name: "a", direction: abi::PORT_OUT, ..STATE_IN });
         assert!(parse(&mut f, 2, 0).unwrap_err().contains("declared twice"));
         let mut f = Fixture::new();
         for i in 0..65 {
-            f.port(&format!("p{i}"), abi::PORT_OUT, abi::PORT_STATE, 8, 8, 0, 0);
+            f.port(Raw { name: Box::leak(format!("p{i}").into_boxed_str()), direction: abi::PORT_OUT, ..STATE_IN });
         }
         assert!(parse(&mut f, 2, 0).unwrap_err().contains("65 ports"));
         let mut f = Fixture::new();
         for i in 0..64 {
-            f.port(&format!("p{i}"), abi::PORT_IN, abi::PORT_STATE, 8, 8, 0, 0);
+            f.port(Raw { name: Box::leak(format!("p{i}").into_boxed_str()), ..STATE_IN });
         }
         assert!(parse(&mut f, 2, 0).is_ok());
     }
 
     #[test]
     fn rejects_bad_ports() {
-        let cases: [(&str, u32, u32, u32, u32, u32, u32, &str); 11] = [
-            ("Bad", 1, 1, 8, 8, 0, 0, "must match"),
-            ("p", 3, 1, 8, 8, 0, 0, "direction"),
-            ("p", 1, 3, 8, 8, 0, 0, "kind"),
-            ("p", 1, 1, 0, 8, 0, 0, "payload size"),
-            ("p", 1, 1, 8, 3, 0, 0, "power of two"),
-            ("p", 1, 1, 8, 128, 0, 0, "power of two"),
-            ("p", 1, 1, 12, 8, 0, 0, "multiple"),
-            ("p", 1, 2, 8, 8, 0, 0, "queue_depth"),
-            ("p", 1, 1, 8, 8, 4, 0, "queue_depth 0"),
-            ("p", 2, 1, 8, 8, 0, abi::PORT_REQUIRED, "inputs only"),
-            ("p", 1, 1, 8, 8, 0, 0x40, "unknown flag"),
+        let cases = [
+            (Raw { name: "Bad", ..STATE_IN }, "must match"),
+            (Raw { direction: 3, ..STATE_IN }, "direction"),
+            (Raw { kind: 3, ..STATE_IN }, "kind"),
+            (Raw { size: 0, ..STATE_IN }, "payload size"),
+            (Raw { align: 3, ..STATE_IN }, "power of two"),
+            (Raw { align: 128, ..STATE_IN }, "power of two"),
+            (Raw { size: 12, ..STATE_IN }, "multiple"),
+            (Raw { kind: abi::PORT_EVENT, ..STATE_IN }, "queue_depth"),
+            (Raw { depth: 4, ..STATE_IN }, "queue_depth 0"),
+            (Raw { direction: abi::PORT_OUT, flags: abi::PORT_REQUIRED, ..STATE_IN }, "inputs only"),
+            (Raw { flags: abi::PORT_ASYNC_WRITER, ..STATE_IN }, "outputs only"),
+            (Raw { flags: 0x40, ..STATE_IN }, "unknown flag"),
         ];
-        for (name, dir, kind, size, align, depth, flags, expect) in cases {
+        for (raw, expect) in cases {
             let mut f = Fixture::new();
-            f.port(name, dir, kind, size, align, depth, flags);
+            f.port(raw);
             let error = parse(&mut f, 2, 0).unwrap_err();
-            assert!(error.contains(expect), "{name} {dir} {kind}: {error}");
+            assert!(error.contains(expect), "{}: {error}", raw.name);
         }
-        let mut f = Fixture::new();
-        f.port("p", abi::PORT_IN, abi::PORT_STATE, 8, 8, 0, abi::PORT_ASYNC_WRITER);
-        assert!(parse(&mut f, 2, 0).unwrap_err().contains("outputs only"));
     }
 
     #[test]

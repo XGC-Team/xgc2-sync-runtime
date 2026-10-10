@@ -70,13 +70,7 @@ fn timestamp() -> String {
     let secs = now.as_secs() as i64;
     let (year, month, day) = civil(secs.div_euclid(86_400));
     let rest = secs.rem_euclid(86_400);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60,
-        now.subsec_millis()
-    )
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z", rest / 3600, rest % 3600 / 60, rest % 60, now.subsec_millis())
 }
 
 pub fn emit(level: Level, target: &str, message: &str) {
