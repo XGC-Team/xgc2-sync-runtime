@@ -9,7 +9,7 @@
 //!   single writer always finds a free one: at most `max_readers` slots are pinned, one is the
 //!   latest and one is free. The writer never waits for a reader and a reader always gets the
 //!   newest complete sample. Readers pin with the usual announce/re-check protocol on the
-//!   `latest` index (sequentially consistent, see [`StateRing::pin_latest`]).
+//!   `latest` index (sequentially consistent, see `StateRing::pin_latest`).
 //! * `Event` channels are bounded broadcast FIFOs of `depth` slots. Several writers claim
 //!   positions under a short lock, fill their slot and publish it; every reader has its own
 //!   cursor and sees every event. A slot is reused only after all readers finished the step in

@@ -36,6 +36,7 @@ jobs:
         run: |
           cargo +"$MSRV" fmt --all --check
           cargo +"$MSRV" clippy --locked --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo +"$MSRV" doc --locked --no-deps
       - name: Unit and integration tests (the integration tests compile the C and C++ test modules in tests/modules)
         run: cargo +"${{ matrix.toolchain }}" test --locked
       - name: The SDK as a module author consumes it

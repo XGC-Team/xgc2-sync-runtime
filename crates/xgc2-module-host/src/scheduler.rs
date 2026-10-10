@@ -15,7 +15,7 @@
 //! A task made runnable from inside a worker goes to that worker's run-next slot instead of
 //! the shared queue, so a chain producer -> consumer runs back to back on one thread without a
 //! wake-up. The watchdog moves a slot to the shared queue when its worker stays busy, and a
-//! worker takes at most [`LOCAL_BURST`] local tasks in a row before serving the shared queue.
+//! worker takes at most `LOCAL_BURST` (8) local tasks in a row before serving the shared queue.
 //!
 //! The timer thread calls [`Scheduler::watchdog`] on every tick: a worker stuck in a module
 //! call beyond its limit is abandoned, the runner isolates the instance and a replacement

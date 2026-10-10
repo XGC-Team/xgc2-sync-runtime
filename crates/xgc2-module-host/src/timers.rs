@@ -8,7 +8,7 @@
 //! calls [`Timers::on_clock`], which fires whatever became due, so simulated time can run
 //! faster or slower than the wall clock.
 //!
-//! The same thread ticks the scheduler's watchdog every [`WATCHDOG_TICK`].
+//! The same thread ticks the scheduler's watchdog every [`WATCHDOG_TICK_NS`].
 
 use crate::clock::{steady_ns, Clock, Mode, Update};
 use crate::scheduler::Scheduler;

@@ -168,7 +168,7 @@ instance misses the steps between its stop and its start.
 ## Control plane
 
 The control plane is the XRPC `http.v1` profile on a Unix socket (the XRPC Rust SDK). The socket's directory must be
-owned by the user running the host and have mode 0700; that is the access control. `GET /v1/describe` is the only
+owned by the user running the host and have mode 0700; that is the access control, and it is the whole of it: a caller that can reach the socket can make the host load any library the host can read. `GET /v1/describe` is the only
 call that works without the instance id of this boot, which the host generates at start and every other call must
 carry (`X-Xrpc-Instance-ID`); a client that talks to a restarted host is told so with `conflict`. Reads are computed
 from atomics and never wait for a module. Mutations run on the SDK's blocking pool and may take as long as a module
