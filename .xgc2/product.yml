@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-module
 name: XGC2 Module
-version: 0.1.0-1
+version: 0.2.0-1
 kind: toolchain-apt
 summary: Same-entity module aggregation - the module ABI SDK for module authors and the xgc2-module-host process that runs the modules of one entity.
 apt:
@@ -43,6 +43,6 @@ release:
   ci_workflow: ci.yml
   workflow: release.yml
   apt_versions:
-    bionic: 0.1.0-1~bionic
-    focal: 0.1.0-1~focal
-    noble: 0.1.0-1~noble
+    bionic: 0.2.0-1~bionic
+    focal: 0.2.0-1~focal
+    noble: 0.2.0-1~noble
