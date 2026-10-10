@@ -11,14 +11,18 @@ use xgc2_module_host::abi::*;
 fn rust_and_c_agree_on_the_layout() {
     let path = build("layout_probe.c", "layout_probe", &[]);
     // SAFETY: the probe exports two plain functions with these signatures.
-    let (count, probe) = unsafe {
+    let (count, probe, entry_symbol) = unsafe {
         let library = libloading::Library::new(&path).unwrap();
         let count: unsafe extern "C" fn() -> u64 = *library.get(b"xgc2_probe_count\0").unwrap();
         let probe: unsafe extern "C" fn(u64) -> u64 = *library.get(b"xgc2_probe\0").unwrap();
+        let symbol: unsafe extern "C" fn() -> *const std::os::raw::c_char = *library.get(b"xgc2_probe_entry_symbol\0").unwrap();
         let values: Vec<u64> = (0..count()).map(|i| probe(i)).collect();
+        let entry = std::ffi::CStr::from_ptr(symbol()).to_str().unwrap().to_owned();
         std::mem::forget(library);
-        (values.len(), values)
+        (values.len(), values, entry)
     };
+    assert_eq!(entry_symbol, ENTRY_NAME, "the entry function name of the header");
+    assert_eq!(ENTRY_SYMBOL, format!("{ENTRY_NAME}\0").as_bytes());
     let expected: Vec<usize> = vec![
         size_of::<PortDesc>(),
         offset_of!(PortDesc, direction),

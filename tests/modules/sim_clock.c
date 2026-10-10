@@ -80,4 +80,4 @@ static void destroy(xgc2_instance* handle) { free(handle); }
 static const xgc2_module_desc DESC = {XGC2_MODULE_ABI_MAJOR, XGC2_MODULE_ABI_MINOR, "test_sim_clock", "1.0.0",
                                       PORTS, 1, create, configure, start, step, stop, destroy};
 
-TEST_EXPORT const xgc2_module_desc* xgc2_module_v2(void) { return &DESC; }
+TEST_EXPORT const xgc2_module_desc* xgc2_module_entry(void) { return &DESC; }

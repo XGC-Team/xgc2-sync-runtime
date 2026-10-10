@@ -147,7 +147,7 @@ pub fn load(path: &Path, pin: Option<&str>) -> Result<Module, LoadError> {
         .map_err(|e| LoadError::Open(format!("{}: {e}", path.display())))?;
     // SAFETY: the symbol has the declared signature by the ABI contract.
     let entry: abi::EntryFn = *unsafe { library.get::<abi::EntryFn>(abi::ENTRY_SYMBOL) }
-        .map_err(|e| LoadError::NoEntry(format!("{}: no {} entry point: {e}", path.display(), "xgc2_module_v2")))?;
+        .map_err(|e| LoadError::NoEntry(format!("{}: no {} entry point: {e}", path.display(), abi::ENTRY_NAME)))?;
     // SAFETY: the entry function takes no arguments and returns a pointer that stays valid
     // while the library is loaded.
     let descriptor = unsafe { entry() };

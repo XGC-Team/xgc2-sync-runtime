@@ -1,7 +1,8 @@
 /*
- * xgc2/module.h - xgc2-module ABI v2 (binding contract for #226/#219).
+ * xgc2/module.h - xgc2-module module ABI (binding contract for #226/#219).
+ * ABI major 2: the successor of the sync-runtime plugin ABI 1.x (incompatible change, normal major bump).
  *
- * A module is a shared library exporting `const xgc2_module_desc* xgc2_module_v2(void)`.
+ * A module is a shared library exporting `const xgc2_module_desc* xgc2_module_entry(void)`.
  * All descriptor strings and the port table must stay valid while the library is loaded.
  *
  * Lifecycle: create, then any number of configure calls, start, step calls, stop, destroy.
@@ -50,7 +51,7 @@ extern "C" {
 
 #define XGC2_MODULE_ABI_MAJOR 2u
 #define XGC2_MODULE_ABI_MINOR 0u
-#define XGC2_MODULE_ENTRY_SYMBOL "xgc2_module_v2"
+#define XGC2_MODULE_ENTRY_SYMBOL "xgc2_module_entry"
 #define XGC2_MODULE_MAX_PORTS 64u
 
 typedef enum xgc2_status {

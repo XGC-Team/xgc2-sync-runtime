@@ -39,3 +39,4 @@ static const unsigned long long VALUES[] = {PROBES(VALUE)};
 
 TEST_EXPORT unsigned long long xgc2_probe_count(void) { return sizeof VALUES / sizeof VALUES[0]; }
 TEST_EXPORT unsigned long long xgc2_probe(unsigned long long index) { return VALUES[index]; }
+TEST_EXPORT const char *xgc2_probe_entry_symbol(void) { return XGC2_MODULE_ENTRY_SYMBOL; }

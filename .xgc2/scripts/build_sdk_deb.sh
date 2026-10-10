@@ -33,7 +33,7 @@ Section: libdevel
 Priority: optional
 Architecture: all
 Maintainer: XGC2 <apt@example.com>
-Description: xgc2-module SDK: the module ABI v2 header
+Description: xgc2-module SDK: the module ABI header
  Header-only C and C++ SDK for modules of the xgc2-module host. Installs
  <xgc2/module.h> and the Xgc2Module CMake package with the imported
  target Xgc2Module::SDK. No library, no runtime.

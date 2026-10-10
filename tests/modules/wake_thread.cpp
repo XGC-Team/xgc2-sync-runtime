@@ -84,4 +84,4 @@ const xgc2_module_desc DESC = {XGC2_MODULE_ABI_MAJOR, XGC2_MODULE_ABI_MINOR, "te
 
 }  // namespace
 
-TEST_EXPORT const xgc2_module_desc* xgc2_module_v2(void) { return &DESC; }
+TEST_EXPORT const xgc2_module_desc* xgc2_module_entry(void) { return &DESC; }

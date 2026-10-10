@@ -44,4 +44,4 @@ static xgc2_status step(xgc2_instance* i, const xgc2_step_ctx* c) { (void)i; (vo
 static const xgc2_module_desc DESC = {MAJOR, MINOR, "test_broken", "1.0.0", PORTS, sizeof PORTS / sizeof PORTS[0],
                                       create, configure, lifecycle, STEP, lifecycle, destroy};
 
-TEST_EXPORT const xgc2_module_desc* xgc2_module_v2(void) { return &DESC; }
+TEST_EXPORT const xgc2_module_desc* xgc2_module_entry(void) { return &DESC; }

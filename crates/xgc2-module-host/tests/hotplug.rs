@@ -13,12 +13,12 @@ use xgc2_module_host::host::HostError;
 fn two_chains(f: &Fixture) {
     f.load_module("producer_state");
     f.load_module("consumer");
-    f.load("pass_v1", &module_version("passthrough", 1));
-    f.load("pass_v2", &module_version("passthrough", 2));
+    f.load("pass_1", &module_version("passthrough", 1));
+    f.load("pass_2", &module_version("passthrough", 2));
     f.add(spec("cb", "consumer", 0.0, "{}", &[("state_in", "b")]));
     f.add(spec("pb", "producer_state", 2.0, r#"{"id":2}"#, &[("out", "b")]));
     f.add(spec("ca", "consumer", 0.0, "{}", &[("state_in", "a_out")]));
-    f.add(spec("stage", "pass_v1", 0.0, "{}", &[("in", "a_in"), ("out", "a_out")]));
+    f.add(spec("stage", "pass_1", 0.0, "{}", &[("in", "a_in"), ("out", "a_out")]));
     f.add(spec("pa", "producer_state", 2.0, r#"{"id":1}"#, &[("out", "a_in")]));
 }
 
@@ -72,7 +72,7 @@ fn replacing_an_instance_under_load_does_not_disturb_the_others() {
     let producer = Stall::watch(&f, "pa");
     let mut longest_swap = Duration::ZERO;
     for round in 0..20 {
-        let module = if round % 2 == 0 { "pass_v2" } else { "pass_v1" };
+        let module = if round % 2 == 0 { "pass_2" } else { "pass_1" };
         let started = Instant::now();
         f.host.replace_instance("stage", Some(module), None).unwrap_or_else(|e| panic!("round {round}: {e}"));
         longest_swap = longest_swap.max(started.elapsed());
@@ -138,7 +138,7 @@ fn a_replacement_that_does_not_fit_is_refused_and_the_old_instance_keeps_running
     assert!(message.contains("event") && message.contains("a_out"), "{message}");
     let stage = f.instance("stage");
     assert_eq!(stage["state"], "running");
-    assert_eq!(stage["module"], "pass_v1");
+    assert_eq!(stage["module"], "pass_1");
     let before = count(&stage["steps"]);
     wait_until("stage keeps stepping", Duration::from_secs(5), || count(&f.instance("stage")["steps"]) > before + 5);
 }
@@ -149,14 +149,14 @@ fn a_replacement_that_cannot_start_restores_the_previous_instance() {
     two_chains(&f);
     wait_until("flowing", Duration::from_secs(10), || count(&f.detail("ca")["state_updates"]) > 5);
     for (config, phase) in [(r#"{"fail_start":1}"#, "start"), (r#"{"fail_create":1}"#, "create")] {
-        let error = f.host.replace_instance("stage", Some("pass_v2"), Some(config.into())).unwrap_err();
+        let error = f.host.replace_instance("stage", Some("pass_2"), Some(config.into())).unwrap_err();
         let text = error.to_string();
         assert!(text.contains(phase), "{text}");
         if phase == "start" {
             assert!(text.contains("previous instance was restored"), "{text}");
         }
         let stage = f.instance("stage");
-        assert_eq!((stage["state"].as_str(), stage["module"].as_str()), (Some("running"), Some("pass_v1")), "{stage}");
+        assert_eq!((stage["state"].as_str(), stage["module"].as_str()), (Some("running"), Some("pass_1")), "{stage}");
         let before = count(&f.detail("ca")["state_updates"]);
         wait_until("data still flows through the restored stage", Duration::from_secs(5), || {
             count(&f.detail("ca")["state_updates"]) > before + 10
@@ -205,7 +205,7 @@ fn ports_are_rebound_live() {
     let f = Fixture::new("rebind");
     f.load_module("producer_state");
     f.load_module("consumer");
-    f.load("pass_v1", &module_version("passthrough", 1));
+    f.load("pass_1", &module_version("passthrough", 1));
     f.add(spec("p1", "producer_state", 2.0, r#"{"id":1}"#, &[("out", "s1")]));
     f.add(spec("p2", "producer_state", 2.0, r#"{"id":2}"#, &[("out", "s2")]));
     f.add(spec("reader", "consumer", 0.0, "{}", &[("state_in", "s1")]));
@@ -220,7 +220,7 @@ fn ports_are_rebound_live() {
     assert_eq!(count(&f.instance("reader")["steps"]), steps);
     assert_eq!(f.channel("s2")["readers"], 0);
     // A required input without a producer makes the entity not ready.
-    f.add(spec("stage", "pass_v1", 0.0, "{}", &[("in", "nowhere")]));
+    f.add(spec("stage", "pass_1", 0.0, "{}", &[("in", "nowhere")]));
     let (ready, facts) = f.host.describe();
     assert!(!ready);
     assert!(facts["not_ready"].to_string().contains("required input in (channel nowhere) has no running producer"), "{facts}");

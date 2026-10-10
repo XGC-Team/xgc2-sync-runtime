@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(Xgc2Module VERSION 0.1.0 LANGUAGES NONE)
 
-# Header-only SDK: include/xgc2/module.h, the ABI v2 header of xgc2-module modules.
+# Header-only SDK: include/xgc2/module.h, the module ABI header of xgc2-module.
 # Consumers either install the package (find_package(Xgc2Module CONFIG REQUIRED)) or add this
 # directory from their own project (add_subdirectory(<xgc2-module>/sdk)). Both give the
 # imported INTERFACE target Xgc2Module::SDK; there is no library to link.

@@ -69,7 +69,7 @@ pub fn module(name: &str) -> PathBuf {
 }
 
 pub fn module_version(name: &str, version: u32) -> PathBuf {
-    build(&format!("{name}.c"), &format!("{name}_v{version}"), &[&format!("VERSION={version}")])
+    build(&format!("{name}.c"), &format!("{name}_{version}"), &[&format!("VERSION={version}")])
 }
 
 pub fn broken(variant: &str) -> PathBuf {

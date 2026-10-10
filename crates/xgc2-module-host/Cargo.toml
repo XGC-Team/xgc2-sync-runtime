@@ -1,6 +1,6 @@
 [package]
 name = "xgc2-module-host"
-description = "Same-entity module host: dlopen'd ABI v2 modules, typed zero-copy channels, event-driven scheduler, hot-plug"
+description = "Same-entity module host: dlopen'd modules, typed zero-copy channels, event-driven scheduler, hot-plug"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -50,10 +50,10 @@ fn broken_descriptors_are_refused_with_a_reason() {
 
 #[test]
 fn a_library_without_the_entry_point_is_refused() {
-    // The layout probe is a valid shared library that exports no xgc2_module_v2.
+    // The layout probe is a valid shared library that exports no xgc2_module_entry.
     let error = loader::load(&build("layout_probe.c", "layout_probe", &[]), None).err().unwrap();
     assert!(matches!(error, LoadError::NoEntry(_)), "{error:?}");
-    assert!(error.to_string().contains("xgc2_module_v2"));
+    assert!(error.to_string().contains("xgc2_module_entry"));
 }
 
 #[test]

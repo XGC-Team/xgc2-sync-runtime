@@ -3,7 +3,7 @@ id: xgc2-module
 name: XGC2 Module
 version: 0.1.0-1
 kind: toolchain-apt
-summary: Same-entity module aggregation - the module ABI v2 SDK for module authors and the xgc2-module-host process that runs the modules of one entity.
+summary: Same-entity module aggregation - the module ABI SDK for module authors and the xgc2-module-host process that runs the modules of one entity.
 apt:
   distribution: bionic,focal,noble
   install:
@@ -28,7 +28,7 @@ usage:
     package with the imported target Xgc2Module::SDK; module authors use find_package(Xgc2Module
     CONFIG REQUIRED). xgc2-module-host is one binary built against glibc 2.27, so the same build
     serves Ubuntu 18.04, 20.04 and 24.04. Products ship their own modules (shared libraries that
-    export xgc2_module_v2) and their own entity manifests; this product contains no domain logic.
+    export xgc2_module_entry) and their own entity manifests; this product contains no domain logic.
     One host process runs one entity; the control plane is XRPC http.v1 on a Unix socket named in
     the manifest or by --control-socket.
 ownership:

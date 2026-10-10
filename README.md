@@ -34,7 +34,7 @@ modules, and cmake for the SDK package.
 
 | Path | What |
 |---|---|
-| `include/xgc2/module.h` | The module ABI v2, a C11 and C++ header. A module is a shared library that exports `xgc2_module_v2()`. |
+| `include/xgc2/module.h` | The module ABI (version 2.0), a C11 and C++ header. A module is a shared library that exports `xgc2_module_entry()`. |
 | `sdk/` | CMake package `Xgc2Module` (target `Xgc2Module::SDK`) that installs the header; Debian package `libxgc2-module-dev`. |
 | `crates/xgc2-module-host` | The host: library and the binary `xgc2-module-host`. |
 | `tests/modules/` | Small C and C++ test modules, built by the integration tests. |
@@ -57,7 +57,7 @@ other endpoints change it live.
 
 Writing a module: include `<xgc2/module.h>`, describe the ports (name, direction, `state` or `event`, schema id, size
 and alignment of a plain struct), implement `create`, `configure`, `start`, `step`, `stop` and `destroy`, and export
-`xgc2_module_v2()`. The rules a module has to follow are in the header and in
+`xgc2_module_entry()`. The rules a module has to follow are in the header and in
 [docs/architecture.md](docs/architecture.md#module-author-notes).
 
 ## Build, test, measure

@@ -50,7 +50,7 @@ POST /v1/instances/add        {"name": "ctl", "module": "ctl", "config": {...}, 
                                "step_budget_ms": 1.5, "hang_limit_ms": 200, "required": true,
                                "autostart": true, "bind": {"pose": "pose", "command": "cmd"}}
 POST /v1/instances/remove     {"name": "ctl"}
-POST /v1/instances/replace    {"name": "ctl", "module": "ctl_v2", "config": {...}}    both optional
+POST /v1/instances/replace    {"name": "ctl", "module": "ctl_next", "config": {...}}    both optional
 POST /v1/instances/configure  {"name": "ctl", "config": {...}, "period_ms": 4, "step_budget_ms": 3, "hang_limit_ms": 300}
 POST /v1/instances/start      {"name": "ctl"}
 POST /v1/instances/stop       {"name": "ctl"}

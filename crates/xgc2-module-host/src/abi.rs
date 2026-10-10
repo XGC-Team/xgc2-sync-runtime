@@ -1,4 +1,4 @@
-//! Rust mirror of `include/xgc2/module.h` (module ABI v2).
+//! Rust mirror of `include/xgc2/module.h` (module ABI 2.0).
 //!
 //! Field order and types follow the C header exactly; `tests/abi_layout.rs` compares every
 //! size and offset with a C compilation of the header. Fields a module fills in (the
@@ -9,8 +9,9 @@ use std::ffi::{c_char, c_int, c_void};
 
 pub const ABI_MAJOR: u32 = 2;
 pub const ABI_MINOR: u32 = 0;
-/// NUL-terminated name of the exported descriptor function.
-pub const ENTRY_SYMBOL: &[u8] = b"xgc2_module_v2\0";
+/// Name of the exported descriptor function, and the same NUL-terminated for `dlsym`.
+pub const ENTRY_NAME: &str = "xgc2_module_entry";
+pub const ENTRY_SYMBOL: &[u8] = b"xgc2_module_entry\0";
 pub const MAX_PORTS: usize = 64;
 
 pub type Status = c_int;

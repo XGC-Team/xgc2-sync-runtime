@@ -43,11 +43,11 @@ fn random_hot_plug_under_load() {
     f.load_module("producer_state");
     f.load_module("producer_event");
     f.load_module("consumer");
-    f.load("pass_v1", &module_version("passthrough", 1));
-    f.load("pass_v2", &module_version("passthrough", 2));
+    f.load("pass_1", &module_version("passthrough", 1));
+    f.load("pass_2", &module_version("passthrough", 2));
     // Chain A is modified all the time, chain B is the bystander, events flow through E.
     f.add(spec("ca", "consumer", 0.0, "{}", &[("state_in", "a_out"), ("event_in", "e")]));
-    f.add(spec("stage", "pass_v1", 0.0, "{}", &[("in", "a_in"), ("out", "a_out")]));
+    f.add(spec("stage", "pass_1", 0.0, "{}", &[("in", "a_in"), ("out", "a_out")]));
     f.add(spec("pa", "producer_state", 2.0, r#"{"id":1}"#, &[("out", "a_in")]));
     f.add(spec("cb", "consumer", 0.0, "{}", &[("state_in", "b")]));
     f.add(spec("pb", "producer_state", 2.0, r#"{"id":2}"#, &[("out", "b")]));
@@ -64,7 +64,7 @@ fn random_hot_plug_under_load() {
         operations[choice as usize] += 1;
         match choice {
             0 | 1 => {
-                let module = if random.below(2) == 0 { "pass_v1" } else { "pass_v2" };
+                let module = if random.below(2) == 0 { "pass_1" } else { "pass_2" };
                 must_succeed_or_be_refused("replace stage", host.replace_instance("stage", Some(module), None));
             }
             2 => {
