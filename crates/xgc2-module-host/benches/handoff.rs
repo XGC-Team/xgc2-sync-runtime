@@ -76,14 +76,38 @@ struct Window {
     cpu_percent: f64,
     wakeups_per_s: f64,
     preemptions_per_s: f64,
+    /// Voluntary context switches per second of every thread, by thread name.
+    by_thread: Vec<(String, f64)>,
+}
+
+/// Voluntary context switches of every thread of this process, by thread name.
+fn thread_switches() -> std::collections::BTreeMap<String, i64> {
+    let mut switches = std::collections::BTreeMap::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return switches };
+    for task in tasks.flatten() {
+        let name = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default().trim().to_owned();
+        let status = std::fs::read_to_string(task.path().join("status")).unwrap_or_default();
+        let count = status
+            .lines()
+            .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        *switches.entry(name).or_insert(0) += count;
+    }
+    switches
 }
 
 /// Run `body` and report the process CPU use during it.
 fn measure(body: impl FnOnce()) -> Window {
-    let (before, started) = (usage(), Instant::now());
+    let (before, threads_before, started) = (usage(), thread_switches(), Instant::now());
     body();
-    let (after, wall) = (usage(), started.elapsed().as_secs_f64());
+    let (after, threads_after, wall) = (usage(), thread_switches(), started.elapsed().as_secs_f64());
+    let by_thread = threads_after
+        .iter()
+        .map(|(name, count)| (name.clone(), (count - threads_before.get(name).copied().unwrap_or(0)) as f64 / wall))
+        .collect();
     Window {
+        by_thread,
         cpu_percent: 100.0 * (after.cpu_seconds - before.cpu_seconds) / wall,
         wakeups_per_s: (after.voluntary - before.voluntary) as f64 / wall,
         preemptions_per_s: (after.involuntary - before.involuntary) as f64 / wall,
@@ -267,6 +291,11 @@ fn main() {
             c.missed
         )
         .unwrap();
+    }
+    for (workers, c) in &chains {
+        let threads: Vec<String> =
+            c.window.by_thread.iter().filter(|(_, rate)| *rate >= 1.0).map(|(name, rate)| format!("{name} {rate:.0}")).collect();
+        writeln!(report, "\nThread wake-ups per second with {workers} worker(s): {}.", threads.join(", ")).unwrap();
     }
     let first = &chains[0].1;
     writeln!(

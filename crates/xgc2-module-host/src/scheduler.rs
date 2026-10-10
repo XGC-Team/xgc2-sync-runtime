@@ -373,9 +373,15 @@ impl Scheduler {
     }
 
     fn enqueue_shared(&self, idx: u32) {
-        let mut queue = lock(&self.queue);
-        queue.push_back(idx);
-        if self.idle.load(Ordering::Acquire) > 0 {
+        // Whether a worker is parked is read under the lock that parking happens under, so the
+        // decision is exact; the wake-up itself is sent after the unlock, because a worker that
+        // wakes while this thread still holds the lock would only block on it again.
+        let wake = {
+            let mut queue = lock(&self.queue);
+            queue.push_back(idx);
+            self.idle.load(Ordering::Acquire) > 0
+        };
+        if wake {
             self.queue_changed.notify_one();
         }
     }
