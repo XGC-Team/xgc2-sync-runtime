@@ -9,7 +9,7 @@ Formerly xgc2-sync-runtime.
 ## What it is, and what it is not
 
 xgc2-module aggregates mature first-party algorithm modules that belong to the same entity: reference generators,
-controllers, and the ROS edge module of that entity. It is a small host (about 5,400 lines of Rust), a C header that
+controllers, and the ROS edge module of that entity. It is a small host (about 5,500 lines of Rust), a C header that
 defines the module ABI, and nothing else. It contains no domain logic; products ship their own modules and their own
 entity manifests.
 
