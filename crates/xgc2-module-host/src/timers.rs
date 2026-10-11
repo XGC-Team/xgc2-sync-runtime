@@ -237,22 +237,49 @@ mod tests {
     }
 
     #[test]
-    fn periodic_timer_fires_at_the_period_without_drift() {
+    fn periodic_timer_fires_every_period_and_stops_when_disarmed() {
         let f = Fixture::new(Mode::Steady);
+        let armed_at = Instant::now();
         let (idx, _) = f.instance(5_000_000);
         thread::sleep(Duration::from_millis(250));
         f.timers.disarm(idx);
         let stamps: Vec<_> = lock(&f.recorder.stamps).iter().map(|(_, at)| *at).collect();
-        // 250 ms / 5 ms = 50 expirations; allow scheduling noise on a shared machine.
-        assert!((35..=51).contains(&stamps.len()), "{} expirations", stamps.len());
-        let span = stamps.last().unwrap().duration_since(stamps[0]).as_secs_f64();
-        let mean = span / (stamps.len() - 1) as f64;
-        assert!((0.0045..0.0058).contains(&mean), "mean interval {mean}");
+        // 250 ms / 5 ms = 50 expirations at most. A loaded machine delays some of them, and the
+        // periods it made the timer miss are merged into later expirations, so only a loose lower
+        // bound holds; what holds always is that no expiration comes early: the k-th is due at
+        // least k periods after the timer was armed.
+        assert!((8..=51).contains(&stamps.len()), "{} expirations", stamps.len());
+        for (k, at) in stamps.iter().enumerate() {
+            let due = armed_at + Duration::from_millis(5 * (k as u64 + 1));
+            assert!(*at >= due, "expiration {} came {:?} early", k + 1, due.saturating_duration_since(*at));
+        }
         // An expiration raised just before the disarm may still be running.
         thread::sleep(Duration::from_millis(30));
         let count = f.recorder.runs.load(Ordering::SeqCst);
         thread::sleep(Duration::from_millis(30));
         assert_eq!(f.recorder.runs.load(Ordering::SeqCst), count, "disarmed timer kept firing");
+    }
+
+    #[test]
+    fn late_expirations_do_not_shift_the_deadlines_after_them() {
+        // On the external clock the test decides when each expiration is noticed, so this holds
+        // on any machine: deadlines are anchor + n * period, not "one period after the last
+        // expiration was handled".
+        let f = Fixture::new(Mode::External);
+        let (idx, _) = f.instance(100_000_000);
+        let publish = |ns: i64| {
+            let update = f.clock.set_external(ns);
+            f.timers.on_clock(update, ns);
+        };
+        publish(1_000_000_000);
+        // Odd expirations are noticed 90 ms late, even ones exactly on time. A timer that counted
+        // its next period from the moment it fired would not be due again at the even sample.
+        for n in 1..=12i64 {
+            let late = if n % 2 == 1 { 90_000_000 } else { 0 };
+            publish(1_000_000_000 + n * 100_000_000 + late);
+            wait_runs(&f, n as usize);
+        }
+        assert_eq!(f.sched.cell(idx).missed_periods.load(Ordering::Relaxed), 0, "no period was skipped");
     }
 
     #[test]
