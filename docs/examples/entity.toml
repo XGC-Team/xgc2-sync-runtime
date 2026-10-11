@@ -1,0 +1,71 @@
+# Example manifest of one entity: a reference generator feeding a controller, with the robot's
+# ROS edge on the other side. Paths and names are illustrative; a product ships its own.
+#
+#   xgc2-module-host --manifest entity.toml --check     validate: load the libraries, plan the channels
+#   xgc2-module-host --manifest entity.toml             run until SIGINT or SIGTERM
+
+entity = "scout1"                       # entity id (one host process per entity)
+
+[host]
+workers = 2                             # worker threads, default min(4, cores)
+
+[clock]
+mode = "steady"                         # "external": time comes from the channel named below
+# mode = "external"
+# channel = "clock"                     # a state channel of schema xgc2.clock.v1, written by the ROS edge
+
+[control]
+socket = "/run/xgc2/scout1/module.sock" # XRPC http.v1; the directory must be owned by the user, mode 0700
+
+# Libraries. `name` is the handle instances use; `sha256` pins the file (optional).
+[[module]]
+name = "edge"
+path = "/opt/xgc2/modules/libugv_ros_edge.so"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[module]]
+name = "reference"
+path = "/opt/xgc2/modules/libugv_unicycle_reference.so"
+
+[[module]]
+name = "controller"
+path = "/opt/xgc2/modules/libugv_unicycle_controller.so"
+
+# Optional channel overrides. A channel is created by the first port bound to it and takes
+# its payload type from that port; later ports must match it exactly.
+[[channel]]
+name = "request"
+depth = 32                              # event queue length, at least what any port asks for
+
+# Instances in start order: list the consumers of an event channel before its producers if the
+# events published while the entity starts must not be missed.
+[[instance]]
+name = "controller"
+module = "controller"
+period_ms = 2                           # 500 Hz timer; omit for an instance driven by its inputs only
+step_budget_ms = 1.5                    # default: one period (50 ms without a period)
+hang_limit_ms = 200                     # default: ten budgets, at least 100 ms
+[instance.config]                       # becomes the JSON object passed to create/configure
+horizon = 20
+gains = [1.0, 0.5, 0.1]
+[instance.bind]                         # port -> channel; unlisted outputs get "<instance>.<port>"
+reference = "active_reference"
+pose = "pose"
+command = "cmd_vel"
+
+[[instance]]
+name = "reference"
+module = "reference"
+period_ms = 10
+[instance.bind]
+active = "active_reference"
+request = "request"
+
+[[instance]]
+name = "edge"
+module = "edge"
+required = true                         # entity readiness needs it running (default true)
+[instance.bind]
+pose = "pose"
+request = "request"
+cmd_vel = "cmd_vel"

@@ -1,40 +1,48 @@
 schema: xgc2.product.v1
-id: libxgc2-runtime-sdk-dev
-name: XGC Runtime SDK
-version: 0.1.0-4
+id: xgc2-module
+name: XGC2 Module
+version: 0.2.0-1
 kind: toolchain-apt
-summary: Header-only C/C++ plugin, clock-source and flat-config SDK for XGC Runtime consumers.
+summary: Same-entity module aggregation - the module ABI SDK for module authors and the xgc2-module-host process that runs the modules of one entity.
 apt:
-  distribution: focal
+  distribution: bionic,focal,noble
   install:
-  - libxgc2-runtime-sdk-dev
+  - libxgc2-module-dev
+  - xgc2-module-host
   packages:
-  - libxgc2-runtime-sdk-dev
+  - libxgc2-module-dev
+  - xgc2-module-host
   package_architectures:
-    libxgc2-runtime-sdk-dev:
+    libxgc2-module-dev:
+    - amd64
+    - arm64
+    xgc2-module-host:
     - amd64
     - arm64
   depends: []
 usage:
-  install: dpkg -i libxgc2-runtime-sdk-dev_0.1.0-4~focal_all.deb
-  smoke_test: python3 abi/tests/test_sdk.py --work-dir /tmp/xgc-runtime-sdk-check
+  install: sudo apt install libxgc2-module-dev xgc2-module-host
+  smoke_test: xgc2-module-host --manifest /usr/share/doc/xgc2-module-host/examples/entity.toml --check; test -f /usr/include/xgc2/module.h
   notes: >-
-    Consumers use find_package(XgcRuntimeSDK CONFIG REQUIRED) and link
-    XgcRuntime::SDK. The installed include directory is include/xgc-runtime;
-    xgc_rt.h, xgc_clock_source.h and flat_config.hpp keep their flat include
-    names. Business records and domain contracts come from their owning products. An explicit source build can
-    add_subdirectory(${XGC_RUNTIME_SDK_SOURCE_ROOT}/abi ...) and link the same
-    target. This development package has no runtime binary or hard package
-    dependency. Local package validation is not APT publication or downstream
-    installation evidence.
+    libxgc2-module-dev is header-only (architecture all): <xgc2/module.h> and the Xgc2Module CMake
+    package with the imported target Xgc2Module::SDK; module authors use find_package(Xgc2Module
+    CONFIG REQUIRED). xgc2-module-host is one binary built against glibc 2.27, so the same build
+    serves Ubuntu 18.04, 20.04 and 24.04. Products ship their own modules (shared libraries that
+    export xgc2_module_entry) and their own entity manifests; this product contains no domain logic.
+    One host process runs one entity; the control plane is XRPC http.v1 on a Unix socket named in
+    the manifest or by --control-socket.
 ownership:
   paths:
-  - /usr/include/xgc-runtime
-  - /usr/share/cmake/XgcRuntimeSDK
+  - /usr/include/xgc2/module.h
+  - /usr/share/cmake/Xgc2Module
+  - /usr/bin/xgc2-module-host
+  - /usr/share/doc/xgc2-module-host
 release:
-  repository: XGC-Team/xgc2-sync-runtime
+  repository: XGC-Team/xgc2-module
   ref: main
   ci_workflow: ci.yml
   workflow: release.yml
   apt_versions:
-    focal: 0.1.0-4~focal
+    bionic: 0.2.0-1~bionic
+    focal: 0.2.0-1~focal
+    noble: 0.2.0-1~noble

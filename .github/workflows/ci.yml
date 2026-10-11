@@ -4,26 +4,45 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
+    inputs:
+      upload:
+        description: "'false' builds and checks everything but publishes no artifact (release compatibility verification)"
+        type: string
+        default: "true"
 permissions:
   contents: read
 defaults:
   run:
     shell: bash
+env:
+  # Releases are built with the minimum supported Rust version, and clippy is pinned to it so
+  # that a new stable lint cannot break the build.
+  MSRV: 1.85.0
 jobs:
-  build-sdk:
+  test:
+    name: cargo test (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.85.0"]
     steps:
       - uses: actions/checkout@v4
-      - name: Build one header-only all Deb and refuse artifact overwrite
-        run: .xgc2/scripts/build_debs_in_docker.sh --output-dir "$GITHUB_WORKSPACE/debs" --work-dir "$RUNNER_TEMP/sdk-build"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: runtime-sdk-deb-bytes
-          path: debs/*.deb
-          retention-days: 14
-  build-debs:
-    name: Install and check identical SDK Deb (${{ matrix.arch }})
-    needs: build-sdk
+      - name: Install the Rust toolchain
+        run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal --component rustfmt --component clippy
+      - name: Format and lints
+        if: matrix.toolchain == '1.85.0'
+        run: |
+          cargo +"$MSRV" fmt --all --check
+          cargo +"$MSRV" clippy --locked --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo +"$MSRV" doc --locked --no-deps
+      - name: Unit and integration tests (the integration tests compile the C and C++ test modules in tests/modules)
+        run: cargo +"${{ matrix.toolchain }}" test --locked
+      - name: The SDK as a module author consumes it
+        run: python3 sdk/tests/test_sdk.py --work-dir "$RUNNER_TEMP/sdk-check"
+  build-host:
+    name: Host binary on Ubuntu 18.04 (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -33,27 +52,49 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Build against glibc 2.27 so one binary serves bionic, focal and noble
+        run: .xgc2/scripts/ci_build_host.sh --output "$RUNNER_TEMP/host"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xgc2-module-host-binary-${{ matrix.arch }}
+          path: ${{ runner.temp }}/host/xgc2-module-host
+          retention-days: 14
+  packages:
+    name: Packages ${{ matrix.distribution }} (${{ matrix.arch }})
+    needs: [test, build-host]
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [bionic, focal, noble]
+        arch: [amd64, arm64]
+        include:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: runtime-sdk-deb-bytes
-          path: debs
-      - name: Actual installed ownership, ABI and missing-payload negatives
+          name: xgc2-module-host-binary-${{ matrix.arch }}
+          path: ${{ runner.temp }}/host
+      - name: Build both packages, install them in a plain Ubuntu image of the release and check them
         run: |
-          mapfile -t debs < <(find debs -maxdepth 1 -type f -name '*.deb')
-          test "${#debs[@]}" -eq 1
-          .xgc2/scripts/build_debs_in_docker.sh --deb "${debs[0]}" --architecture "${{ matrix.arch }}"
+          chmod +x "$RUNNER_TEMP/host/xgc2-module-host"
+          .xgc2/scripts/ci_package.sh --distribution "${{ matrix.distribution }}" --architecture "${{ matrix.arch }}" \
+            --binary "$RUNNER_TEMP/host/xgc2-module-host" --output debs
       - name: Create strict source-bound build manifest
         run: |
           version="$(awk '/^version:/ {print $2; exit}' .xgc2/product.yml)"
           python3 .xgc2/scripts/xgc2_artifact_manifest.py build \
             --deb-dir debs --output-dir .ci/build-manifests \
-            --product libxgc2-runtime-sdk-dev --product-version "$version" \
-            --distribution focal --architecture "${{ matrix.arch }}" \
+            --product xgc2-module --product-version "$version" \
+            --distribution "${{ matrix.distribution }}" --architecture "${{ matrix.arch }}" \
             --source-sha "$GITHUB_SHA" --ci-run-id "$GITHUB_RUN_ID" \
             --ci-workflow "$GITHUB_WORKFLOW" --ci-workflow-ref "$GITHUB_WORKFLOW_REF"
       - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload != 'false' }}
         with:
-          name: libxgc2-runtime-sdk-dev-debs-${{ matrix.arch }}
+          name: xgc2-module-debs-${{ matrix.distribution }}-${{ matrix.arch }}
           path: |
             debs/*.deb
             .ci/build-manifests/*.json

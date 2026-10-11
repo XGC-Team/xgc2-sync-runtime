@@ -1,0 +1,32 @@
+[package]
+name = "xgc2-module-host"
+description = "Same-entity module host: dlopen'd modules, typed zero-copy channels, event-driven scheduler, hot-plug"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "xgc2_module_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xgc2-module-host"
+path = "src/main.rs"
+
+[dependencies]
+xgc2-xrpc.workspace = true
+libc.workspace = true
+libloading.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bench]]
+name = "handoff"
+harness = false

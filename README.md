@@ -1,68 +1,93 @@
-# XGC2 Sync Runtime
+# xgc2-module
 
-One module skeleton for every onboard and station module: perception, estimation, planning, control, DMPC neighbor exchange and simulation adapters. Communications are one plugin family on the same skeleton, with Zenoh as the cross-host transport. Latency, loss, reordering and throughput are audited per link against exact definitions.
+Runs the algorithm modules of **one entity** (one robot) in one process. The modules hand typed samples to each
+other in memory instead of through ROS hops, an event-driven scheduler runs them, and single modules can be added,
+replaced and removed while the others keep running.
 
-**It is not:** a planner, PX4 HIL, a ROS replacement mandate, or anything to do with AI chat. "Agent" in XGC2 means the robot `xgc-agent` ops process. Agent-managed deployment and native module validation are separate acceptance steps; see [migration status](docs/native-migration-status.md).
+Formerly xgc2-sync-runtime.
 
-## Topology
+## What it is, and what it is not
 
-An aggregator is a plain process (`xgc-rt-host`) that loads the `.so` modules one manifest lists. Usually there is one per robot; a computer may run several for independent jobs.
+xgc2-module aggregates mature first-party algorithm modules that belong to the same entity: reference generators,
+controllers, and the ROS edge module of that entity. It is a small host (about 5,500 lines of Rust), a C header that
+defines the module ABI, and nothing else. It contains no domain logic; products ship their own modules and their own
+entity manifests.
+
+It is **not**
+
+* a communication stack: there is no transport between entities and no serialization inside one;
+* a simulator host, a station service or a visualizer;
+* a place to aggregate **drivers, calibration, estimators (for now), simulators, multi-robot visualization, type
+  servers, multi-robot controllers and planners, or paper-experiment code** (the TRO, TASE and RAL DMPC work). Those
+  stay separate processes and talk through ROS or XRPC as before.
+
+One host process serves exactly one entity; several entities are never mixed in one host. ROS is only used at the
+boundary of the entity, by a ROS edge module that the entity's product ships.
+
+## Platforms
+
+Ubuntu 18.04 (bionic), 20.04 (focal) and 24.04 (noble), amd64 and arm64. The host binary needs glibc 2.27 and is built
+once against the oldest of them. Building from source needs Rust 1.85 or newer, a C and a C++ compiler for the test
+modules, and cmake for the SDK package.
+
+## Parts
+
+| Path | What |
+|---|---|
+| `include/xgc2/module.h` | The module ABI (version 2.0), a C11 and C++ header. A module is a shared library that exports `xgc2_module_entry()`. |
+| `sdk/` | CMake package `Xgc2Module` (target `Xgc2Module::SDK`) that installs the header; Debian package `libxgc2-module-dev`. |
+| `crates/xgc2-module-host` | The host: library and the binary `xgc2-module-host`. |
+| `tests/modules/` | Small C and C++ test modules, built by the integration tests. |
+| `docs/` | [architecture](docs/architecture.md), [manifest](docs/manifest.md), [control API](docs/control-api.md), validation records, an example manifest. |
+| `scripts/bionic-test.sh` | Builds and tests the host against the Ubuntu 18.04 sysroot (glibc 2.27). |
+| `.xgc2/` | Product metadata and the Debian package scripts. |
+
+## Using it
 
 ```text
-            robot (container or onboard)                         other robots / station
- ┌─────────────────── aggregator (xgc-rt-host) ─────────┐
- │  inputs ─▶ estimator ─▶ planner ─▶ controller ─▶ outputs │
- │                               ▲  │                  │
- │  same process: memory only    │  └── dmpc/plan ─────┼──▶ Zenoh over radio ◀──▶ peers
- │  (one thread per module)      └───── neighbor plans ◀┼───  stamped + audited
- └──────────────────────────────────────────────────────┘
+xgc2-module-host --manifest entity.toml [--control-socket PATH] [--workers N] [--log-level LEVEL]
+xgc2-module-host --manifest entity.toml --check     # load the libraries, plan the channels, start nothing
 ```
 
-## Shape
+The manifest (see [docs/manifest.md](docs/manifest.md) and [docs/examples/entity.toml](docs/examples/entity.toml))
+names the entity, the clock, the module libraries (with an optional sha256 pin), and the instances with their
+configuration, period, step budgets and port-to-channel bindings. The process runs until SIGINT or SIGTERM. When a
+control socket is configured, [`GET /v1/describe`](docs/control-api.md) answers whether the entity is ready and the
+other endpoints change it live.
 
-| Piece | What |
-|---|---|
-| `abi/include/xgc_rt.h` | The C ABI (v1). A plugin is a `.so` exporting `xgc_rt_plugin_v1`, in any language. A transport plugin is a `.so` exporting `xgc_rt_transport_v1`. |
-| `crates/xgc-rt-abi` | Rust mirror of the ABI, plus the safe plugin SDK (`Plugin` trait, `export_plugin!`) |
-| `crates/xgc-rt-core` | Envelope v2, the lifecycle state machine, `Clock`/`RoundSchedule`, the `Transport` and `AuditSink` interfaces, the manifest, and `transport_abi` (the Rust side of `xgc_rt_transport_v1`; `export_transport!` exports any `Transport` as a transport plugin) |
-| `crates/xgc-rt-audit` | Lossless records, the multi-node merge, and the `audit-def/1` report (`xgc-rt-audit merge`) |
-| `crates/xgc-rt-transport-loopback` | In-memory stand-in for a link between nodes, with a seeded ground-truth impairment injector (tests only; never used between modules of one aggregator) |
-| `crates/xgc-rt-host` | The aggregator (`xgc-rt-host --manifest`): loader, one thread per module, memory handoff, watchdog, restart policy, health and step logs |
-| `plugins/stub-*`, `plugins/c-stub` | Z1 domain stubs (Rust) and the pure-C plugin |
-| `plugins/transport-loopback`, `plugins/transport-zenoh` | The loopback and Zenoh transports as transport plugins. A manifest names one with `[transport] kind = "zenoh"` and `path = "libtransport_zenoh.so"` (optionally `sha256`), exactly as a `[[plugin]] path`; without `path` the host uses its built-in transport of that kind. |
+Writing a module: include `<xgc2/module.h>`, describe the ports (name, direction, `state` or `event`, schema id, size
+and alignment of a plain struct), implement `create`, `configure`, `start`, `step`, `stop` and `destroy`, and export
+`xgc2_module_entry()`. The rules a module has to follow are in the header and in
+[docs/architecture.md](docs/architecture.md#module-author-notes).
 
-## Host behavior
-
-1. A domain is a plugin plus a manifest entry; host, clock, transport and audit code are shared.
-2. Each plugin has one responsibility, and its declared ports are its entire I/O.
-3. Threads: one thread per module, so a slow or blocking module stalls only itself. The main thread routes link frames and runs the clock probe and the watchdog. Transport IO threads only stamp, verify, audit and enqueue; writer threads append audit and step records.
-4. Modules step on their round (`on_round`), on new input (`on_dirty`), or both. There is no busy-polling. Each step reads one snapshot of its inputs taken at step start.
-4a. **Same process = memory only.** An output write hands one shared sample to each same-process reader's input (a bounded queue, or with `latest = true` only the newest sample) and wakes it. No envelope, transport or pub/sub between modules of one aggregator. The link (Zenoh) is used only when the roster has other nodes. `steps.jsonl` records each step's start, end and the samples it read; `[audit] steps_every = N` keeps one round in N plus every failed or over-budget step.
-4b. **Watchdog.** A step over `step_budget_ms` (default one period) marks the module Degraded; the next step within budget recovers it. A step over 10× the budget is a hang: the instance is abandoned and, if the restart policy allows, replaced. After `session.max_abandoned` (default 2) abandons the aggregator stops and exits nonzero, so the Agent restarts it.
-5. Every module has the lifecycle state machine (`Unconfigured → Inactive → Active ⇄ Degraded`, plus `Error` and `Finalized`), tested exhaustively, and its own domain state is visible in health.
-6. A module's declared inputs and outputs are its entire I/O. Between processes, only the link (Zenoh) is used.
-6a. **ROS integration is product-owned.** Runtime supplies the host, ABI and transport; it does not define robot message mappings or provide a platform `ros_io` plugin. Products compose their ROS nodes and owning native adapters through ordinary launch or workflow entry points.
-7. Every link (cross-process) channel is audited (`audit-def/1`, `docs/audit-definitions.md`).
-
-## Build, test and demo
+## Build, test, measure
 
 ```bash
-cargo test                       # unit tests + Z1 exit tests (needs a C compiler for the C plugin)
-examples/z1-pipeline/run.sh      # release build, 5-plugin host for 5 s, merged audit in out/z1-pipeline/merged
+cargo build --release                  # target/release/xgc2-module-host
+cargo test                             # unit tests and integration tests with real C modules (needs cc and c++)
+cargo bench --bench handoff            # handoff latency and CPU of a 3-module chain at 500 Hz
+scripts/bionic-test.sh                 # the same tests against glibc 2.27, on the glibc 2.27 loader
+python3 sdk/tests/test_sdk.py --work-dir /tmp/sdk-check    # the SDK as a module author consumes it
 ```
 
-Rust ≥ 1.85 (workspace resolver 3 and the shared XRPC SDK require it).
+Measurements and the commands behind them are recorded in [docs/validation/](docs/validation/).
 
-Some native integration tests return early when ROS/core dependencies are
-absent. A successful default `cargo test` run alone does not show they ran.
-With the real dependencies configured, `scripts/check-native-gates.sh` checks
-the executed test counts and rejects those skips. These replay gates consume
-owning installed artifacts and headers plus recorded flights supplied in the
-output directory's `bags/`; they do not build a ROS bridge. The [recorded validation](docs/validation/native-20260926/README.md)
-lists source identities, replay hashes, software-plant results and limitations.
+The control plane uses the XRPC Rust SDK, pinned by git revision in the workspace `Cargo.toml`. To build against a
+local checkout of the SDK (for example an unreleased branch) without touching the manifest or the lock file, patch it
+for one invocation:
 
-The runtime-owned [deployment renderer](docs/native-deployment.md) binds an actual Session, robot namespace, topics, calibration provenance and artifact hashes into a private manifest generation. Use its target-local `run` entry with the ordinary managed-process definition; `prepare` alone does not establish module readiness.
+```bash
+cargo test --config 'patch."https://github.com/XGC-Team/xgc2-xrpc".xgc2-xrpc.path="/path/to/xrpc/rust"'
+```
 
-## Author sources and design history
+The host uses only `Runtime`, `Host::bind`, `handler`, `Fault`, `Limits::default()`, `new_instance_id` (and
+`BlockingClient` in its tests), so bumping the pin needs no code change.
 
-The [academic topic](https://github.com/lxk36/academic/blob/main/memory/now/sync-runtime.md) links the frozen author brief and the [September 2026 design pack](https://github.com/lxk36/academic/blob/main/memory/archive/sync-runtime/design-pack-2026-09-25.md). Historical stages, PR states and plans remain dated records. This repository documents the current code and its how-to.
+## Packages
+
+`.xgc2/product.yml` declares the product `xgc2-module` with two Debian packages for bionic, focal and noble:
+
+* `libxgc2-module-dev` (architecture all): `/usr/include/xgc2/module.h` and the `Xgc2Module` CMake package;
+* `xgc2-module-host` (amd64, arm64): `/usr/bin/xgc2-module-host`, the documentation and the example manifest.
+
+`.xgc2/scripts/` builds and checks them; CI builds and tests everything on every push.

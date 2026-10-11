@@ -1,50 +1,30 @@
 [workspace]
 resolver = "3"
-members = [
-  "crates/xgc-rt-abi",
-  "crates/xgc-rt-core",
-  "crates/xgc-rt-audit",
-  "crates/xgc-rt-clock",
-  "crates/xgc-rt-transport-loopback",
-  "crates/xgc-rt-transport-zenoh",
-  "crates/xgc-rt-impair",
-  "crates/xgc-rt-host",
-  "plugins/stub-perception",
-  "plugins/stub-estimation",
-  "plugins/stub-planning",
-  "plugins/stub-control",
-  "plugins/dmpc-exchange-demo",
-  "plugins/station-io",
-  "plugins/transport-loopback",
-  "plugins/transport-zenoh",
-]
+members = ["crates/xgc2-module-host"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/XGC-Team/xgc2-sync-runtime"
+repository = "https://github.com/XGC-Team/xgc2-module"
 
 [workspace.dependencies]
-xgc2-xrpc = { git = "https://github.com/XGC-Team/xgc2-xrpc", rev = "35c2262358a39843c347249efd80c1788cb79849" }
-xgc-rt-abi = { path = "crates/xgc-rt-abi" }
-xgc-rt-core = { path = "crates/xgc-rt-core" }
-xgc-rt-audit = { path = "crates/xgc-rt-audit" }
-xgc-rt-clock = { path = "crates/xgc-rt-clock" }
-xgc-rt-transport-loopback = { path = "crates/xgc-rt-transport-loopback" }
-xgc-rt-transport-zenoh = { path = "crates/xgc-rt-transport-zenoh" }
-xgc-rt-impair = { path = "crates/xgc-rt-impair" }
+# Control plane: XRPC http.v1 over a Unix socket. The host uses Runtime, Host::bind,
+# handler/Fault, Limits::default and (in tests) BlockingClient only.
+xgc2-xrpc = { git = "https://github.com/XGC-Team/xgc2-xrpc", rev = "3e7f4653f42218e7bffaad5752afc5f89690afd2" }
+libc = "0.2"
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
 sha2 = "0.10"
+toml = "0.8"
+tempfile = "3"
 
 [profile.release]
 debug = 1
 
-# Plugin loading hashes each library; unoptimized sha2 takes about a second
-# per debug-built plugin and made multi-host tests miss their epoch.
+# Module loading hashes every library; unoptimized sha2 takes about a second per
+# debug-built module and slows the integration tests.
 [profile.dev.package.sha2]
 opt-level = 3
